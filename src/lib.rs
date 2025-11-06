@@ -1,3 +1,5 @@
+mod vectorchord_indexing;
+
 use pgrx::prelude::*;
 
 ::pgrx::pg_module_magic!(name, version);

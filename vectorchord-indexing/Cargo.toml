@@ -1,0 +1,14 @@
+[package]
+name = "vectorchord-indexing"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+cuda_gpu = []
+default = []
+
+
+[dependencies]
+pgrx = { workspace = true }
+abi_stable = { workspace = true }
+libloading = "0.9"
