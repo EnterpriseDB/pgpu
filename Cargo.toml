@@ -1,0 +1,37 @@
+[package]
+name = "pgpu"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "pgrx_embed_pgpu"
+path = "./src/bin/pgrx_embed.rs"
+
+[features]
+EPAS = ["pgrx/EPAS"]
+PGE = ["pgrx/PGE"]
+default = ["pg17"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14" ]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15" ]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16" ]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17" ]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18" ]
+pg_test = []
+
+[dependencies]
+pgrx = { git = "https://github.com/EnterpriseDB/pgrx", branch = "develop-v0.16.1-edb", default-features = false }
+
+[dev-dependencies]
+pgrx-tests = { git = "https://github.com/EnterpriseDB/pgrx", branch = "develop-v0.16.1-edb" }
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

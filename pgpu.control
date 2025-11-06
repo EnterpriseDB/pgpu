@@ -1,0 +1,7 @@
+comment = 'GPU acceleration for PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pgpu'
+relocatable = false
+superuser = true
+trusted = false
+schema = 'pgpu'

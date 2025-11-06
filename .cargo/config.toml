@@ -1,0 +1,6 @@
+[net]
+git-fetch-with-cli = true
+
+[target.'cfg(target_os="macos")']
+# Postgres symbols won't be available until runtime
+rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]
