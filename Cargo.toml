@@ -11,7 +11,7 @@ name = "pgrx_embed_pgpu"
 path = "./src/bin/pgrx_embed.rs"
 
 [workspace]
-members = ["vectorchord-indexing", "gpu-lib"]
+members = ["vectorchord-indexing", "pgpu-gpu-lib"]
 
 # workspace.dependencies can be referenced by the workspace members. Then we can declare the version only once, here.
 [workspace.dependencies]
