@@ -5,3 +5,4 @@ relocatable = false
 superuser = true
 trusted = false
 schema = 'pgpu'
+requires = 'vector, vchord'
