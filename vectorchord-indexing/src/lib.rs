@@ -1,33 +1,13 @@
-#[cfg(feature = "cuda_gpu")]
 mod centroids_table;
-#[cfg(feature = "cuda_gpu")]
 pub mod guc;
-#[cfg(feature = "cuda_gpu")]
 pub mod index;
-#[cfg(feature = "cuda_gpu")]
 mod vector_index_read;
-#[cfg(feature = "cuda_gpu")]
 mod vectorchord_index;
-#[cfg(feature = "cuda_gpu")]
 mod wrapper_gpu_lib;
-
-#[cfg(feature = "cuda_gpu")]
 pub use guc::*;
-#[cfg(feature = "cuda_gpu")]
 pub use index::*;
-
-#[cfg(not(feature = "cuda_gpu"))]
-pub mod guc_fallback;
-#[cfg(not(feature = "cuda_gpu"))]
-pub mod index_fallback;
-
-#[cfg(not(feature = "cuda_gpu"))]
-pub use guc_fallback::*;
-#[cfg(not(feature = "cuda_gpu"))]
-pub use index_fallback::*;
 use pgrx::Spi;
 
-#[cfg(feature = "cuda_gpu")]
 fn print_memory(vectors: &[f32], message: &str) {
     let bytes_len = std::mem::size_of_val(vectors);
     let kb_len = bytes_len as f64 / 1024.0 / 1024.0 / 1024.0;

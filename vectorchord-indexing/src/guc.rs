@@ -9,7 +9,7 @@ pub enum GpuAcceleration {
     Disable,
 }
 static GPU_ACCELERATION: GucSetting<GpuAcceleration> =
-    GucSetting::<GpuAcceleration>::new(GpuAcceleration::Disable);
+    GucSetting::<GpuAcceleration>::new(GpuAcceleration::Enable);
 
 pub fn init_guc() {
     GucRegistry::define_enum_guc(
