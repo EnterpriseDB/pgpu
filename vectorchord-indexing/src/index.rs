@@ -2,10 +2,10 @@ use crate::centroids_table;
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
-use crate::wrapper_gpu_lib;
 use pgrx::info;
 use pgrx::spi::quote_qualified_identifier;
 use std::time::Instant;
+use crate::clustering_gpu_impl::run_clustering;
 
 #[allow(clippy::too_many_arguments)]
 pub fn index(
@@ -44,7 +44,7 @@ pub fn index(
         dims = batch_dims; // this is not expected to change
         let vecs_flat: Vec<f32> = batch.into_iter().flatten().collect();
         crate::print_memory(&vecs_flat, "training vectors");
-        let centroids_batch = wrapper_gpu_lib::run_clustering_in_plugin(
+        let centroids_batch = run_clustering(
             vecs_flat,
             dims,
             cluster_count,
@@ -67,7 +67,7 @@ pub fn index(
         centroids_all
     } else {
         info!("All centroids computed in multiple batches, starting re-clusting of {} centroids into {cluster_count} clusters", centroids_all.len()/(dims as usize));
-        wrapper_gpu_lib::run_clustering_in_plugin(
+        run_clustering(
             centroids_all,
             dims,
             cluster_count,

@@ -11,13 +11,12 @@ name = "pgrx_embed_pgpu"
 path = "./src/bin/pgrx_embed.rs"
 
 [workspace]
-members = ["vectorchord-indexing", "pgpu-gpu-lib"]
+members = ["vectorchord-indexing"]
 
 # workspace.dependencies can be referenced by the workspace members. Then we can declare the version only once, here.
 [workspace.dependencies]
-abi_stable = "0.11"
 pgrx = { git = "https://github.com/EnterpriseDB/pgrx", branch = "develop-v0.16.1-edb", default-features = false }
-
+faiss = { version = "0.12.1", features = ["gpu"] }
 [features]
 EPAS = ["pgrx/EPAS"]
 PGE = ["pgrx/PGE"]
@@ -32,6 +31,7 @@ pg_test = []
 [dependencies]
 pgrx = { workspace = true }
 vectorchord-indexing = { path = "vectorchord-indexing" }
+
 
 [dev-dependencies]
 pgrx-tests = { git = "https://github.com/EnterpriseDB/pgrx", branch = "develop-v0.16.1-edb" }

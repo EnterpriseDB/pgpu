@@ -3,7 +3,8 @@ pub mod guc;
 pub mod index;
 mod vector_index_read;
 mod vectorchord_index;
-mod wrapper_gpu_lib;
+mod clustering_gpu_impl;
+
 pub use guc::*;
 pub use index::*;
 use pgrx::Spi;
