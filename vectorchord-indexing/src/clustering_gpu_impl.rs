@@ -1,10 +1,11 @@
+use std::thread::sleep;
 use faiss::{
     cluster::{Clustering, ClusteringParameters},
     gpu::StandardGpuResources,
     index_factory, GpuResources, MetricType,
 };
 use std::time::Instant;
-
+use pgrx::info;
 
 pub fn run_clustering(
     vectors: Vec<f32>,
@@ -43,15 +44,21 @@ pub fn run_clustering(
         .into_gpu(&gpu_res, 0)
         .expect("Flat index creation failed");
 
+    info!("waiting... before GPU mode");
+    sleep(std::time::Duration::from_secs(10));
     // Run the clustering algorithm
     clustering
         .train(&vectors, &mut index)
         .expect("training failed");
 
+    info!("waiting... before getting results");
+    sleep(std::time::Duration::from_secs(10));
     // Retrieve centroids (k x vector_dims floats)
     let centroids = clustering.centroids().expect("centroids not found");
     let centroids_owned: Vec<f32> = centroids.into_iter().flatten().cloned().collect();
 
+    info!("waiting... before returning results");
+    sleep(std::time::Duration::from_secs(10));
     println!(
         "\tClustering (k-means) done in: {:.2?}",
         start_time.elapsed()

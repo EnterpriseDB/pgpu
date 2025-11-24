@@ -1,3 +1,4 @@
+# this is the Cargo.toml for building PGPU for EDB PG variants (EPAS, PGE)
 [package]
 name = "pgpu"
 version = "1.0.0"
@@ -15,10 +16,11 @@ members = ["vectorchord-indexing"]
 
 # workspace.dependencies can be referenced by the workspace members. Then we can declare the version only once, here.
 [workspace.dependencies]
-pgrx = { git = "https://github.com/pgcentralfoundation/pgrx", tag = "v0.16.1", default-features = false }
+pgrx = { git = "https://github.com/EnterpriseDB/pgrx", branch = "develop-v0.16.1-edb", default-features = false }
 faiss = { version = "0.12.1", features = ["gpu"] }
-
 [features]
+EPAS = ["pgrx/EPAS"]
+PGE = ["pgrx/PGE"]
 default = ["pg17"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
@@ -33,7 +35,7 @@ vectorchord-indexing = { path = "vectorchord-indexing" }
 
 
 [dev-dependencies]
-pgrx-tests = { git = "https://github.com/pgcentralfoundation/pgrx", tag = "v0.16.1", default-features = false }
+pgrx-tests = { git = "https://github.com/EnterpriseDB/pgrx", branch = "develop-v0.16.1-edb" }
 
 [profile.dev]
 panic = "unwind"
