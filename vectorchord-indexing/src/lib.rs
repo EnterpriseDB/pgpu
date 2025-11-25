@@ -11,10 +11,8 @@ pub use index::*;
 use pgrx::Spi;
 
 fn print_memory(v: &Vec<f32>, message: &str) {
-    let bytes_len = std::mem::size_of_val(v);
-    let kb_len = bytes_len as f64 / 1024.0 / 1024.0 / 1024.0;
     let heap_size = calculate_vec_size(v) as f64 / 1024.0 / 1024.0 / 1024.0;
-    pgrx::info!("Data length in main memory ({message}): {kb_len:.2} GB, heap {heap_size:.2} GB");
+    pgrx::info!("Data length in main memory ({message}): {heap_size:.2} GB");
 }
 
 fn calculate_vec_size<T>(v: &Vec<T>) -> usize {
