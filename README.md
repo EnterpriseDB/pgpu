@@ -3,13 +3,28 @@
 PGPU is a postgres extension that can use NVIDIA GPUs with CUDA to accelerate certain operations in the database and/or to offload them
 from the CPU to the GPU.
 
+Right now, the extension implements GPU acceleration for vector index build using the vectorchord extension.
+
+## GPU accelerated vector index build
+The vectorchord extension uses an index type that is based on "vector centroids". These
+centroids can be computed very quickly on a GPU and vectorchord can leverage such
+externally computed centroids via an "external build" setting:  https://docs.vectorchord.ai/vectorchord/usage/external-index-precomputation.html
+
+PGPU implement exactly this process:
+- read data from the database
+- compute centroids on the GPU
+- write centroids to PG table
+- call vectorchord indexing, passing the pre-computed centroids table
+
+This work is based on scripts that vectorchord provides: https://github.com/tensorchord/VectorChord/tree/main/scripts#run-external-index-precomputation-toolkit
+
+PGPU just simplifies this process by packaging everything into a single PG exntension and only requiring a single function call.
 ![pgpu process flow](docs/images/pgpu_flow.png)
 
-## Features
-GPU accelerated controids computation for vector indexes using the vectorchord extension.
 
-### Usage examples for vectorchord index build acceleration
-### Set up test data and run PGPU
+
+### Usage examples
+#### Set up test data and run PGPU
 ```sql
 -- create test tables and generate data
 -- 10K table
@@ -29,7 +44,7 @@ FROM generate_series(1, 10000) AS g(i)
    ) AS arr(embedding);
 ```
 
-### Run PGPU
+#### Run PGPU
 ```sql
 SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_1m_vecs', 
                                        column_name => 'embedding', 
