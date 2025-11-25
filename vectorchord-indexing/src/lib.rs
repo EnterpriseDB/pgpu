@@ -1,17 +1,29 @@
 mod centroids_table;
+mod clustering_gpu_impl;
 pub mod guc;
 pub mod index;
 mod vector_index_read;
+mod vector_type;
 mod vectorchord_index;
-mod wrapper_gpu_lib;
+
 pub use guc::*;
 pub use index::*;
 use pgrx::Spi;
 
-fn print_memory(vectors: &[f32], message: &str) {
-    let bytes_len = std::mem::size_of_val(vectors);
-    let kb_len = bytes_len as f64 / 1024.0 / 1024.0 / 1024.0;
-    pgrx::info!("Data length in main memory ({message}): {:.2} GB", kb_len);
+fn print_memory(v: &Vec<f32>, message: &str) {
+    let heap_size = calculate_vec_size(v) as f64 / 1024.0 / 1024.0 / 1024.0;
+    pgrx::info!("Data length in main memory ({message}): {heap_size:.2} GB");
+}
+
+fn calculate_vec_size<T>(v: &Vec<T>) -> usize {
+    // 1. Get the size of a single element (e.g., f32 is 4 bytes)
+    let elem_size = std::mem::size_of::<T>();
+
+    // 2. Get the current allocated capacity of the Vec
+    let capacity = v.capacity();
+
+    // 3. Calculate the total heap memory size in bytes
+    capacity * elem_size
 }
 
 /// Parse a fully qualified table identifier using Postgres' built-in `parse_ident`.

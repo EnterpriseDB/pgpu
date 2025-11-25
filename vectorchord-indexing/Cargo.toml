@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-cuda_gpu = []
 default = []
 
 
 [dependencies]
+faiss = { workspace = true }
+faiss-sys = { workspace = true }
+log = "0.4.28"
 pgrx = { workspace = true }
-abi_stable = { workspace = true }
-libloading = "0.9"

@@ -1,8 +1,8 @@
 use crate::centroids_table;
+use crate::clustering_gpu_impl::run_clustering;
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
-use crate::wrapper_gpu_lib;
 use pgrx::info;
 use pgrx::spi::quote_qualified_identifier;
 use std::time::Instant;
@@ -37,15 +37,20 @@ pub fn index(
 
     info!("running GPU accelerated index build for {schema_table}.{column_name} using {samples} samples (cluster_count * sampling_factor). Reading and processing vectors in batches of {batch_size}");
 
-    let batcher = VectorReadBatcher::new(schema_table.clone(), column_name, samples, batch_size);
+    let mut batcher =
+        VectorReadBatcher::new(schema_table.clone(), column_name, samples, batch_size);
     let mut centroids_all: Vec<f32> = Vec::new();
     let mut dims: u32 = 0;
-    for (batch, batch_dims) in batcher {
+
+    batcher.start_scan();
+    while let Some((vecs, batch_dims)) = batcher.next_batch() {
+        info!("processing batch...");
         dims = batch_dims; // this is not expected to change
-        let vecs_flat: Vec<f32> = batch.into_iter().flatten().collect();
-        crate::print_memory(&vecs_flat, "training vectors");
-        let centroids_batch = wrapper_gpu_lib::run_clustering_in_plugin(
-            vecs_flat,
+
+        crate::print_memory(&vecs, "batch training vectors");
+
+        let centroids_batch = run_clustering(
+            vecs,
             dims,
             cluster_count,
             kmeans_iterations,
@@ -53,11 +58,12 @@ pub fn index(
             spherical_centroids,
         );
 
-        // TODO: can we move centroids_batch instead of copying?
         centroids_all.extend_from_slice(&centroids_batch);
-        crate::print_memory(&centroids_batch, "centroids");
+        crate::print_memory(&centroids_batch, "centroids from this batch");
         crate::print_memory(&centroids_all, "centroids from all batches");
     }
+    batcher.end_scan();
+    info!("getting data finished in {:.2?}", start_time.elapsed());
 
     let centroids_result_flat = if centroids_all.is_empty() {
         info!("No vectors to cluster");
@@ -67,7 +73,7 @@ pub fn index(
         centroids_all
     } else {
         info!("All centroids computed in multiple batches, starting re-clusting of {} centroids into {cluster_count} clusters", centroids_all.len()/(dims as usize));
-        wrapper_gpu_lib::run_clustering_in_plugin(
+        run_clustering(
             centroids_all,
             dims,
             cluster_count,

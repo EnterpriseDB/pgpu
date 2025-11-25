@@ -1,21 +1,20 @@
-use abi_stable::std_types::RVec;
 use faiss::{
     cluster::{Clustering, ClusteringParameters},
     gpu::StandardGpuResources,
     index_factory, GpuResources, MetricType,
 };
+use faiss_sys::*;
+
 use std::time::Instant;
 
-// NOTICE: update the ABI version in abi_version.rs when changing this function signature
-#[no_mangle]
-pub extern "C" fn run_clustering(
-    vectors: RVec<f32>,
+pub fn run_clustering(
+    vectors: Vec<f32>,
     vector_dims: u32,
     cluster_count: u32,
     kmeans_iterations: u32,
     kmeans_nredo: u32,
     spherical_centroids: bool,
-) -> RVec<f32> {
+) -> Vec<f32> {
     println!("Clustering vectors on GPU");
     let start_time = Instant::now();
 
@@ -52,11 +51,15 @@ pub extern "C" fn run_clustering(
 
     // Retrieve centroids (k x vector_dims floats)
     let centroids = clustering.centroids().expect("centroids not found");
-    let centroids_owned: RVec<f32> = centroids.into_iter().flatten().cloned().collect();
+    let centroids_owned: Vec<f32> = centroids.into_iter().flatten().copied().collect();
 
     println!(
         "\tClustering (k-means) done in: {:.2?}",
         start_time.elapsed()
     );
+    // Note: this is undocumented but I found a memory leak whenever we use the GPU resource; this call resolves the issue.
+    unsafe {
+        faiss_StandardGpuResources_free(faiss::gpu::GpuResourcesProvider::inner_ptr(&gpu_res))
+    };
     centroids_owned
 }
