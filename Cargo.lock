@@ -537,6 +537,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "home"
+version = "0.5.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -884,7 +893,7 @@ dependencies = [
 [[package]]
 name = "pgrx"
 version = "0.16.1"
-source = "git+https://github.com/pgcentralfoundation/pgrx?tag=v0.16.1#2e515ae3fe3d350258ce9cd492ce41a7afcbaaef"
+source = "git+https://github.com/EnterpriseDB/pgrx?branch=develop-v0.16.1-edb#0cb51473bdfe1709fd424f63f1b5f645e5fcf3e1"
 dependencies = [
  "bitflags",
  "bitvec",
@@ -904,7 +913,7 @@ dependencies = [
 [[package]]
 name = "pgrx-bindgen"
 version = "0.16.1"
-source = "git+https://github.com/pgcentralfoundation/pgrx?tag=v0.16.1#2e515ae3fe3d350258ce9cd492ce41a7afcbaaef"
+source = "git+https://github.com/EnterpriseDB/pgrx?branch=develop-v0.16.1-edb#0cb51473bdfe1709fd424f63f1b5f645e5fcf3e1"
 dependencies = [
  "bindgen",
  "cc",
@@ -922,7 +931,7 @@ dependencies = [
 [[package]]
 name = "pgrx-macros"
 version = "0.16.1"
-source = "git+https://github.com/pgcentralfoundation/pgrx?tag=v0.16.1#2e515ae3fe3d350258ce9cd492ce41a7afcbaaef"
+source = "git+https://github.com/EnterpriseDB/pgrx?branch=develop-v0.16.1-edb#0cb51473bdfe1709fd424f63f1b5f645e5fcf3e1"
 dependencies = [
  "pgrx-sql-entity-graph",
  "proc-macro2",
@@ -933,12 +942,13 @@ dependencies = [
 [[package]]
 name = "pgrx-pg-config"
 version = "0.16.1"
-source = "git+https://github.com/pgcentralfoundation/pgrx?tag=v0.16.1#2e515ae3fe3d350258ce9cd492ce41a7afcbaaef"
+source = "git+https://github.com/EnterpriseDB/pgrx?branch=develop-v0.16.1-edb#0cb51473bdfe1709fd424f63f1b5f645e5fcf3e1"
 dependencies = [
  "cargo_toml",
  "codepage",
  "encoding_rs",
  "eyre",
+ "home",
  "owo-colors",
  "pathsearch",
  "serde",
@@ -952,7 +962,7 @@ dependencies = [
 [[package]]
 name = "pgrx-pg-sys"
 version = "0.16.1"
-source = "git+https://github.com/pgcentralfoundation/pgrx?tag=v0.16.1#2e515ae3fe3d350258ce9cd492ce41a7afcbaaef"
+source = "git+https://github.com/EnterpriseDB/pgrx?branch=develop-v0.16.1-edb#0cb51473bdfe1709fd424f63f1b5f645e5fcf3e1"
 dependencies = [
  "cee-scape",
  "libc",
@@ -965,7 +975,7 @@ dependencies = [
 [[package]]
 name = "pgrx-sql-entity-graph"
 version = "0.16.1"
-source = "git+https://github.com/pgcentralfoundation/pgrx?tag=v0.16.1#2e515ae3fe3d350258ce9cd492ce41a7afcbaaef"
+source = "git+https://github.com/EnterpriseDB/pgrx?branch=develop-v0.16.1-edb#0cb51473bdfe1709fd424f63f1b5f645e5fcf3e1"
 dependencies = [
  "convert_case",
  "eyre",
@@ -980,7 +990,7 @@ dependencies = [
 [[package]]
 name = "pgrx-tests"
 version = "0.16.1"
-source = "git+https://github.com/pgcentralfoundation/pgrx?tag=v0.16.1#2e515ae3fe3d350258ce9cd492ce41a7afcbaaef"
+source = "git+https://github.com/EnterpriseDB/pgrx?branch=develop-v0.16.1-edb#0cb51473bdfe1709fd424f63f1b5f645e5fcf3e1"
 dependencies = [
  "clap-cargo",
  "eyre",
@@ -1682,6 +1692,8 @@ name = "vectorchord-indexing"
 version = "0.1.0"
 dependencies = [
  "faiss",
+ "faiss-sys",
+ "log",
  "pgrx",
 ]
 

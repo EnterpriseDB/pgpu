@@ -3,15 +3,12 @@ mod clustering_gpu_impl;
 pub mod guc;
 pub mod index;
 mod vector_index_read;
-mod vectorchord_index;
 mod vector_type;
+mod vectorchord_index;
 
 pub use guc::*;
 pub use index::*;
-use pgrx::spi::SpiError;
-use pgrx::{debug1, pg_extern, warning, PgMemoryContexts, Spi};
-use std::ffi::c_long;
-use std::time::Instant;
+use pgrx::Spi;
 
 fn print_memory(v: &Vec<f32>, message: &str) {
     let bytes_len = std::mem::size_of_val(v);
@@ -48,119 +45,4 @@ pub fn parse_table_identifier(ident: &str) -> (String, String) {
     }
 
     (parts[0].clone(), parts[1].clone())
-}
-
-pub fn dump_mem_ctx() {
-    Spi::run(
-        "DO $$
-DECLARE
-    current_pid INTEGER;
-BEGIN
-    -- 1. Get the PID of the current session.
-    SELECT pg_backend_pid() INTO current_pid;
-
-    RAISE NOTICE 'Dumping memory contexts for PID % to the server log.', current_pid;
-
-    -- 2. Call the dump function using the retrieved PID.
-    -- This function returns TRUE on success.
-    PERFORM pg_log_backend_memory_contexts(current_pid);
-
-    RAISE NOTICE 'Memory contexts have been logged. Check the PostgreSQL server logs.';
-
-END
-$$ LANGUAGE plpgsql;",
-    )
-    .unwrap();
-}
-
-#[pg_extern]
-pub fn apples() {
-    warning!("running memory test");
-    let query = "SELECT
-            g.row_num,
-            (
-                SELECT ARRAY_AGG(i ORDER BY i)
-                FROM GENERATE_SERIES(1, 10000) AS t(i)
-            ) AS increasing_numbers_array
-        FROM GENERATE_SERIES(1, 10000) AS g(row_num);
-            ";
-    for i in 0..1000000000 {
-        let vecs = unsafe {
-            PgMemoryContexts::switch_to(
-                &mut PgMemoryContexts::Transient {
-                    parent: PgMemoryContexts::CurrentMemoryContext.value(),
-                    name: "per-call",
-                    min_context_size: 4096,
-                    initial_block_size: 4096,
-                    max_block_size: 4096,
-                },
-                |_| {
-                    // get one batch using offset
-                    let vecs = Spi::connect(|client| {
-                        let res = client
-                            .select(query, None, &[])
-                            .expect("unable to get result")
-                            .map(|row| {
-                                Ok::<Vec<i32>, SpiError>(
-                                    row.get_by_name("increasing_numbers_array")?.unwrap(),
-                                )
-                            })
-                            .collect::<Result<Vec<_>, SpiError>>()
-                            .expect("");
-                        res.to_owned()
-                    });
-                    vecs
-                },
-            )
-        };
-        dump_mem_ctx();
-        let used_md: i64 = Spi::get_one("select used_bytes/1024/1024 as \"used MB\" from pg_backend_memory_contexts where name = 'TopTransactionContext';").expect("unable to get memory usage").unwrap();
-        warning!(
-            "iteration {i}, received {} vectors - TopTransactionContext used memory: {:.2} MB",
-            vecs.len(),
-            used_md
-        );
-    }
-}
-
-#[pg_extern]
-pub fn bananas() {
-    warning!("running memory test");
-    let query = "select public.increasing_numbers_array()";
-    for i in 0..1000 {
-        let vecs = unsafe {
-            PgMemoryContexts::switch_to(
-                &mut PgMemoryContexts::Transient {
-                    parent: PgMemoryContexts::CurrentMemoryContext.value(),
-                    name: "per-call",
-                    min_context_size: 4096,
-                    initial_block_size: 4096,
-                    max_block_size: 4096,
-                },
-                |_| {
-                    // get one batch using offset
-                    let vecs = Spi::connect(|client| {
-                        let res = client
-                            .select(query, None, &[])
-                            .expect("unable to get result")
-                            .map(|row| {
-                                Ok::<Vec<i32>, SpiError>(
-                                    row.get_by_name("increasing_numbers_array")?.unwrap(),
-                                )
-                            })
-                            .collect::<Result<Vec<_>, SpiError>>()
-                            .expect("");
-                        res.to_owned()
-                    });
-                    vecs
-                },
-            )
-        };
-        let used_md: i64 = Spi::get_one("select used_bytes/1024/1024 as \"used MB\" from pg_backend_memory_contexts where name = 'TopTransactionContext';").expect("unable to get memory usage").unwrap();
-        warning!(
-            "iteration {i}, received {} vectors - TopTransactionContext used memory: {:.2} MB",
-            vecs.len(),
-            used_md
-        );
-    }
 }

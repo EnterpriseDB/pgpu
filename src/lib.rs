@@ -2,36 +2,33 @@ mod vectorchord_indexing;
 
 use pgrx::prelude::*;
 
-::pgrx::pg_module_magic!(name, version);
+pg_module_magic!(name, version);
 
+/// For basic CI testing; just to see if the extension will run
 #[pg_extern]
-fn hello_pgpu() -> &'static str {
-    "Hello, pgpu"
+fn ping() -> &'static str {
+    "pong"
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pg_schema]
-mod tests {
-    use pgrx::prelude::*;
+pub fn dump_mem_ctx() {
+    Spi::run(
+        "DO $$
+DECLARE
+    current_pid INTEGER;
+BEGIN
+    -- 1. Get the PID of the current session.
+    SELECT pg_backend_pid() INTO current_pid;
 
-    #[pg_test]
-    fn test_hello_pgpu() {
-        assert_eq!("Hello, pgpu", crate::hello_pgpu());
-    }
+    RAISE NOTICE 'Dumping memory contexts for PID % to the server log.', current_pid;
 
-}
+    -- 2. Call the dump function using the retrieved PID.
+    -- This function returns TRUE on success.
+    PERFORM pg_log_backend_memory_contexts(current_pid);
 
-/// This module is required by `cargo pgrx test` invocations.
-/// It must be visible at the root of your extension crate.
-#[cfg(test)]
-pub mod pg_test {
-    pub fn setup(_options: Vec<&str>) {
-        // perform one-off initialization when the pg_test framework starts
-    }
+    RAISE NOTICE 'Memory contexts have been logged. Check the PostgreSQL server logs.';
 
-    #[must_use]
-    pub fn postgresql_conf_options() -> Vec<&'static str> {
-        // return any postgresql.conf settings that are required for your tests
-        vec![]
-    }
+END
+$$ LANGUAGE plpgsql;",
+    )
+    .unwrap();
 }

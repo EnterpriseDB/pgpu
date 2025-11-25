@@ -15,10 +15,13 @@ members = ["vectorchord-indexing"]
 
 # workspace.dependencies can be referenced by the workspace members. Then we can declare the version only once, here.
 [workspace.dependencies]
-pgrx = { git = "https://github.com/pgcentralfoundation/pgrx", tag = "v0.16.1", default-features = false }
 faiss = { version = "0.12.1", features = ["gpu"] }
+faiss-sys = { version = "0.6.2", features = ["gpu"] }
+pgrx = { git = "https://github.com/EnterpriseDB/pgrx", branch = "develop-v0.16.1-edb", default-features = false }
 
 [features]
+EPAS = ["pgrx/EPAS"]
+PGE = ["pgrx/PGE"]
 default = ["pg17"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
@@ -33,7 +36,7 @@ vectorchord-indexing = { path = "vectorchord-indexing" }
 
 
 [dev-dependencies]
-pgrx-tests = { git = "https://github.com/pgcentralfoundation/pgrx", tag = "v0.16.1", default-features = false }
+pgrx-tests = { git = "https://github.com/EnterpriseDB/pgrx", branch = "develop-v0.16.1-edb", default-features = false }
 
 [profile.dev]
 panic = "unwind"

@@ -1,10 +1,7 @@
-use crate::{dump_mem_ctx, vector_type};
-use pgrx::datum::PgVarlena;
-use pgrx::pg_sys::{varlena, SysScanDesc};
-use pgrx::prelude::PgHeapTuple;
-use pgrx::spi::SpiError;
-use pgrx::{debug1, debug2, debug3, debug5, heap_getattr_raw, info, pg_sys, spi, warning, Array, PgBox, PgMemoryContexts, PgRelation, PgTupleDesc, Spi};
-use std::ffi::{c_char, c_long};
+use crate::vector_type;
+use pgrx::pg_sys::{format_type_be, SysScanDesc};
+use pgrx::{debug1, debug2, heap_getattr_raw, notice, pg_sys, PgRelation};
+use std::ffi::CStr;
 use std::time::Instant;
 
 pub struct VectorReadBatcher {
@@ -12,7 +9,8 @@ pub struct VectorReadBatcher {
     column_name: String,
     vectors_total: u64,
     vectors_per_batch: u64,
-    cursor_name: Option<String>,
+    vectors_read: u64,
+    //cursor_name: Option<String>,
     table_scan: Option<SysScanDesc>,
     pg_rel: Option<PgRelation>,
     col_num: Option<usize>,
@@ -30,14 +28,16 @@ impl VectorReadBatcher {
             column_name,
             vectors_total,
             vectors_per_batch,
-            cursor_name: None,
+            vectors_read: 0,
             table_scan: None,
             pg_rel: None,
             col_num: None,
         }
     }
 
-    pub(crate) fn get_batch_cursor(&mut self) -> Option<(Vec<f32>, u32)> {
+    // original SQL/SPI based implementation. Unused because of memory "leak": https://github.com/pgcentralfoundation/pgrx/issues/2211
+    // left-in for reference
+    /*    pub(crate) fn get_batch_cursor(&mut self) -> Option<(Vec<f32>, u32)> {
         debug1!("(SPI/SQL Cursor) Reading a batch of {vectors_per_batch} vectors (total vectors to read: {vectors_total}) from {table_name}.{column_name}...",
         vectors_total = self.vectors_total,
         vectors_per_batch = self.vectors_per_batch,
@@ -89,7 +89,7 @@ impl VectorReadBatcher {
             None => 0,
         };
 
-        debug1!(
+        info!(
             "Read {} vectors in: {:.2?}",
             vecs.len(),
             start_time.elapsed()
@@ -98,124 +98,130 @@ impl VectorReadBatcher {
             true => None,
             false => Some((vecs.into_iter().flatten().collect(), dims as u32)),
         }
+    }*/
+
+    pub(crate) fn start_scan(&mut self) {
+        let pg_rel = PgRelation::open_with_name_and_share_lock(&self.table_name)
+            .expect("unable to open table");
+        if !pg_rel.is_table() {
+            panic!(
+                "table {} is not a table; only regular tables are supported",
+                self.table_name
+            );
+        }
+        debug2!(
+            "table {} is a table and has {:?} tuples",
+            self.table_name,
+            pg_rel.reltuples()
+        );
+
+        // look for the column number
+        let tup_desc = pg_rel.tuple_desc();
+        let mut col_num_found: Option<i32> = None;
+        for attr in tup_desc.iter().filter(|a| !a.attisdropped) {
+            let col_name = pgrx::name_data_to_str(&attr.attname);
+            unsafe {
+                if col_name == self.column_name {
+                    let type_name = CStr::from_ptr(format_type_be(attr.atttypid))
+                        .to_str()
+                        .expect("invalid type name");
+                    if type_name != "vector" {
+                        panic!("column \"{}\" type is not \"vector\". Only pgvector/vector types are supported", self.column_name);
+                    }
+                    col_num_found = Some(attr.attnum.into());
+                }
+            }
+        }
+        let col_num = col_num_found.unwrap_or_else(|| {
+            panic!(
+                "column {} not found in table {}",
+                self.column_name, self.table_name
+            )
+        });
+        self.col_num = Some(col_num as usize);
+
+        // initialize a simple sequential table scan; "systable_beginscan" is just called "systable" for historical reasons
+        // very common to use this wrapper on user tables
+        let scan = unsafe {
+            pg_sys::systable_beginscan(
+                pg_rel.as_ptr(),
+                pg_sys::InvalidOid,               // no index
+                false,                            // no idex use
+                pg_sys::GetTransactionSnapshot(), // we need to use our snapshot to not violate MVCC
+                0,                                // number of scan keys
+                std::ptr::null_mut(),             // no key; no filter needed
+            )
+        };
+        self.table_scan = Some(scan);
+        self.pg_rel = Some(pg_rel.clone());
+        debug1!("systable scan initialized");
     }
 
-    pub(crate) fn get_batch_native(&mut self) -> Option<(Vec<f32>, u32)> {
-        debug1!("(TABLE SCAN) Reading a batch of {vectors_per_batch} vectors, (total vectors to read: {vectors_total}) from {table_name}.{column_name}...",
-        vectors_total = self.vectors_total,
-        vectors_per_batch = self.vectors_per_batch,
-        table_name = self.table_name,
-        column_name = self.column_name);
+    pub(crate) fn end_scan(self) {
+        let scan = self.table_scan.expect("systable scan not initialized");
         unsafe {
-            let start_time = Instant::now();
+            pg_sys::systable_endscan(scan);
+        }
+    }
 
-            // Open the cursor on the first use. We will reference it by name
-            if self.table_scan.is_none() {
-                let pg_rel = PgRelation::open_with_name_and_share_lock(&*self.table_name)
-                    .expect("unable to open table");
-                if !pg_rel.is_table() {
-                    panic!(
-                        "table {} is not a table; only regular tables are supported",
-                        self.table_name
-                    );
-                }
-                debug2!(
-                    "table {} is a table and has {:?} tuples",
-                    self.table_name,
-                    pg_rel.reltuples()
-                );
+    pub(crate) fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
+        notice!("({vectors_read}/{vectors_total}) Reading next batch of {vectors_per_batch} from {table_name}.{column_name}...",
+            vectors_total = self.vectors_total,
+            vectors_read = self.vectors_read,
+            vectors_per_batch = self.vectors_per_batch,
+            table_name = self.table_name,
+            column_name = self.column_name
+        );
+        let start_time = Instant::now();
+        unsafe {
+            assert!(
+                self.table_scan.is_some(),
+                "systable scan not initialized; call start_scan() first"
+            );
 
-                // look for the column number
-                let tup_desc = pg_rel.tuple_desc();
-                let mut col_num_found: Option<i32> = None;
-                for (_, attr) in tup_desc.iter().filter(|a| !a.attisdropped).enumerate() {
-                    let col_name = pgrx::name_data_to_str(&attr.attname);
-                    if col_name == self.column_name {
-                        col_num_found = Some(attr.attnum.into());
-                    }
-                }
-                let col_num = col_num_found.expect(
-                    format!(
-                        "column {} not found in table {}",
-                        self.column_name, self.table_name
-                    )
-                    .as_str(),
-                );
-                self.col_num = Some(col_num as usize);
-
-                // initialize a simple sequential table scan; "systable_beginscan" is just called "systable" for historical reasons
-                // very common to use this wrapper on user tables
-                let scan = pg_sys::systable_beginscan(
-                    pg_rel.as_ptr(),
-                    pg_sys::InvalidOid,               // no index
-                    false,                            // no idex use
-                    pg_sys::GetTransactionSnapshot(), // we need to use our snapshot to not violate MVCC
-                    0,                                // number of scan keys
-                    std::ptr::null_mut(),             // no key; no filter needed
-                );
-                self.table_scan = Some(scan);
-                self.pg_rel = Some(pg_rel.clone());
-                debug1!("systable scan initialized");
-                warning!("systable scan initialized");
-            }
-
-            let scan = self.table_scan.clone().expect("systable scan not initialized");
-            let pg_rel = self.pg_rel.clone().expect("tuple descriptor not initialized");
+            let scan = self.table_scan.expect("systable scan not initialized");
+            let pg_rel = self
+                .pg_rel
+                .clone()
+                .expect("tuple descriptor not initialized");
             let tup_desc = pg_rel.tuple_desc();
             let col_num = self.col_num.expect("column number not initialized");
-
+            let col_num_nonzero = std::num::NonZero::new(col_num).unwrap();
 
             let mut all_vectors: Vec<f32> = Vec::new();
             let mut dims: u32 = 0;
-            for i in 0..self.vectors_per_batch {
-                let tuple = pg_sys::systable_getnext(scan);
-                if tuple.is_null() {
-                    pg_sys::systable_endscan(scan);
+            for _i in 0..self.vectors_per_batch {
+                if self.vectors_read >= self.vectors_total {
                     break;
                 }
-                debug3!("({i}) got a tuple");
+                self.vectors_read += 1;
+                let tuple = pg_sys::systable_getnext(scan);
+                if tuple.is_null() {
+                    break;
+                }
+                //debug3!("({i}) got a tuple");
 
-                let pgtup = PgHeapTuple::from_heap_tuple(tup_desc.clone(), tuple);
-                // Extract the raw Datum
-                let pg_attr = pgtup
-                    .get_attribute_by_index(std::num::NonZero::new(col_num).unwrap())
-                    //.get_by_index::<pgrx::datum::PgVarlena<f32>>(std::num::NonZero::new(col_num as usize).unwrap())
-                    .unwrap();
+                let datum = heap_getattr_raw(tuple, col_num_nonzero, tup_desc.as_ptr())
+                    .expect("unable to get datum");
+                //debug3!("({i}) got a datum: {:?}", datum);
 
-                debug3!("({i}) got a pg_attr: {:?}", pg_attr);
-
-                let datum = heap_getattr_raw(
-                    tuple,
-                    std::num::NonZero::new(col_num).unwrap(),
-                    tup_desc.as_ptr(),
-                )
-                .expect("unable to get datum");
-
-                debug3!("({i}) got a datum: {:?}", datum);
-
-                let raw_ptr = datum.cast_mut_ptr() as *mut pg_sys::varlena;
+                let raw_ptr = datum.cast_mut_ptr();
                 let detoasted_ptr = pg_sys::pg_detoast_datum(raw_ptr);
 
                 let byte_slice = pgrx::varlena_to_byte_slice(detoasted_ptr);
+                //debug5!("({i}) got bytes: {:?}", byte_slice);
 
-                debug5!("({i}) got bytes: {:?}", byte_slice);
-
-                let (vector_values, dims) = vector_type::decode_pgvector_vector(byte_slice);
+                let (vector_values, vector_dims) = vector_type::decode_pgvector_vector(byte_slice);
                 all_vectors.extend_from_slice(&vector_values);
+                dims = vector_dims;
+                //debug5!("({i}) got the vector: {:?}", vector_values);
 
-                debug5!("({i}) got the vector: {:?}", vector_values);
-
-                // CLEANUP: run after data was copied
                 if detoasted_ptr != raw_ptr {
                     pg_sys::pfree(detoasted_ptr as *mut std::ffi::c_void);
                 }
             }
 
-            //pg_sys::systable_endscan(scan);
-            info!(
-            "Read vectors in: {:.2?}",
-            start_time.elapsed()
-        );
+            debug1!("Read vectors in: {:.2?}", start_time.elapsed());
             match all_vectors.is_empty() {
                 true => None,
                 false => Some((all_vectors, dims)),
@@ -223,7 +229,7 @@ impl VectorReadBatcher {
         }
     }
 
-    pub fn get_batch_test(&self) -> Option<(Vec<f32>, u32)> {
+    /*    pub fn get_batch_test(&self) -> Option<(Vec<f32>, u32)> {
         let dims = 2000;
         let inner_vec: Vec<f32> = std::iter::repeat(0.01234).take(dims).collect();
         let matrix: Vec<Vec<f32>> = std::iter::repeat(inner_vec.clone())
@@ -231,14 +237,5 @@ impl VectorReadBatcher {
             .collect();
         let matrix_flat: Vec<f32> = matrix.into_iter().flatten().collect();
         Some((matrix_flat, dims as u32))
-    }
-}
-
-impl Iterator for VectorReadBatcher {
-    type Item = (Vec<f32>, u32);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.get_batch_cursor()
-        //self.get_batch_native()
-    }
+    }*/
 }
