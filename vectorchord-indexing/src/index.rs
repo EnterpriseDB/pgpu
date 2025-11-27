@@ -1,4 +1,4 @@
-use crate::centroids_table;
+use crate::{centroids_table, util};
 use crate::clustering_gpu_impl::run_clustering;
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
@@ -26,8 +26,7 @@ pub fn index(
     let (schema, table) = crate::parse_table_identifier(&table_name);
     let schema_table = quote_qualified_identifier(schema.clone(), table.clone());
 
-    vectorchord_index::assert_valid_distance_operator(&distance_operator);
-    let spherical_centroids = distance_operator == "ip";
+    util::assert_valid_distance_operator(&distance_operator);
     let centroid_table_name = quote_qualified_identifier(schema, format!("{table}_centroids"));
     assert!(centroid_table_name.len() <= 63, "generated centroid table name \"{centroid_table_name}\" is too long to use as a postgres identifier. Use a source table name that is shorter than 53 characters");
 
@@ -55,7 +54,7 @@ pub fn index(
             cluster_count,
             kmeans_iterations,
             kmeans_nredo,
-            spherical_centroids,
+            &distance_operator,
         );
 
         centroids_all.extend_from_slice(&centroids_batch);
@@ -79,7 +78,7 @@ pub fn index(
             cluster_count,
             kmeans_iterations,
             kmeans_nredo,
-            spherical_centroids,
+            &distance_operator,
         )
     };
 

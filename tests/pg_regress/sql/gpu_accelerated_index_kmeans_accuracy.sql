@@ -53,6 +53,7 @@ from test_100k_vecs_centroids
 ORDER BY (vector::real[])[1];
 
 
+
 -- compare against series. Check if centroids are within "1" distance of expected 1..100
 WITH expected AS (
     SELECT g AS val

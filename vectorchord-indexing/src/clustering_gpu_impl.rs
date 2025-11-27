@@ -1,10 +1,10 @@
-use faiss::{
-    cluster::{Clustering, ClusteringParameters},
-    gpu::StandardGpuResources,
-    index_factory, GpuResources, MetricType,
-};
-use faiss_sys::*;
+use crate::util::distance_type_from_str;
+use cuvs::cluster::kmeans;
+use cuvs::distance_type::DistanceType;
+use cuvs::{ManagedTensor, Resources};
+use ndarray::Array;
 
+use pgrx::warning;
 use std::time::Instant;
 
 pub fn run_clustering(
@@ -13,53 +13,66 @@ pub fn run_clustering(
     cluster_count: u32,
     kmeans_iterations: u32,
     kmeans_nredo: u32,
-    spherical_centroids: bool,
+    distance_operator: &str,
 ) -> Vec<f32> {
-    println!("Clustering vectors on GPU");
+    warning!("Clustering vectors on GPU");
     let start_time = Instant::now();
 
-    // Set up clustering parameters
-    let mut params = ClusteringParameters::new();
-    params.set_niter(kmeans_iterations); // number of k-means iterations - vchord on GPU uses 25; on CPU they only use 10
-    params.set_nredo(kmeans_nredo); // number of times to redo and keep best
-    params.set_verbose(true); // print progress
-    params.set_update_index(true); // update the index after each iteration for better results
-    params.set_spherical(spherical_centroids);
+    // cuvs setup
+    let res = Resources::new().expect("GPU Resource creation failed");
+    // shape is (rows, cols). rows is determined by the length of the vector input; so we divide by dimensions to get that value
+    let vectors_array = Array::from_shape_vec(
+        (vectors.len() / vector_dims as usize, vector_dims as usize),
+        vectors.to_vec(),
+    )
+    .expect("shaping vectors failed");
+    let dataset = ManagedTensor::from(&vectors_array)
+        .to_device(&res)
+        .expect("vectors->tensor transformation failed");
 
-    // spherical_centroids should be used when the distance metric for the dataset is not L2
-    let index_metric_type = if spherical_centroids {
-        MetricType::InnerProduct
-    } else {
-        MetricType::L2
+    let centroids_host =
+        ndarray::Array::<f32, _>::zeros((cluster_count as usize, vector_dims as usize));
+    let mut centroids = ManagedTensor::from(&centroids_host)
+        .to_device(&res)
+        .expect("centroids(empty)->tensor transformation failed");
+
+    let distance_operator_cuvs = distance_type_from_str(&distance_operator)
+        .expect(format!("invalid distance operator: {distance_operator}").as_str());
+    let balanced_kmeans = match distance_operator_cuvs {
+        DistanceType::InnerProduct | DistanceType::CosineExpanded => true,
+        _ => false,
     };
 
-    // Create the clustering object with parameters
-    let mut clustering = Clustering::new_with_params(vector_dims, cluster_count, &params)
-        .expect("Clustering creation failed");
+    let kmeans_params = kmeans::Params::new()
+        .expect("kmeans params create failed")
+        .set_n_clusters(cluster_count as i32)
+        .set_max_iter(kmeans_iterations as i32)
+        .set_n_init(kmeans_nredo as i32)
+        .set_metric(distance_operator_cuvs)
+        .set_hierarchical(balanced_kmeans);
 
-    let mut gpu_res = StandardGpuResources::new().unwrap();
-    gpu_res.no_temp_memory().unwrap(); // TODO: we have a GPU memory leak when temp_memory is being used; not sure why. AFAICT this shouldn't be the case. Disabling temp memory seems to cost a little performance
-    let mut index = index_factory(vector_dims, "Flat", index_metric_type)
-        .unwrap()
-        .into_gpu(&gpu_res, 0)
-        .expect("Flat index creation failed");
+    warning!(
+        "\tpreparing/transferring data done in: {:.2?}",
+        start_time.elapsed()
+    );
 
-    // Run the clustering algorithm
-    clustering
-        .train(&vectors, &mut index)
-        .expect("training failed");
+    warning!("running kemans");
+    let (inertia, n_iter) = kmeans::fit(&res, &kmeans_params, &dataset, &None, &mut centroids)
+        .expect("kmeans training failed");
+    warning!("kmeans done with inertia: {inertia}, n_iter: {n_iter}");
 
-    // Retrieve centroids (k x vector_dims floats)
-    let centroids = clustering.centroids().expect("centroids not found");
-    let centroids_owned: Vec<f32> = centroids.into_iter().flatten().copied().collect();
+    warning!("retrieve results from GPU");
+    let mut centroids_host_result =
+        ndarray::Array::<f32, _>::zeros((cluster_count as usize, vector_dims as usize));
+    centroids
+        .to_host(&res, &mut centroids_host_result)
+        .expect("centroids->host transfer failed");
 
-    println!(
+    let centroids_owned: Vec<f32> = centroids_host_result.into_raw_vec().into();
+
+    warning!(
         "\tClustering (k-means) done in: {:.2?}",
         start_time.elapsed()
     );
-    // Note: this is undocumented but I found a memory leak whenever we use the GPU resource; this call resolves the issue.
-    unsafe {
-        faiss_StandardGpuResources_free(faiss::gpu::GpuResourcesProvider::inner_ptr(&gpu_res))
-    };
     centroids_owned
 }
