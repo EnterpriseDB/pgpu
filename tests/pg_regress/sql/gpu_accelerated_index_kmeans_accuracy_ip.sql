@@ -8,7 +8,7 @@ create extension vchord cascade;
 -- shared_preload_libraries = 'vchord'
 
 -- Setup
-CREATE TABLE test_100k_vecs
+CREATE TABLE test_100k_vecs_ip
 (
     id        bigserial PRIMARY KEY,
     embedding vector(2000)
@@ -25,13 +25,13 @@ DO
 $$
     DECLARE
         DIM    int := 2000;
-        K      int := 100;
+        K      int := 100; -- NOTE: not actually using this below; we're using floats here so it's awkward using counters like this
         COPIES int := 1000;
     BEGIN
         EXECUTE format($f$
-        INSERT INTO test_100k_vecs (embedding)
+        INSERT INTO test_100k_vecs_ip (embedding)
         SELECT array_fill(k::real, ARRAY[%1$s])::vector
-        FROM generate_series(1, %2$s) AS k
+        FROM generate_series(0.001, 0.1, 0.001) AS k
         CROSS JOIN generate_series(1, %3$s) AS r;
       $f$, DIM, K, COPIES);
     END
@@ -41,15 +41,23 @@ $$;
 
 -- sampling factor and cluster count guarantee that we execute in batches
 -- NOTE: must use l2 distance to avoid normalizing vectors
-SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_100k_vecs', column_name => 'embedding', batch_size => 10000,
+SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_100k_vecs_ip', column_name => 'embedding', batch_size => 10000,
                                        cluster_count => 100, sampling_factor => 1000, kmeans_iterations=>10,
-                                       kmeans_nredo=>1, distance_operator=> 'l2', skip_index_build=> true);
+                                       kmeans_nredo=>1, distance_operator=> 'ip', skip_index_build=> true);
 
 
 -- check with:
 select (vector::real[])[1]
-from test_100k_vecs_centroids
+from test_100k_vecs_ip_centroids
 ORDER BY (vector::real[])[1];
+
+
+
+
+
+
+
+
 
 
 
