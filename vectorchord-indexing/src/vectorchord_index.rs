@@ -1,4 +1,5 @@
 use pgrx::{info, Spi};
+use crate::util;
 
 pub fn create_vectorchord_index(
     table: String,
@@ -6,7 +7,7 @@ pub fn create_vectorchord_index(
     centroids_table_name: String,
     distance_operator: String,
 ) {
-    assert_valid_distance_operator(&distance_operator);
+    util::assert_valid_distance_operator(&distance_operator);
     let index_name = format!("{table}_pgpu_ext");
     let index_metric_type = format!("vector_{distance_operator}_ops");
 
@@ -24,13 +25,4 @@ table = '{centroids_table_name}'
 $$);"
     ))
     .expect("error creating vectorchord index");
-}
-
-pub(crate) fn assert_valid_distance_operator(input: &str) {
-    match input {
-        "ip" | "l2" | "cos" => (),
-        _ => {
-            panic!("Invalid distance_operator \"{input}\": expected one of \"ip\", \"l2\", \"cos\"")
-        }
-    }
 }

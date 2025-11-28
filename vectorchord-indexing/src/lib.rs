@@ -5,6 +5,7 @@ pub mod index;
 mod vector_index_read;
 mod vector_type;
 mod vectorchord_index;
+mod util;
 
 pub use guc::*;
 pub use index::*;
