@@ -7,43 +7,69 @@ create extension vchord cascade;
 -- add to "/var/lib/postgresql/17/main/postgresql.auto.conf"
 -- shared_preload_libraries = 'vchord'
 
--- Setup
-CREATE TABLE test_100k_vecs_ip
-(
-    id        bigserial PRIMARY KEY,
-    embedding vector(2000)
+
+
+
+
+
+CREATE TABLE test_vecs_normalized_small (
+                              id SERIAL PRIMARY KEY,
+                              embedding vector(2)
+);
+CREATE TABLE test_vecs_normalized_large (
+                              id SERIAL PRIMARY KEY,
+                              embedding vector(2)
+);
+CREATE TABLE test_vecs_small (
+                              id SERIAL PRIMARY KEY,
+                              embedding vector(2)
 );
 
+INSERT INTO test_vecs_small (embedding)
+SELECT
+    ARRAY[
+        (random() * 2 - 1), -- X value
+        (random() * 2 - 1)  -- Y value
+        ]::vector
+FROM generate_series(1, 1000);
 
+INSERT INTO test_vecs_normalized_large (embedding)
+SELECT
+    l2_normalize(ARRAY[
+        (random() * 2 - 1), -- X value
+        (random() * 2 - 1)  -- Y value
+        ]::vector)
+FROM generate_series(1, 100000);
 
--- we get 100k vectors but only 100 different ones.
--- the first vector is [1, 1, 1, 1, ...] and gets repeated 1000 times
--- the 1001 vector is [2, 2, 2, ...] and gets repeated 1000 times
---  this means kmeans SHOULD find 100 unique clusters close to those values
--- each vector is [k, k, k, ..., k] (length DIM)
-DO
-$$
-    DECLARE
-        DIM    int := 2000;
-        K      int := 100; -- NOTE: not actually using this below; we're using floats here so it's awkward using counters like this
-        COPIES int := 1000;
-    BEGIN
-        EXECUTE format($f$
-        INSERT INTO test_100k_vecs_ip (embedding)
-        SELECT array_fill(k::real, ARRAY[%1$s])::vector
-        FROM generate_series(0.001, 0.1, 0.001) AS k
-        CROSS JOIN generate_series(1, %3$s) AS r;
-      $f$, DIM, K, COPIES);
-    END
-$$;
+-- 4. Verify the data
+-- This query checks the id, the raw vector, and proves the length is 1.0 (Normalized)
+SELECT *
+FROM test_vecs_normalized_small
+LIMIT 10;
+
+-- run the python script to visualize the vectors
+
 
 
 
 -- sampling factor and cluster count guarantee that we execute in batches
 -- NOTE: must use l2 distance to avoid normalizing vectors
-SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_100k_vecs_ip', column_name => 'embedding', batch_size => 10000,
-                                       cluster_count => 100, sampling_factor => 1000, kmeans_iterations=>10,
+SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_vecs_normalized_small', column_name => 'embedding', batch_size => 1000,
+                                       cluster_count => 10, sampling_factor => 100, kmeans_iterations=>10,
                                        kmeans_nredo=>1, distance_operator=> 'ip', skip_index_build=> true);
+
+
+
+
+-- sampling factor and cluster count guarantee that we execute in batches
+-- NOTE: must use l2 distance to avoid normalizing vectors
+SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_vecs_small', column_name => 'embedding', batch_size => 1000,
+                                       cluster_count => 10, sampling_factor => 100, kmeans_iterations=>10,
+                                       kmeans_nredo=>1, distance_operator=> 'ip', skip_index_build=> true);
+
+
+
+
 
 
 -- check with:

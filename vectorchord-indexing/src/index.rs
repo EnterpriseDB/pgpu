@@ -18,6 +18,7 @@ pub fn index(
     kmeans_nredo: u32,
     distance_operator: String,
     skip_index_build: bool,
+    spherical_centroids: bool
 ) {
     if !use_gpu_acceleration() {
         panic!("GPU acceleration is not enabled. Ensure that your system is compatible and then configure: \"SET pgpu.gpu_acceleration = 'enable';\"");
@@ -55,6 +56,7 @@ pub fn index(
             kmeans_iterations,
             kmeans_nredo,
             &distance_operator,
+            spherical_centroids
         );
 
         centroids_all.extend_from_slice(&centroids_batch);
@@ -79,6 +81,7 @@ pub fn index(
             kmeans_iterations,
             kmeans_nredo,
             &distance_operator,
+            spherical_centroids
         )
     };
 
