@@ -77,6 +77,7 @@ pub fn run_clustering(
         .expect("centroids->host transfer failed");
 
     if spherical_centroids {
+        warning!("normalizing centroids");
         // 1. Iterate over the rows (Axis 0) mutably
         for mut row in centroids_host_result.axis_iter_mut(Axis(0)) {
             // 2. Calculate L2 norm
