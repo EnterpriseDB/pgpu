@@ -12,6 +12,7 @@ pub fn create_vector_index_on_gpu(
     kmeans_nredo: default!(i64, 1),
     distance_operator: default!(String, "'ip'"),
     skip_index_build: default!(bool, false),
+    spherical_centroids: default!(bool, false),
 ) {
     vectorchord_indexing::index(
         table_name,
@@ -23,5 +24,6 @@ pub fn create_vector_index_on_gpu(
         kmeans_nredo as u32,
         distance_operator,
         skip_index_build,
+        spherical_centroids,
     );
 }

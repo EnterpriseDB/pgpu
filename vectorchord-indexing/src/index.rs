@@ -1,8 +1,8 @@
-use crate::centroids_table;
 use crate::clustering_gpu_impl::run_clustering;
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
+use crate::{centroids_table, util};
 use pgrx::info;
 use pgrx::spi::quote_qualified_identifier;
 use std::time::Instant;
@@ -18,6 +18,7 @@ pub fn index(
     kmeans_nredo: u32,
     distance_operator: String,
     skip_index_build: bool,
+    spherical_centroids: bool,
 ) {
     if !use_gpu_acceleration() {
         panic!("GPU acceleration is not enabled. Ensure that your system is compatible and then configure: \"SET pgpu.gpu_acceleration = 'enable';\"");
@@ -26,8 +27,7 @@ pub fn index(
     let (schema, table) = crate::parse_table_identifier(&table_name);
     let schema_table = quote_qualified_identifier(schema.clone(), table.clone());
 
-    vectorchord_index::assert_valid_distance_operator(&distance_operator);
-    let spherical_centroids = distance_operator == "ip";
+    util::assert_valid_distance_operator(&distance_operator);
     let centroid_table_name = quote_qualified_identifier(schema, format!("{table}_centroids"));
     assert!(centroid_table_name.len() <= 63, "generated centroid table name \"{centroid_table_name}\" is too long to use as a postgres identifier. Use a source table name that is shorter than 53 characters");
 
@@ -55,6 +55,7 @@ pub fn index(
             cluster_count,
             kmeans_iterations,
             kmeans_nredo,
+            &distance_operator,
             spherical_centroids,
         );
 
@@ -79,6 +80,7 @@ pub fn index(
             cluster_count,
             kmeans_iterations,
             kmeans_nredo,
+            &distance_operator,
             spherical_centroids,
         )
     };

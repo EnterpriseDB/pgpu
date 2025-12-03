@@ -2,11 +2,10 @@
 
 
 -- Prepare
-create extension aidb cascade;
+create extension pgpu cascade;
 create extension vchord cascade;
 -- add to "/var/lib/postgresql/17/main/postgresql.auto.conf"
 -- shared_preload_libraries = 'vchord'
--- aidb.gpu_acceleration = 'enable'
 
 -- Setup
 CREATE TABLE test_100k_vecs
@@ -51,6 +50,7 @@ SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_100k_vecs', co
 select (vector::real[])[1]
 from test_100k_vecs_centroids
 ORDER BY (vector::real[])[1];
+
 
 
 -- compare against series. Check if centroids are within "1" distance of expected 1..100

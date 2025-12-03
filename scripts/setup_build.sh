@@ -2,10 +2,9 @@
 # so we template such a tag based on the name/version we have
 export DIST_VERSION="9"
 export GPU_CUDA_TOOLKIT_VER="12-9"
-export GPU_FAISS_VER="v1.13.0"
 #export GPU_CUDA_ARCHITECTURES="89;90;100;103;120;121" # 89: L40/L4, 90: H100/H200/GH200
 export GPU_CUDA_ARCHITECTURES="89"
-
+export CUVS_VER="25.10.00"
 
 # we need packages from the subscription repos to build the NVIDIA driver kernel module
 sudo subscription-manager register
@@ -16,20 +15,6 @@ sudo subscription-manager repos --enable=codeready-builder-for-rhel-9-x86_64-rpm
 
 sudo dnf group install -y "Development Tools"
 sudo dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
-
-# MKL / OMP dependencies. FAISS need these -> can remove for CUVS
-tee > /tmp/oneAPI.repo << EOF
-[oneAPI]
-name=Intel® oneAPI repository
-baseurl=https://yum.repos.intel.com/oneapi
-enabled=1
-gpgcheck=1
-repo_gpgcheck=1
-gpgkey=https://yum.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
-EOF
-sudo mv /tmp/oneAPI.repo /etc/yum.repos.d
-sudo dnf install -y intel-oneapi-mkl-devel
-sudo cp /opt/intel/oneapi/compiler/latest/lib/libiomp5.so /usr/lib64/
 
 
 # CUDA
@@ -44,30 +29,23 @@ sudo dnf install -y pkg-config cmake
 export PATH=/usr/local/cuda/bin:$PATH
 export CUDACXX=/usr/local/cuda/bin/nvcc
 
-# FAISS
-sudo mkdir /faiss_build
-sudo chmod 777 -R /faiss_build
-mkdir -p ~/faiss-git
-cd faiss-git
-git clone --branch ${GPU_FAISS_VER} --depth 1 https://github.com/facebookresearch/faiss.git
-cd faiss/
-
-# need to reduce opt level to avx2 since gcc on el8 only supports this. No problem for us; don't use these features of faiss
-cmake -B /faiss_build -DFAISS_ENABLE_C_API=ON \
-  -DFAISS_OPT_LEVEL=avx2 \
-  -DBUILD_TESTING=OFF \
-  -DBUILD_SHARED_LIBS=ON \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES="${GPU_CUDA_ARCHITECTURES}" \
-  -DFAISS_ENABLE_PYTHON=OFF \
-  -DMKL_LIBRARIES=/opt/intel/oneapi/mkl/latest/lib/libmkl_rt.so
-cmake --build /faiss_build --parallel "$(nproc --ignore 1)"  # limit parallelism otherwise github runners crash/lose connection
 
 
-# add the faiss and cuda libs to ldconfig so the linker can find them later when building aidb
-sudo cp /faiss_build/c_api/libfaiss_c.so /usr/lib
-sudo cp /faiss_build/faiss/libfaiss.so /usr/lib
-sudo ldconfig -v
+sudo mkdir /miniconda
+sudo chmod 777 -R /miniconda
+curl -fsSLo /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash /tmp/miniconda.sh -b -u -p /miniconda
+source "/miniconda/etc/profile.d/conda.sh"
+conda config --set always_yes yes --set changeps1 no
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
+
+
+curl -fsSLo rust_cuda-129_arch-x86_64.yaml https://raw.githubusercontent.com/rapidsai/cuvs/refs/tags/v${CUVS_VER}/conda/environments/rust_cuda-129_arch-x86_64.yaml
+conda env create -f rust_cuda-129_arch-x86_64.yaml
+conda activate rust_cuda-129_arch-x86_64
+
 
 
 # set up git authentication for the builder; some rust dependencies need to access private repos later
