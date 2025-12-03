@@ -12,19 +12,22 @@ pub use index::*;
 use pgrx::Spi;
 
 fn print_memory(v: &Vec<f32>, message: &str) {
-    let heap_size = calculate_vec_size(v) as f64 / 1024.0 / 1024.0 / 1024.0;
-    pgrx::info!("Data length in main memory ({message}): {heap_size:.2} GB");
+    let (heap_size, used) = calculate_vec_size(v);
+    pgrx::info!("Memory footprint ({message}). Allocated: {heap_size:.2} GB, used: {used:.2} GB");
 }
 
-fn calculate_vec_size<T>(v: &Vec<T>) -> usize {
+fn calculate_vec_size<T>(v: &Vec<T>) -> (f64, f64) {
     // 1. Get the size of a single element (e.g., f32 is 4 bytes)
     let elem_size = std::mem::size_of::<T>();
 
     // 2. Get the current allocated capacity of the Vec
     let capacity = v.capacity();
 
+    // 2. Get the current used capacity of the Vec
+    let length = v.len();
+
     // 3. Calculate the total heap memory size in bytes
-    capacity * elem_size
+    ((capacity * elem_size) as f64 / 1024.0 / 1024.0 / 1024.0, (length * elem_size) as f64 / 1024.0 / 1024.0 / 1024.0)
 }
 
 /// Parse a fully qualified table identifier using Postgres' built-in `parse_ident`.
