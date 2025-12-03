@@ -1,8 +1,8 @@
-use crate::{centroids_table, util};
 use crate::clustering_gpu_impl::run_clustering;
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
+use crate::{centroids_table, util};
 use pgrx::info;
 use pgrx::spi::quote_qualified_identifier;
 use std::time::Instant;
@@ -18,7 +18,7 @@ pub fn index(
     kmeans_nredo: u32,
     distance_operator: String,
     skip_index_build: bool,
-    spherical_centroids: bool
+    spherical_centroids: bool,
 ) {
     if !use_gpu_acceleration() {
         panic!("GPU acceleration is not enabled. Ensure that your system is compatible and then configure: \"SET pgpu.gpu_acceleration = 'enable';\"");
@@ -56,7 +56,7 @@ pub fn index(
             kmeans_iterations,
             kmeans_nredo,
             &distance_operator,
-            spherical_centroids
+            spherical_centroids,
         );
 
         centroids_all.extend_from_slice(&centroids_batch);
@@ -81,7 +81,7 @@ pub fn index(
             kmeans_iterations,
             kmeans_nredo,
             &distance_operator,
-            spherical_centroids
+            spherical_centroids,
         )
     };
 

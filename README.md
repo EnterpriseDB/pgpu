@@ -61,6 +61,5 @@ SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_1m_vecs',
 ## Building and running
 See script [scripts/setup_build.sh](scripts/setup_build.sh)
 
-- PGPU uses FAISS for GPU accelerated k-means clustering
-- You can build FAISS from source or use the precompiled binaries from [here](https://github.com/facebookresearch/faiss/releases)
+- PGPU uses NVIDIA cuVS for GPU accelerated k-means clustering https://github.com/rapidsai/cuvs/tree/main/rust
 - `vectorchord` (aka. `vchord`) and `pgvector` (aka. `vector`) PG extensions need to be installed
