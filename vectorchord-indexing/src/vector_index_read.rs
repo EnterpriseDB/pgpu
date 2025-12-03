@@ -1,14 +1,14 @@
 use crate::vector_type;
 use pgrx::pg_sys::{format_type_be, SysScanDesc};
-use pgrx::{debug1, debug2, heap_getattr_raw, notice, pg_sys, PgRelation};
+use pgrx::{debug1, debug2, heap_getattr_raw, info, notice, pg_sys, PgRelation};
 use std::ffi::CStr;
 use std::time::Instant;
 
 pub struct VectorReadBatcher {
     table_name: String,
     column_name: String,
-    vectors_total: u64,
-    vectors_per_batch: u64,
+    num_samples: u64,
+    num_samples_per_batch: u64,
     vectors_read: u64,
     //cursor_name: Option<String>,
     table_scan: Option<SysScanDesc>,
@@ -20,19 +20,33 @@ impl VectorReadBatcher {
     pub fn new(
         table_name: String,
         column_name: String,
-        vectors_total: u64,
-        vectors_per_batch: u64,
+        cluster_count: u32,
+        sampling_factor: u32,
+        num_samples_per_batch: u64,
     ) -> Self {
-        VectorReadBatcher {
+        let mut vbr = VectorReadBatcher {
             table_name,
             column_name,
-            vectors_total,
-            vectors_per_batch,
+            num_samples: 0,
+            num_samples_per_batch: 0,
             vectors_read: 0,
             table_scan: None,
             pg_rel: None,
             col_num: None,
-        }
+        };
+        vbr.initialize();
+        let table_size = (&vbr).num_tuples();
+        let samples_desired = (cluster_count as u64).saturating_mul(sampling_factor as u64);
+        assert!(samples_desired > table_size as u64, "The table has fewer records ({table_size}) than the desired number of samples ({samples_desired}) based on cluster_count*sampling_factor. Unable to continue");
+        vbr.num_samples = samples_desired;
+        // TODO: calculate this from a new input "max memory GB"
+        vbr.num_samples_per_batch = num_samples_per_batch;
+        info!("vector batch read properties:\n\t num_samples: {num_samples}\n\t num_samples_per_batch: {num_samples_per_batch}\n\t num_batches: {nb}\n\t table_size: {table_size}", nb=vbr.num_batches(), samples_desired=vbr.num_samples, num_samples_per_batch=vbr.num_samples_per_batch, table_size=table_size);
+        vbr
+    }
+
+    pub fn num_batches(&mut self) -> u64 {
+        self.num_samples / self.num_samples_per_batch
     }
 
     // original SQL/SPI based implementation. Unused because of memory "leak": https://github.com/pgcentralfoundation/pgrx/issues/2211
@@ -100,7 +114,7 @@ impl VectorReadBatcher {
         }
     }*/
 
-    pub(crate) fn start_scan(&mut self) {
+    fn initialize(&mut self) {
         let pg_rel = PgRelation::open_with_name_and_share_lock(&self.table_name)
             .expect("unable to open table");
         if !pg_rel.is_table() {
@@ -157,6 +171,23 @@ impl VectorReadBatcher {
         debug1!("systable scan initialized");
     }
 
+    pub(crate) fn num_tuples(self) -> usize {
+        let pg_rel = self
+            .pg_rel
+            .clone()
+            .expect("tuple descriptor not initialized");
+        let tuples = pg_rel
+            .reltuples()
+            .expect("source table is empty or ANALYZE didn't yet run; unable to continue")
+            .ceil() as usize;
+        // the Option from PGRX only ensures that "tuples" is not 0. But it may also be -1 if ANALYZE hasn't run yet
+        assert!(
+            tuples > 0,
+            "source table is empty or ANALYZE didn't yet run; unable to continue"
+        );
+        tuples
+    }
+
     pub(crate) fn end_scan(self) {
         let scan = self.table_scan.expect("systable scan not initialized");
         unsafe {
@@ -165,10 +196,10 @@ impl VectorReadBatcher {
     }
 
     pub(crate) fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
-        notice!("({vectors_read}/{vectors_total}) Reading next batch of {vectors_per_batch} from {table_name}.{column_name}...",
-            vectors_total = self.vectors_total,
+        notice!("({vectors_read}/{num_samples}) Reading next batch of {num_samples_per_batch} from {table_name}.{column_name}...",
+            num_samples = self.num_samples,
             vectors_read = self.vectors_read,
-            vectors_per_batch = self.vectors_per_batch,
+            num_samples_per_batch = self.num_samples_per_batch,
             table_name = self.table_name,
             column_name = self.column_name
         );
@@ -190,8 +221,8 @@ impl VectorReadBatcher {
 
             let mut all_vectors: Vec<f32> = Vec::new();
             let mut dims: u32 = 0;
-            for _i in 0..self.vectors_per_batch {
-                if self.vectors_read >= self.vectors_total {
+            for _i in 0..self.num_samples_per_batch {
+                if self.vectors_read >= self.num_samples {
                     break;
                 }
                 self.vectors_read += 1;

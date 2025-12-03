@@ -32,17 +32,14 @@ pub fn index(
     assert!(centroid_table_name.len() <= 63, "generated centroid table name \"{centroid_table_name}\" is too long to use as a postgres identifier. Use a source table name that is shorter than 53 characters");
 
     let start_time = Instant::now();
-    // this mimics the `sampling_factor` behavior of vectorchord; so we can use the same args for comparison
-    let samples = (cluster_count as u64).saturating_mul(sampling_factor as u64);
-
-    info!("running GPU accelerated index build for {schema_table}.{column_name} using {samples} samples (cluster_count * sampling_factor). Reading and processing vectors in batches of {batch_size}");
+    info!("running GPU accelerated index build for {schema_table}.{column_name}");
 
     let mut batcher =
         VectorReadBatcher::new(schema_table.clone(), column_name, samples, batch_size);
     let mut centroids_all: Vec<f32> = Vec::new();
     let mut dims: u32 = 0;
 
-    batcher.start_scan();
+
     while let Some((vecs, batch_dims)) = batcher.next_batch() {
         info!("processing batch...");
         dims = batch_dims; // this is not expected to change
