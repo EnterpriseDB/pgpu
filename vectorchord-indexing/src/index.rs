@@ -32,7 +32,6 @@ pub fn index(
     let qualified_table = quote_qualified_identifier(schema.clone(), table.clone());
 
     util::assert_valid_distance_operator(&distance_operator);
-    let spherical_centroids = distance_operator == "ip";
     let centroid_table_name = quote_qualified_identifier(schema, format!("{table}_centroids"));
     assert!(centroid_table_name.len() <= 63, "generated centroid table name \"{centroid_table_name}\" is too long to use as a postgres identifier. Use a source table name that is shorter than 53 characters");
 

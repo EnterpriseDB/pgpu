@@ -1,6 +1,6 @@
 use crate::vector_type;
 use pgrx::pg_sys::{format_type_be, SysScanDesc};
-use pgrx::{debug1, debug2, heap_getattr_raw, info, notice, pg_sys, warning, PgRelation, Spi};
+use pgrx::{debug1, heap_getattr_raw, info, notice, pg_sys, PgRelation, Spi};
 use std::ffi::CStr;
 use std::time::Instant;
 
@@ -214,7 +214,7 @@ impl VectorReadBatcher {
             let col_num = self.col_num.expect("column number not initialized");
             let col_num_nonzero = std::num::NonZero::new(col_num).unwrap();
 
-            let mut all_vectors: Vec<f32> = Vec::with_capacity();
+            let mut all_vectors: Vec<f32> = Vec::new();
             let mut dims: u32 = 0;
             for _i in 0..self.num_samples_per_batch {
                 if self.vectors_read >= self.num_samples {
