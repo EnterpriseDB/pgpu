@@ -20,15 +20,14 @@ impl VectorReadBatcher {
     pub fn new(
         table_name: String,
         column_name: String,
-        cluster_count: u32,
-        sampling_factor: u32,
+        num_samples: u64,
         num_samples_per_batch: u64,
     ) -> Self {
         let mut vbr = VectorReadBatcher {
             table_name,
             column_name,
-            num_samples: 0,
-            num_samples_per_batch: 0,
+            num_samples,
+            num_samples_per_batch,
             vectors_read: 0,
             table_scan: None,
             pg_rel: None,
@@ -36,16 +35,13 @@ impl VectorReadBatcher {
         };
         vbr.initialize();
         let table_size = (&vbr).num_tuples();
-        let samples_desired = (cluster_count as u64).saturating_mul(sampling_factor as u64);
-        assert!(samples_desired > table_size as u64, "The table has fewer records ({table_size}) than the desired number of samples ({samples_desired}) based on cluster_count*sampling_factor. Unable to continue");
-        vbr.num_samples = samples_desired;
+        assert!(num_samples > table_size as u64, "The table has fewer records ({table_size}) than the desired number of samples ({num_samples}) based on cluster_count*sampling_factor. Unable to continue");
         // TODO: calculate this from a new input "max memory GB"
-        vbr.num_samples_per_batch = num_samples_per_batch;
-        info!("vector batch read properties:\n\t num_samples: {num_samples}\n\t num_samples_per_batch: {num_samples_per_batch}\n\t num_batches: {nb}\n\t table_size: {table_size}", nb=vbr.num_batches(), samples_desired=vbr.num_samples, num_samples_per_batch=vbr.num_samples_per_batch, table_size=table_size);
+        info!("vector batch read properties:\n\t num_samples: {num_samples}\n\t num_samples_per_batch: {num_samples_per_batch}\n\t num_batches: {nb}\n\t table_size: {table_size}", nb=vbr.num_batches(), num_samples=vbr.num_samples, num_samples_per_batch=vbr.num_samples_per_batch, table_size=table_size);
         vbr
     }
 
-    pub fn num_batches(&mut self) -> u64 {
+    pub fn num_batches(&self) -> u64 {
         self.num_samples / self.num_samples_per_batch
     }
 
@@ -171,7 +167,7 @@ impl VectorReadBatcher {
         debug1!("systable scan initialized");
     }
 
-    pub(crate) fn num_tuples(self) -> usize {
+    pub(crate) fn num_tuples(&self) -> usize {
         let pg_rel = self
             .pg_rel
             .clone()
