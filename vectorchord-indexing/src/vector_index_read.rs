@@ -1,12 +1,13 @@
 use crate::vector_type;
 use pgrx::pg_sys::{format_type_be, SysScanDesc};
-use pgrx::{debug1, debug2, heap_getattr_raw, info, notice, pg_sys, PgRelation};
+use pgrx::{debug1, debug2, heap_getattr_raw, info, notice, pg_sys, warning, PgRelation, Spi};
 use std::ffi::CStr;
 use std::time::Instant;
 
 pub struct VectorReadBatcher {
     table_name: String,
     column_name: String,
+    num_tuples_in_table: Option<u64>,
     num_samples: u64,
     num_samples_per_batch: u64,
     vectors_read: u64,
@@ -28,21 +29,27 @@ impl VectorReadBatcher {
             column_name,
             num_samples,
             num_samples_per_batch,
+            num_tuples_in_table: None,
             vectors_read: 0,
             table_scan: None,
             pg_rel: None,
             col_num: None,
         };
         vbr.initialize();
-        let table_size = (&vbr).num_tuples();
-        assert!(num_samples > table_size as u64, "The table has fewer records ({table_size}) than the desired number of samples ({num_samples}) based on cluster_count*sampling_factor. Unable to continue");
+        vbr.analyze_source_table();
+        let table_size = (vbr).num_tuples();
+        assert!(num_samples <= table_size as u64, "The table has fewer records ({table_size}) than the desired number of samples ({num_samples}) based on cluster_count*sampling_factor. Unable to continue");
         // TODO: calculate this from a new input "max memory GB"
         info!("vector batch read properties:\n\t num_samples: {num_samples}\n\t num_samples_per_batch: {num_samples_per_batch}\n\t num_batches: {nb}\n\t table_size: {table_size}", nb=vbr.num_batches(), num_samples=vbr.num_samples, num_samples_per_batch=vbr.num_samples_per_batch, table_size=table_size);
         vbr
     }
 
-    pub fn num_batches(&self) -> u64 {
-        self.num_samples / self.num_samples_per_batch
+    pub fn num_batches(&self) -> u32 {
+        self.num_samples.div_ceil(self.num_samples_per_batch) as u32
+    }
+    fn analyze_source_table(&self) {
+        Spi::run(format!("ANALYZE {}", self.table_name).as_str())
+            .expect("unable to ANALYZE source table");
     }
 
     // original SQL/SPI based implementation. Unused because of memory "leak": https://github.com/pgcentralfoundation/pgrx/issues/2211
@@ -119,11 +126,6 @@ impl VectorReadBatcher {
                 self.table_name
             );
         }
-        debug2!(
-            "table {} is a table and has {:?} tuples",
-            self.table_name,
-            pg_rel.reltuples()
-        );
 
         // look for the column number
         let tup_desc = pg_rel.tuple_desc();
@@ -167,21 +169,18 @@ impl VectorReadBatcher {
         debug1!("systable scan initialized");
     }
 
-    pub(crate) fn num_tuples(&self) -> usize {
-        let pg_rel = self
-            .pg_rel
-            .clone()
-            .expect("tuple descriptor not initialized");
-        let tuples = pg_rel
-            .reltuples()
-            .expect("source table is empty or ANALYZE didn't yet run; unable to continue")
-            .ceil() as usize;
-        // the Option from PGRX only ensures that "tuples" is not 0. But it may also be -1 if ANALYZE hasn't run yet
-        assert!(
-            tuples > 0,
-            "source table is empty or ANALYZE didn't yet run; unable to continue"
-        );
-        tuples
+    pub(crate) fn num_tuples(&mut self) -> u64 {
+        match self.num_tuples_in_table {
+            None => {
+                let tuples: i64 =
+                    Spi::get_one(format!("SELECT COUNT(1) FROM {}", self.table_name).as_str())
+                        .unwrap()
+                        .unwrap();
+                self.num_tuples_in_table = Some(tuples as u64);
+                tuples as u64
+            }
+            Some(tuples) => tuples,
+        }
     }
 
     pub(crate) fn end_scan(self) {
@@ -215,7 +214,7 @@ impl VectorReadBatcher {
             let col_num = self.col_num.expect("column number not initialized");
             let col_num_nonzero = std::num::NonZero::new(col_num).unwrap();
 
-            let mut all_vectors: Vec<f32> = Vec::new();
+            let mut all_vectors: Vec<f32> = Vec::with_capacity();
             let mut dims: u32 = 0;
             for _i in 0..self.num_samples_per_batch {
                 if self.vectors_read >= self.num_samples {
