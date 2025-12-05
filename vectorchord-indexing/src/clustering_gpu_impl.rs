@@ -26,7 +26,7 @@ pub fn run_clustering(
         (vectors.len() / vector_dims as usize, vector_dims as usize),
         vectors.to_vec(),
     )
-    .expect("shaping vectors failed");
+        .expect("shaping vectors failed");
     let dataset = ManagedTensor::from(&vectors_array)
         .to_device(&res)
         .expect("vectors->tensor transformation failed");
