@@ -4,6 +4,7 @@ use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
 use crate::{centroids_table, util};
 use pgrx::info;
+use pgrx::{info, warning};
 use pgrx::spi::quote_qualified_identifier;
 use std::time::Instant;
 
@@ -24,10 +25,15 @@ pub fn index(
         panic!("GPU acceleration is not enabled. Ensure that your system is compatible and then configure: \"SET pgpu.gpu_acceleration = 'enable';\"");
     }
 
+    if sampling_factor < 40 {
+        warning!("sampling factor {sampling_factor} is very low; consider increasing to at least 40 to achieve useful clustering results");
+    }
+
     let (schema, table) = crate::parse_table_identifier(&table_name);
     let schema_table = quote_qualified_identifier(schema.clone(), table.clone());
 
     util::assert_valid_distance_operator(&distance_operator);
+    let spherical_centroids = distance_operator == "ip";
     let centroid_table_name = quote_qualified_identifier(schema, format!("{table}_centroids"));
     assert!(centroid_table_name.len() <= 63, "generated centroid table name \"{centroid_table_name}\" is too long to use as a postgres identifier. Use a source table name that is shorter than 53 characters");
 
@@ -37,8 +43,19 @@ pub fn index(
 
     info!("running GPU accelerated index build for {schema_table}.{column_name} using {samples} samples (cluster_count * sampling_factor). Reading and processing vectors in batches of {batch_size}");
 
+    let num_samples = (cluster_count as u64).saturating_mul(sampling_factor as u64);
+
     let mut batcher =
-        VectorReadBatcher::new(schema_table.clone(), column_name, samples, batch_size);
+        VectorReadBatcher::new(schema_table.clone(), column_name, num_samples, batch_size);
+    let num_batches = batcher.num_batches();
+
+    // the intermediate batch runs need to produce enough output clusters so that the final consolidation run has enough input
+    // we use the same num_samples as configured by the user
+    let num_clusters_per_intermediate_batch: u32 = (num_samples / num_batches) as u32;
+
+    info!("clustering properties:\n\t num_clusters_per_intermediate_batch: {num_clusters_per_intermediate_batch}");
+
+
     let mut centroids_all: Vec<f32> = Vec::new();
     let mut dims: u32 = 0;
 
@@ -52,10 +69,9 @@ pub fn index(
         let centroids_batch = run_clustering(
             vecs,
             dims,
-            cluster_count,
+            num_clusters_per_intermediate_batch,
             kmeans_iterations,
             kmeans_nredo,
-            &distance_operator,
             spherical_centroids,
         );
 
@@ -80,7 +96,6 @@ pub fn index(
             cluster_count,
             kmeans_iterations,
             kmeans_nredo,
-            &distance_operator,
             spherical_centroids,
         )
     };
