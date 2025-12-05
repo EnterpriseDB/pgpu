@@ -36,7 +36,6 @@ impl VectorReadBatcher {
             col_num: None,
         };
         vbr.initialize();
-        vbr.analyze_source_table();
         let table_size = (vbr).num_tuples();
         assert!(num_samples <= table_size as u64, "The table has fewer records ({table_size}) than the desired number of samples ({num_samples}) based on cluster_count*sampling_factor. Unable to continue");
         // TODO: calculate this from a new input "max memory GB"
@@ -46,10 +45,6 @@ impl VectorReadBatcher {
 
     pub fn num_batches(&self) -> u32 {
         self.num_samples.div_ceil(self.num_samples_per_batch) as u32
-    }
-    fn analyze_source_table(&self) {
-        Spi::run(format!("ANALYZE {}", self.table_name).as_str())
-            .expect("unable to ANALYZE source table");
     }
 
     // original SQL/SPI based implementation. Unused because of memory "leak": https://github.com/pgcentralfoundation/pgrx/issues/2211
