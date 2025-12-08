@@ -2,10 +2,11 @@ use crate::util::distance_type_from_str;
 use cuvs::cluster::kmeans;
 use cuvs::distance_type::DistanceType;
 use cuvs::{ManagedTensor, Resources};
-use ndarray::{Array, Axis};
+use ndarray::{Array, Array1, Array2, Axis};
 
-use pgrx::warning;
+use pgrx::{info, warning};
 use std::time::Instant;
+use log::warn;
 
 pub fn run_clustering(
     vectors: Vec<f32>,
@@ -16,26 +17,38 @@ pub fn run_clustering(
     distance_operator: &str,
     spherical_centroids: bool,
 ) -> Vec<f32> {
-    warning!("Clustering vectors on GPU");
+    info!("Clustering vectors on GPU");
     let start_time = Instant::now();
-
+    let num_vectors = vectors.len() / vector_dims as usize;
     // cuvs setup
     let res = Resources::new().expect("GPU Resource creation failed");
     // shape is (rows, cols). rows is determined by the length of the vector input; so we divide by dimensions to get that value
-    let vectors_array = Array::from_shape_vec(
-        (vectors.len() / vector_dims as usize, vector_dims as usize),
+    let vectors_array = Array2::from_shape_vec(
+        (num_vectors, vector_dims as usize),
         vectors.to_vec(),
     )
         .expect("shaping vectors failed");
+
+    info!(
+        "⏱️ preparing VEC done at: {:.2?}",
+        start_time.elapsed()
+    );
+
     let dataset = ManagedTensor::from(&vectors_array)
         .to_device(&res)
         .expect("vectors->tensor transformation failed");
-
-    let centroids_host =
-        ndarray::Array::<f32, _>::zeros((cluster_count as usize, vector_dims as usize));
-    let mut centroids = ManagedTensor::from(&centroids_host)
+    info!(
+        "⏱️ copied vec to gpu at: {:.2?}",
+        start_time.elapsed()
+    );
+    let mut centroids_host =
+        Array2::<f32>::zeros((cluster_count as usize, vector_dims as usize));
+    let mut centroids_gpu = ManagedTensor::from(&centroids_host)
         .to_device(&res)
-        .expect("centroids(empty)->tensor transformation failed");
+        .expect("centroids(empty)->GPU transfer failed");
+
+    let mut labels_host = Array1::<i32>::zeros(num_vectors);
+    let mut labels_gpu = ManagedTensor::from(&labels_host).to_device(&res).expect("labels(empty)->GPU transfer failed");
 
     let distance_operator_cuvs = distance_type_from_str(&distance_operator)
         .expect(format!("invalid distance operator: {distance_operator}").as_str());
@@ -44,7 +57,7 @@ pub fn run_clustering(
         _ => false,
     };
 
-    warning!(
+    info!(
         "using distance {:#?} with balanced kmeans: {:?}",
         distance_operator_cuvs,
         balanced_kmeans
@@ -59,27 +72,44 @@ pub fn run_clustering(
         .set_hierarchical(balanced_kmeans)
         .set_hierarchical_n_iters(kmeans_iterations as i32);
 
-    warning!(
-        "\tpreparing/transferring data done in: {:.2?}",
+    info!(
+        "⏱️ preparing/transferring data done at: {:.2?}",
         start_time.elapsed()
     );
 
-    warning!("running kemans");
-    let (inertia, n_iter) = kmeans::fit(&res, &kmeans_params, &dataset, &None, &mut centroids)
+    info!("running kemans");
+    let (inertia, n_iter) = kmeans::fit(&res, &kmeans_params, &dataset, &None, &mut centroids_gpu)
         .expect("kmeans training failed");
-    warning!("kmeans done with inertia: {inertia}, n_iter: {n_iter}");
+    info!("kmeans done with inertia: {inertia}, n_iter: {n_iter}");
+    info!(
+        "⏱️ kmeans training data done at: {:.2?}",
+        start_time.elapsed()
+    );
+    let _inertia_pred = kmeans::predict(&res, &kmeans_params, &dataset, &None, &centroids_gpu, &mut labels_gpu, true).expect("kmeans prediction failed");
+    info!(
+        "⏱️ kmeans predict data done at: {:.2?}",
+        start_time.elapsed()
+    );
 
-    warning!("retrieve results from GPU");
-    let mut centroids_host_result =
-        ndarray::Array::<f32, _>::zeros((cluster_count as usize, vector_dims as usize));
-    centroids
-        .to_host(&res, &mut centroids_host_result)
+    info!("retrieve results from GPU");
+    labels_gpu.to_host(&res, &mut labels_host).expect("labels->host transfer failed");
+
+
+    //let mut centroids_host_result =
+     //   ndarray::Array::<f32, _>::zeros((cluster_count as usize, vector_dims as usize));
+    //warning!("got labels: {:#?}", labels_host);
+    centroids_gpu
+        .to_host(&res, &mut centroids_host)
         .expect("centroids->host transfer failed");
+    info!(
+        "⏱️ retrieved data from GPU at: {:.2?}",
+        start_time.elapsed()
+    );
 
     if spherical_centroids {
-        warning!("normalizing centroids");
+        info!("normalizing centroids");
         // 1. Iterate over the rows (Axis 0) mutably
-        for mut row in centroids_host_result.axis_iter_mut(Axis(0)) {
+        for mut row in centroids_host.axis_iter_mut(Axis(0)) {
             // 2. Calculate L2 norm
             let norm = row.dot(&row).sqrt();
             // 3. Normalize in-place if there is normalization to be done
@@ -87,11 +117,15 @@ pub fn run_clustering(
                 row /= norm;
             }
         }
+        info!(
+        "⏱️ normlaized centroids at: {:.2?}",
+        start_time.elapsed()
+    );
     }
 
-    let centroids_owned: Vec<f32> = centroids_host_result.into_raw_vec().into();
+    let centroids_owned: Vec<f32> = centroids_host.into_raw_vec().into();
 
-    warning!(
+    info!(
         "\tClustering (k-means) done in: {:.2?}",
         start_time.elapsed()
     );
