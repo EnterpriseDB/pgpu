@@ -31,21 +31,7 @@ export CUDACXX=/usr/local/cuda/bin/nvcc
 
 
 
-sudo mkdir /miniconda
-sudo chmod 777 -R /miniconda
-curl -fsSLo /tmp/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-bash /tmp/miniconda.sh -b -u -p /miniconda
-source "/miniconda/etc/profile.d/conda.sh"
-conda config --set always_yes yes --set changeps1 no
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-
-
-
-curl -fsSLo rust_cuda-129_arch-x86_64.yaml https://raw.githubusercontent.com/rapidsai/cuvs/refs/tags/v${CUVS_VER}/conda/environments/rust_cuda-129_arch-x86_64.yaml
-conda env create -f rust_cuda-129_arch-x86_64.yaml
-conda activate rust_cuda-129_arch-x86_64
-
+# TODO: install cuVS binaries/dependencies see: https://github.com/rapidsai/cuvs/blob/94795b09444746eda80dc27f775a73c9bf8b2ecd/conda/environments/rust_cuda-129_arch-x86_64.yaml
 
 
 # set up git authentication for the builder; some rust dependencies need to access private repos later
