@@ -1,4 +1,4 @@
-use crate::clustering_gpu_impl::run_clustering;
+use crate::clustering_gpu_impl::{run_clustering, run_clustering_consolidate};
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
@@ -46,13 +46,16 @@ pub fn index(
 
     // the intermediate batch runs need to produce enough output clusters so that the final consolidation run has enough input
     // we use the same num_samples as configured by the user
-    let desired_intermediate_batch_clusters = num_clusters * 40;
+    // Note: typically, you'll want 30-50 data points per cluster. But here, we're just stiching together the pre-trained centroids from the intermediate batches
+    // so a much lower points/clusters ration can be used
+    let desired_intermediate_batch_clusters = num_clusters * 4; // * 40;
     let num_clusters_per_intermediate_batch: u32 = desired_intermediate_batch_clusters / num_batches;
 
     info!("clustering properties:\n\t num_clusters_per_intermediate_batch: {num_clusters_per_intermediate_batch}\n\t desired_intermediate_batch_clusters: {desired_intermediate_batch_clusters}\n\t num_clusters: {num_clusters}");
 
 
     let mut centroids_all: Vec<f32> = Vec::new();
+    let mut weights_all: Vec<f32> = Vec::new();
     let mut dims: u32 = 0;
 
 
@@ -62,7 +65,7 @@ pub fn index(
 
         crate::print_memory(&vecs, "batch training vectors");
 
-        let centroids_batch = run_clustering(
+        let (centroids_batch, weights_batch) = run_clustering(
             vecs,
             dims,
             num_clusters_per_intermediate_batch,
@@ -73,8 +76,10 @@ pub fn index(
         );
 
         centroids_all.extend_from_slice(&centroids_batch);
+        weights_all.extend_from_slice(&weights_batch);
         crate::print_memory(&centroids_batch, "centroids from this batch");
         crate::print_memory(&centroids_all, "centroids from all batches");
+        crate::print_memory(&weights_all, "weights from all batches");
     }
     batcher.end_scan();
     info!("getting data finished in {:.2?}", start_time.elapsed());
@@ -87,8 +92,9 @@ pub fn index(
         centroids_all
     } else {
         info!("All centroids computed in multiple batches, starting re-clusting of {} centroids into {num_clusters} clusters", centroids_all.len()/(dims as usize));
-        run_clustering(
+        run_clustering_consolidate(
             centroids_all,
+            weights_all,
             dims,
             num_clusters,
             kmeans_iterations,
