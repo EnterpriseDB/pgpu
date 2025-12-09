@@ -1,10 +1,10 @@
-use crate::clustering_gpu_impl::{run_clustering, run_clustering_consolidate};
+use crate::clustering_gpu_impl::{run_clustering_batch, run_clustering_consolidate};
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
 use crate::{centroids_table, util};
-use pgrx::{info, warning};
 use pgrx::spi::quote_qualified_identifier;
+use pgrx::{info, warning};
 use std::time::Instant;
 
 #[allow(clippy::too_many_arguments)]
@@ -40,8 +40,12 @@ pub fn index(
 
     let num_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
 
-    let mut batcher =
-        VectorReadBatcher::new(qualified_table.clone(), column_name, num_samples, batch_size);
+    let mut batcher = VectorReadBatcher::new(
+        qualified_table.clone(),
+        column_name,
+        num_samples,
+        batch_size,
+    );
     let num_batches = batcher.num_batches();
 
     // the intermediate batch runs need to produce enough output clusters so that the final consolidation run has enough input
@@ -49,15 +53,14 @@ pub fn index(
     // Note: typically, you'll want 30-50 data points per cluster. But here, we're just stiching together the pre-trained centroids from the intermediate batches
     // so a much lower points/clusters ration can be used
     let desired_intermediate_batch_clusters = num_clusters * 4; // * 40;
-    let num_clusters_per_intermediate_batch: u32 = desired_intermediate_batch_clusters / num_batches;
+    let num_clusters_per_intermediate_batch: u32 =
+        desired_intermediate_batch_clusters / num_batches;
 
     info!("clustering properties:\n\t num_clusters_per_intermediate_batch: {num_clusters_per_intermediate_batch}\n\t desired_intermediate_batch_clusters: {desired_intermediate_batch_clusters}\n\t num_clusters: {num_clusters}");
-
 
     let mut centroids_all: Vec<f32> = Vec::new();
     let mut weights_all: Vec<f32> = Vec::new();
     let mut dims: u32 = 0;
-
 
     while let Some((vecs, batch_dims)) = batcher.next_batch() {
         info!("processing batch...");
@@ -65,7 +68,7 @@ pub fn index(
 
         crate::print_memory(&vecs, "batch training vectors");
 
-        let (centroids_batch, weights_batch) = run_clustering(
+        let (centroids_batch, weights_batch) = run_clustering_batch(
             vecs,
             dims,
             num_clusters_per_intermediate_batch,
@@ -99,7 +102,6 @@ pub fn index(
             num_clusters,
             kmeans_iterations,
             kmeans_nredo,
-            &distance_operator,
             spherical_centroids,
         )
     };

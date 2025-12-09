@@ -2,10 +2,10 @@ mod centroids_table;
 mod clustering_gpu_impl;
 pub mod guc;
 pub mod index;
+mod util;
 mod vector_index_read;
 mod vector_type;
 mod vectorchord_index;
-mod util;
 
 pub use guc::*;
 pub use index::*;
@@ -27,7 +27,10 @@ fn calculate_vec_size<T>(v: &Vec<T>) -> (f64, f64) {
     let length = v.len();
 
     // 3. Calculate the total heap memory size in bytes
-    ((capacity * elem_size) as f64 / 1024.0 / 1024.0 / 1024.0, (length * elem_size) as f64 / 1024.0 / 1024.0 / 1024.0)
+    (
+        (capacity * elem_size) as f64 / 1024.0 / 1024.0 / 1024.0,
+        (length * elem_size) as f64 / 1024.0 / 1024.0 / 1024.0,
+    )
 }
 
 /// Parse a fully qualified table identifier using Postgres' built-in `parse_ident`.

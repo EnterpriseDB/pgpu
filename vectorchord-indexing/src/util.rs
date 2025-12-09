@@ -20,7 +20,7 @@ pub(crate) fn assert_valid_distance_operator(input: &str) {
     }
 }
 
-fn normalize_vectors(vecs: &mut ArrayBase<OwnedRepr<f32>, Ix2>) {
+pub(crate) fn normalize_vectors(vecs: &mut ArrayBase<OwnedRepr<f32>, Ix2>) {
     for mut row in vecs.axis_iter_mut(Axis(0)) {
         let norm = row.dot(&row).sqrt();
         // 3. Normalize in-place if there is normalization to be done
