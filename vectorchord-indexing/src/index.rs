@@ -1,17 +1,17 @@
-use crate::clustering_gpu_impl::run_clustering;
+use crate::clustering_gpu_impl::{run_clustering_batch, run_clustering_consolidate};
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
 use crate::{centroids_table, util};
-use pgrx::info;
 use pgrx::spi::quote_qualified_identifier;
+use pgrx::{info, warning};
 use std::time::Instant;
 
 #[allow(clippy::too_many_arguments)]
 pub fn index(
     table_name: String,
     column_name: String,
-    cluster_count: u32,
+    num_clusters: u32,
     sampling_factor: u32,
     batch_size: u64,
     kmeans_iterations: u32,
@@ -23,36 +23,70 @@ pub fn index(
     if !use_gpu_acceleration() {
         panic!("GPU acceleration is not enabled. Ensure that your system is compatible and then configure: \"SET pgpu.gpu_acceleration = 'enable';\"");
     }
+    let (schema, table) = crate::util::parse_table_identifier(&table_name);
+    let qualified_table = quote_qualified_identifier(schema.clone(), table.clone());
+    info!("running GPU accelerated index build for {qualified_table}.{column_name}");
 
-    let (schema, table) = crate::parse_table_identifier(&table_name);
-    let schema_table = quote_qualified_identifier(schema.clone(), table.clone());
+    if sampling_factor < 40 {
+        warning!("sampling factor {sampling_factor} is very low; consider increasing to at least 40 to achieve useful clustering results");
+    }
 
     util::assert_valid_distance_operator(&distance_operator);
     let centroid_table_name = quote_qualified_identifier(schema, format!("{table}_centroids"));
     assert!(centroid_table_name.len() <= 63, "generated centroid table name \"{centroid_table_name}\" is too long to use as a postgres identifier. Use a source table name that is shorter than 53 characters");
 
     let start_time = Instant::now();
-    // this mimics the `sampling_factor` behavior of vectorchord; so we can use the same args for comparison
-    let samples = (cluster_count as u64).saturating_mul(sampling_factor as u64);
 
-    info!("running GPU accelerated index build for {schema_table}.{column_name} using {samples} samples (cluster_count * sampling_factor). Reading and processing vectors in batches of {batch_size}");
+    let num_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
+    let num_batches = num_samples.div_ceil(batch_size) as u32;
 
-    let mut batcher =
-        VectorReadBatcher::new(schema_table.clone(), column_name, samples, batch_size);
+    // the intermediate batch runs need to produce enough output clusters so that the final consolidation run has enough input
+    // we use the same num_samples as configured by the user
+    // Note: typically, you'll want 30-50 data points per cluster. But here, we're just stiching together the pre-trained centroids from the intermediate batches
+    // so a much lower points/clusters ration can be used
+    let num_clusters_per_intermediate_batch: u32 = match num_batches {
+        1 => {
+            info!(
+                "clustering properties:\n\t uses_batching: false\n\t num_clusters: {num_clusters}"
+            );
+            num_clusters
+        }
+        _ => {
+            let desired_intermediate_batch_clusters = num_clusters * 4; // * 40;
+            let n = desired_intermediate_batch_clusters / num_batches;
+            info!("clustering properties:\n\t uses_batching: true\n\t num_clusters_per_intermediate_batch: {n}\n\t desired_intermediate_batch_clusters: {desired_intermediate_batch_clusters}\n\t num_clusters: {num_clusters}");
+            n
+        }
+    };
+    assert!(num_clusters > 2, "cluster count must be larger than 2");
+    assert!(
+        num_clusters_per_intermediate_batch > 2,
+        "batch size is too small for clustering"
+    );
+    let mut batcher = VectorReadBatcher::new(
+        qualified_table.clone(),
+        column_name,
+        num_samples,
+        batch_size,
+        num_clusters_per_intermediate_batch as u64,
+    );
+
     let mut centroids_all: Vec<f32> = Vec::new();
+    let mut weights_all: Vec<f32> = Vec::new();
     let mut dims: u32 = 0;
 
-    batcher.start_scan();
+    let mut batch_count = 0;
     while let Some((vecs, batch_dims)) = batcher.next_batch() {
-        info!("processing batch...");
+        batch_count += 1;
+        info!("processing batch ({batch_count}/{num_batches})");
         dims = batch_dims; // this is not expected to change
 
-        crate::print_memory(&vecs, "batch training vectors");
+        util::print_memory(&vecs, "batch training vectors");
 
-        let centroids_batch = run_clustering(
+        let (centroids_batch, weights_batch) = run_clustering_batch(
             vecs,
             dims,
-            cluster_count,
+            num_clusters_per_intermediate_batch,
             kmeans_iterations,
             kmeans_nredo,
             &distance_operator,
@@ -60,27 +94,29 @@ pub fn index(
         );
 
         centroids_all.extend_from_slice(&centroids_batch);
-        crate::print_memory(&centroids_batch, "centroids from this batch");
-        crate::print_memory(&centroids_all, "centroids from all batches");
+        weights_all.extend_from_slice(&weights_batch);
+        util::print_memory(&centroids_batch, "centroids from this batch");
+        util::print_memory(&centroids_all, "centroids from all batches");
+        util::print_memory(&weights_all, "weights from all batches");
     }
     batcher.end_scan();
-    info!("getting data finished in {:.2?}", start_time.elapsed());
+    info!("batches finished in {:.2?}", start_time.elapsed());
 
     let centroids_result_flat = if centroids_all.is_empty() {
-        info!("No vectors to cluster");
+        warning!("empty result from kmeans clustering");
         return;
-    } else if centroids_all.len() == (cluster_count * dims) as usize {
+    } else if centroids_all.len() == (num_clusters * dims) as usize {
         info!("All centroids computed in one batch, skipping re-clusting");
         centroids_all
     } else {
-        info!("All centroids computed in multiple batches, starting re-clusting of {} centroids into {cluster_count} clusters", centroids_all.len()/(dims as usize));
-        run_clustering(
+        info!("All centroids computed in multiple batches, starting re-clusting of {} centroids into {num_clusters} clusters", centroids_all.len()/(dims as usize));
+        run_clustering_consolidate(
             centroids_all,
+            weights_all,
             dims,
-            cluster_count,
+            num_clusters,
             kmeans_iterations,
             kmeans_nredo,
-            &distance_operator,
             spherical_centroids,
         )
     };
@@ -98,7 +134,7 @@ pub fn index(
         );
         vectorchord_index::create_vectorchord_index(
             table,
-            schema_table,
+            qualified_table,
             centroid_table_name,
             distance_operator,
         );

@@ -1,5 +1,5 @@
-use pgrx::{info, Spi};
 use crate::util;
+use pgrx::{info, Spi};
 
 pub fn create_vectorchord_index(
     table: String,
@@ -19,7 +19,7 @@ pub fn create_vectorchord_index(
     Spi::run(&format!(
         "CREATE INDEX {index_name} ON {schema_table} USING vchordrq (embedding {index_metric_type}) WITH (options = $$
 residual_quantization = true
-build.pin = true
+build.pin = 2
 [build.external]
 table = '{centroids_table_name}'
 $$);"
