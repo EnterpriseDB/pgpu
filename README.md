@@ -84,6 +84,9 @@ CREATE FUNCTION "create_vector_index_on_gpu"(
 - `sampling_factor`: how many samples to take per centroid/cluster
   - default: `256`
   - note: values below 40 are not recommended. More samples lead to more accurate indexes but also increase the clustering time
+- `batch_size`: how many rows to process at once
+  - default: `100000`
+  - note: when this number is lower than cluster_count*sampling_factor, clustering will run in multiple batches. This is useful to reduce the overall amount of memory required for clustering
 - `kmeans_iterations`: how many iterations to run during clustering
   - default: `10`
   - note: this rarely needs to be changed
