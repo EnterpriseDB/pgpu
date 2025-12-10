@@ -49,7 +49,7 @@ FROM generate_series(1, 10000) AS g(i)
 SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_10k_vecs', 
                                        column_name => 'embedding', 
                                        batch_size => 1000, 
-                                       cluster_count => 1000, 
+                                       lists => ARRAY[1000], 
                                        sampling_factor => 10, 
                                        kmeans_iterations=>10, 
                                        kmeans_nredo=>1, 
@@ -64,7 +64,7 @@ SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_10k_vecs',
 CREATE FUNCTION "create_vector_index_on_gpu"(
         "table_name" TEXT,
         "column_name" TEXT,
-        "cluster_count" bigint DEFAULT 1000,
+        "lists" INT[] DEFAULT NULL,
         "sampling_factor" bigint DEFAULT 256,
         "batch_size" bigint DEFAULT 100000,
         "kmeans_iterations" bigint DEFAULT 10,
@@ -78,9 +78,15 @@ CREATE FUNCTION "create_vector_index_on_gpu"(
 - `table_name`: the fully qualified table name
   - example: `public.test_table`
 - `column_name`: the vector column in the table that should be indexed
-- `cluster_count`: how many centroids should be computed
-  - default: `1000`
-  - note: refer to vectorchord docs for more details on this parameter: https://docs.vectorchord.ai/vectorchord/usage/indexing.html#tuning this is effectively the `lists` parameter in vectorchord
+- `lists`: how many centroids should be computed on each level of the tree
+  - default: `[1000]`
+  - valid values: `NULL`, `[n]`, `[n, m]`
+  - note: `NULL` means use default value / auto-tuning
+    - you can provide one or two values to set the number of centroids on each level of the tree. If only one value is provided, a flat index will be produced
+    - refer to vectorchord docs for more details on this parameter: https://docs.vectorchord.ai/vectorchord/usage/indexing.html#tuning this is effectively the `lists` parameter in vectorchord
+    - root level: use `4*sqrt(rows)` up to `16*sqrt(rows)` where "rows" is the number of rows in the table
+    - leaf level: use `sqrt(root_level)`
+    - e.g. for 1 million rows: `[64, 4000]`
 - `sampling_factor`: how many samples to take per centroid/cluster
   - default: `256`
   - note: values below 40 are not recommended. More samples lead to more accurate indexes but also increase the clustering time
