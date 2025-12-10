@@ -3,7 +3,7 @@ use cuvs::cluster::kmeans;
 use cuvs::distance_type::DistanceType;
 use cuvs::{ManagedTensor, Resources};
 use ndarray::{Array1, Array2};
-use pgrx::{info, warning};
+use pgrx::{debug1, info};
 use std::time::Instant;
 
 pub fn run_clustering_batch(
@@ -27,7 +27,7 @@ pub fn run_clustering_batch(
     let dataset = ManagedTensor::from(&vectors_array)
         .to_device(&res)
         .expect("vectors->tensor transformation failed");
-    info!("⏱️ copied vec to gpu at: {:.2?}", start_time.elapsed());
+    debug1!("⏱️ copied vec to gpu at: {:.2?}", start_time.elapsed());
     let mut centroids_host = Array2::<f32>::zeros((num_clusters as usize, vector_dims as usize));
     let mut centroids_gpu = ManagedTensor::from(&centroids_host)
         .to_device(&res)
@@ -50,16 +50,16 @@ pub fn run_clustering_batch(
         .set_hierarchical(true)
         .set_hierarchical_n_iters(kmeans_iterations as i32);
 
-    info!(
+    debug1!(
         "⏱️ preparing/transferring data done at: {:.2?}",
         start_time.elapsed()
     );
 
-    info!("running kemans");
+    debug1!("running kemans");
     let (inertia, n_iter) = kmeans::fit(&res, &kmeans_params, &dataset, &None, &mut centroids_gpu)
         .expect("kmeans training failed");
-    info!("kmeans done with inertia: {inertia}, n_iter: {n_iter}");
-    info!(
+    debug1!("kmeans done with inertia: {inertia}, n_iter: {n_iter}");
+    debug1!(
         "⏱️ kmeans training data done at: {:.2?}",
         start_time.elapsed()
     );
@@ -73,12 +73,12 @@ pub fn run_clustering_batch(
         false,
     )
     .expect("kmeans prediction failed");
-    info!(
+    debug1!(
         "⏱️ kmeans predict data done at: {:.2?}",
         start_time.elapsed()
     );
 
-    info!("retrieve results from GPU");
+    debug1!("retrieve results from GPU");
     labels_gpu
         .to_host(&res, &mut labels_host)
         .expect("labels->host transfer failed");
@@ -86,7 +86,7 @@ pub fn run_clustering_batch(
     centroids_gpu
         .to_host(&res, &mut centroids_host)
         .expect("centroids->host transfer failed");
-    info!(
+    debug1!(
         "⏱️ retrieved data from GPU at: {:.2?}",
         start_time.elapsed()
     );
@@ -96,17 +96,16 @@ pub fn run_clustering_batch(
     for &label in labels_host.iter() {
         counts[label as usize] += 1.0;
     }
-    warning!("counts: {:#?}", counts);
 
     if spherical_centroids {
-        info!("normalizing centroids");
+        debug1!("normalizing centroids");
         normalize_vectors(&mut centroids_host);
-        info!("⏱️ normlaized centroids at: {:.2?}", start_time.elapsed());
+        debug1!("⏱️ normlaized centroids at: {:.2?}", start_time.elapsed());
     }
 
     let centroids_owned: Vec<f32> = centroids_host.into_raw_vec().into();
 
-    info!(
+    debug1!(
         "\tClustering (k-means) done in: {:.2?}",
         start_time.elapsed()
     );
@@ -139,12 +138,12 @@ pub fn run_clustering_consolidate(
         .to_device(&res)
         .expect("weights(host)->GPU transfer failed");
 
-    info!("⏱️ preparing VEC done at: {:.2?}", start_time.elapsed());
+    debug1!("⏱️ preparing vectors done at: {:.2?}", start_time.elapsed());
 
     let dataset = ManagedTensor::from(&vectors_array)
         .to_device(&res)
         .expect("vectors->tensor transformation failed");
-    info!("⏱️ copied vec to gpu at: {:.2?}", start_time.elapsed());
+    debug1!("⏱️ copied vectors to gpu at: {:.2?}", start_time.elapsed());
     let mut centroids_host = Array2::<f32>::zeros((num_clusters as usize, vector_dims as usize));
     let mut centroids_gpu = ManagedTensor::from(&centroids_host)
         .to_device(&res)
@@ -161,12 +160,12 @@ pub fn run_clustering_consolidate(
         .set_metric(DistanceType::L2Expanded)
         .set_hierarchical(false);
 
-    info!(
+    debug1!(
         "⏱️ preparing/transferring data done at: {:.2?}",
         start_time.elapsed()
     );
 
-    info!("running kemans");
+    debug1!("running kemans");
     let (inertia, n_iter) = kmeans::fit(
         &res,
         &kmeans_params,
@@ -175,31 +174,31 @@ pub fn run_clustering_consolidate(
         &mut centroids_gpu,
     )
     .expect("kmeans training failed");
-    info!("kmeans done with inertia: {inertia}, n_iter: {n_iter}");
-    info!(
+    debug1!("kmeans done with inertia: {inertia}, n_iter: {n_iter}");
+    debug1!(
         "⏱️ kmeans training data done at: {:.2?}",
         start_time.elapsed()
     );
 
-    info!("retrieve results from GPU");
+    debug1!("retrieve results from GPU");
 
     centroids_gpu
         .to_host(&res, &mut centroids_host)
         .expect("centroids->host transfer failed");
-    info!(
+    debug1!(
         "⏱️ retrieved data from GPU at: {:.2?}",
         start_time.elapsed()
     );
 
     if spherical_centroids {
-        info!("normalizing centroids");
+        debug1!("normalizing centroids");
         normalize_vectors(&mut centroids_host);
-        info!("⏱️ normlaized centroids at: {:.2?}", start_time.elapsed());
+        debug1!("⏱️ normlaized centroids at: {:.2?}", start_time.elapsed());
     }
 
     let centroids_owned: Vec<f32> = centroids_host.into_raw_vec().into();
 
-    info!(
+    debug1!(
         "\tClustering (k-means) done in: {:.2?}",
         start_time.elapsed()
     );

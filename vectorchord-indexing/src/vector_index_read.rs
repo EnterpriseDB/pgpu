@@ -1,6 +1,6 @@
 use crate::vector_type;
 use pgrx::pg_sys::{format_type_be, SysScanDesc};
-use pgrx::{debug1, heap_getattr_raw, info, notice, pg_sys, PgRelation, Spi};
+use pgrx::{debug1, heap_getattr_raw, info, pg_sys, warning, PgRelation, Spi};
 use std::ffi::CStr;
 use std::time::Instant;
 
@@ -10,8 +10,8 @@ pub struct VectorReadBatcher {
     num_tuples_in_table: Option<u64>,
     num_samples: u64,
     num_samples_per_batch: u64,
+    min_samples_per_batch: u64,
     vectors_read: u64,
-    //cursor_name: Option<String>,
     table_scan: Option<SysScanDesc>,
     pg_rel: Option<PgRelation>,
     col_num: Option<usize>,
@@ -23,12 +23,14 @@ impl VectorReadBatcher {
         column_name: String,
         num_samples: u64,
         num_samples_per_batch: u64,
+        min_samples_per_batch: u64,
     ) -> Self {
         let mut vbr = VectorReadBatcher {
             table_name,
             column_name,
             num_samples,
             num_samples_per_batch,
+            min_samples_per_batch,
             num_tuples_in_table: None,
             vectors_read: 0,
             table_scan: None,
@@ -38,6 +40,10 @@ impl VectorReadBatcher {
         vbr.initialize();
         let table_size = (vbr).num_tuples();
         assert!(num_samples <= table_size as u64, "The table has fewer records ({table_size}) than the desired number of samples ({num_samples}) based on cluster_count*sampling_factor. Unable to continue");
+        let rem = num_samples % num_samples_per_batch;
+        if rem < min_samples_per_batch {
+            warning!("batch size {num_samples_per_batch} will lead to a remainder of {rem} samples in the last batch; which is too small for clustering. The last batch will be enlarged to {0} to contain this remainder", vbr.num_samples_per_batch + rem)
+        }
         // TODO: calculate this from a new input "max memory GB"
         info!("vector batch read properties:\n\t num_samples: {num_samples}\n\t num_samples_per_batch: {num_samples_per_batch}\n\t num_batches: {nb}\n\t table_size: {table_size}", nb=vbr.num_batches(), num_samples=vbr.num_samples, num_samples_per_batch=vbr.num_samples_per_batch, table_size=table_size);
         vbr
@@ -186,10 +192,19 @@ impl VectorReadBatcher {
     }
 
     pub(crate) fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
-        notice!("({vectors_read}/{num_samples}) Reading next batch of {num_samples_per_batch} from {table_name}.{column_name}...",
+        // take the remainder into this batch if it would be too small for clustering
+        let mut samples_to_read = self.num_samples_per_batch;
+        let size_next_batch = self
+            .num_samples
+            .saturating_sub(self.vectors_read)
+            .saturating_sub(self.num_samples_per_batch);
+        if size_next_batch < self.min_samples_per_batch {
+            samples_to_read += size_next_batch;
+        }
+        debug1!("({vectors_read}/{num_samples}) Reading next batch of {num_samples_per_batch} from {table_name}.{column_name}...",
             num_samples = self.num_samples,
             vectors_read = self.vectors_read,
-            num_samples_per_batch = self.num_samples_per_batch,
+            num_samples_per_batch = samples_to_read,
             table_name = self.table_name,
             column_name = self.column_name
         );
@@ -211,7 +226,7 @@ impl VectorReadBatcher {
 
             let mut all_vectors: Vec<f32> = Vec::new();
             let mut dims: u32 = 0;
-            for _i in 0..self.num_samples_per_batch {
+            for _i in 0..samples_to_read {
                 if self.vectors_read >= self.num_samples {
                     break;
                 }
