@@ -34,6 +34,7 @@ export CUDACXX=/usr/local/cuda/bin/nvcc
 # TODO: install cuVS binaries/dependencies see: https://github.com/rapidsai/cuvs/blob/94795b09444746eda80dc27f775a73c9bf8b2ecd/conda/environments/rust_cuda-129_arch-x86_64.yaml
 
 
+
 # set up git authentication for the builder; some rust dependencies need to access private repos later
 git config --global url."https://x:${GITHUB_TOKEN}@github.com".insteadOf "https://github.com"
 
