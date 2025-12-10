@@ -46,17 +46,60 @@ FROM generate_series(1, 10000) AS g(i)
 
 #### Run PGPU
 ```sql
-SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_1m_vecs', 
+SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_10k_vecs', 
                                        column_name => 'embedding', 
-                                       batch_size => 100000, 
-                                       cluster_count => 100000, 
+                                       batch_size => 1000, 
+                                       cluster_count => 1000, 
                                        sampling_factor => 10, 
                                        kmeans_iterations=>10, 
                                        kmeans_nredo=>1, 
                                        distance_operator=>'ip',
-                                       skip_index_build=>true                    
+                                       skip_index_build=>true,
+                                       spherical_centroids=>true
        );
 ```
+
+## Function reference
+```sql
+CREATE FUNCTION "create_vector_index_on_gpu"(
+        "table_name" TEXT,
+        "column_name" TEXT,
+        "cluster_count" bigint DEFAULT 1000,
+        "sampling_factor" bigint DEFAULT 256,
+        "batch_size" bigint DEFAULT 100000,
+        "kmeans_iterations" bigint DEFAULT 10,
+        "kmeans_nredo" bigint DEFAULT 1,
+        "distance_operator" TEXT DEFAULT 'ip',
+        "skip_index_build" bool DEFAULT false,
+        "spherical_centroids" bool DEFAULT false
+) RETURNS void STRICT
+```
+
+- `table_name`: the fully qualified table name
+  - example: `public.test_table`
+- `column_name`: the vector column in the table that should be indexed
+- `cluster_count`: how many centroids should be computed
+  - default: `1000`
+  - note: refer to vectorchord docs for more details on this parameter: https://docs.vectorchord.ai/vectorchord/usage/indexing.html#tuning this is effectively the `lists` parameter in vectorchord
+- `sampling_factor`: how many samples to take per centroid/cluster
+  - default: `256`
+  - note: values below 40 are not recommended. More samples lead to more accurate indexes but also increase the clustering time
+- `kmeans_iterations`: how many iterations to run during clustering
+  - default: `10`
+  - note: this rarely needs to be changed
+- `kmeans_nredo`: how many times to rerun the clustering algorithm
+  - default: `1`
+  - note: this rarely needs to be changed
+- `distance_operator`: what distance operator to use for clustering 
+  - default: `'ip'`
+  - valid values: `'ip'`, `'l2'`, `'cos'`
+  - note: the index will be built for this specific distance operator. So it will only be used for queries with the same distance operator. Typically, this is determined by the dataset.
+- `skip_index_build`: skip the index build step and only create the centroids table
+  - note: useful for testing/benchmarking purposes
+- `spherical_centroids`: whether to normalize centroids to unit sphere
+  - default: `false`
+  - note: this should be enabled when using `ip` distance operator and/or when using a dataset that is normalized to unit sphere
+
 
 ## Building and running
 See script [scripts/setup_build.sh](scripts/setup_build.sh)
