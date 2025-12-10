@@ -11,7 +11,7 @@ use std::time::Instant;
 pub fn index(
     table_name: String,
     column_name: String,
-    num_clusters: u32,
+    lists: Vec<u32>,
     sampling_factor: u32,
     batch_size: u64,
     kmeans_iterations: u32,
@@ -20,8 +20,9 @@ pub fn index(
     skip_index_build: bool,
     spherical_centroids: bool,
 ) {
+    let num_clusters = 1000;
     if !use_gpu_acceleration() {
-        panic!("GPU acceleration is not enabled. Ensure that your system is compatible and then configure: \"SET pgpu.gpu_acceleration = 'enable';\"");
+        pgrx::error!("GPU acceleration is not enabled. Ensure that your system is compatible and then configure: \"SET pgpu.gpu_acceleration = 'enable';\"");
     }
     let (schema, table) = crate::util::parse_table_identifier(&table_name);
     let qualified_table = quote_qualified_identifier(schema.clone(), table.clone());

@@ -122,7 +122,7 @@ impl VectorReadBatcher {
         let pg_rel = PgRelation::open_with_name_and_share_lock(&self.table_name)
             .expect("unable to open table");
         if !pg_rel.is_table() {
-            panic!(
+            pgrx::error!(
                 "table {} is not a table; only regular tables are supported",
                 self.table_name
             );
@@ -139,14 +139,14 @@ impl VectorReadBatcher {
                         .to_str()
                         .expect("invalid type name");
                     if type_name != "vector" {
-                        panic!("column \"{}\" type is not \"vector\". Only pgvector/vector types are supported", self.column_name);
+                        pgrx::error!("column \"{}\" type is not \"vector\". Only pgvector/vector types are supported", self.column_name);
                     }
                     col_num_found = Some(attr.attnum.into());
                 }
             }
         }
         let col_num = col_num_found.unwrap_or_else(|| {
-            panic!(
+            pgrx::error!(
                 "column {} not found in table {}",
                 self.column_name, self.table_name
             )
