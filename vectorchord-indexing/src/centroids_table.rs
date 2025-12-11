@@ -1,7 +1,7 @@
 use pgrx::{info, warning, Spi};
 use std::time::Instant;
 
-pub fn store_centroids(centroids: Vec<Vec<f32>>, table_name: String, vector_dimensions: u32) {
+pub fn store_centroids(centroids: Vec<(Vec<f32>, i32)>, table_name: String, vector_dimensions: u32) {
     info!("Storing {} centroids in {table_name}", centroids.len());
     let start_time = Instant::now();
 
@@ -26,15 +26,15 @@ pub fn store_centroids(centroids: Vec<Vec<f32>>, table_name: String, vector_dime
     let query = &format!(
         // note: parent ID is always 0 since we only support one lvl in the voronoi tree
         "INSERT INTO {table_name} (parent, vector)
-            VALUES (0, $1)",
+            VALUES ($1, $2)",
     );
 
     // TODO: can we do a more efficient bulk insert? The only other way I found is to
     // use string formatting and prepare a long statement.
     Spi::connect_mut(|client| {
-        for vec in centroids {
+        for (vec, parent) in centroids {
             client
-                .update(query, None, &[vec.into()])
+                .update(query, None, &[parent.into(), vec.into()])
                 .expect("error inserting centroid");
         }
     });

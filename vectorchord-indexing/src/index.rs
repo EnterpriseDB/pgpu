@@ -4,7 +4,7 @@ use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
 use crate::{centroids_table, util};
 use pgrx::spi::quote_qualified_identifier;
-use pgrx::{info, warning};
+use pgrx::{error, info, warning};
 use std::time::Instant;
 
 #[allow(clippy::too_many_arguments)]
@@ -20,7 +20,11 @@ pub fn index(
     skip_index_build: bool,
     spherical_centroids: bool,
 ) {
-    let num_clusters = 1000;
+    let (num_clusters_top, num_clusters_leaf) = match lists.len() {
+        1 => (None, lists[0]),
+        2 => (Some(lists[1]), lists[0]),
+        _ => {pgrx::error!("invalid lists parameter: {lists:?}. Must be either [n] or [n, m]")}
+    };
     if !use_gpu_acceleration() {
         pgrx::error!("GPU acceleration is not enabled. Ensure that your system is compatible and then configure: \"SET pgpu.gpu_acceleration = 'enable';\"");
     }
@@ -38,7 +42,7 @@ pub fn index(
 
     let start_time = Instant::now();
 
-    let num_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
+    let num_samples = (num_clusters_leaf as u64).saturating_mul(sampling_factor as u64);
     let num_batches = num_samples.div_ceil(batch_size) as u32;
 
     // the intermediate batch runs need to produce enough output clusters so that the final consolidation run has enough input
@@ -50,16 +54,16 @@ pub fn index(
             info!(
                 "clustering properties:\n\t uses_batching: false\n\t num_clusters: {num_clusters}"
             );
-            num_clusters
+            num_clusters_leaf
         }
         _ => {
-            let desired_intermediate_batch_clusters = num_clusters * 4; // * 40;
+            let desired_intermediate_batch_clusters = num_clusters_leaf * 4; // * 40;
             let n = desired_intermediate_batch_clusters / num_batches;
             info!("clustering properties:\n\t uses_batching: true\n\t num_clusters_per_intermediate_batch: {n}\n\t desired_intermediate_batch_clusters: {desired_intermediate_batch_clusters}\n\t num_clusters: {num_clusters}");
             n
         }
     };
-    assert!(num_clusters > 2, "cluster count must be larger than 2");
+    assert!(num_clusters_leaf > 2, "cluster count must be larger than 2");
     assert!(
         num_clusters_per_intermediate_batch > 2,
         "batch size is too small for clustering"
@@ -106,7 +110,7 @@ pub fn index(
     let centroids_result_flat = if centroids_all.is_empty() {
         warning!("empty result from kmeans clustering");
         return;
-    } else if centroids_all.len() == (num_clusters * dims) as usize {
+    } else if centroids_all.len() == (num_clusters_leaf * dims) as usize {
         info!("All centroids computed in one batch, skipping re-clusting");
         centroids_all
     } else {
@@ -115,17 +119,31 @@ pub fn index(
             centroids_all,
             weights_all,
             dims,
-            num_clusters,
+            num_clusters_leaf,
             kmeans_iterations,
             kmeans_nredo,
             spherical_centroids,
         )
     };
 
-    let centroids_result = centroids_result_flat
-        .chunks(dims as usize)
-        .map(|x| x.to_vec())
-        .collect();
+
+
+    let centroids_result: Vec<(Vec<f32>, i32)> = match num_clusters_top {
+        None => {
+            // use "0" as parent ID if we don't have a top-level list
+            centroids_result_flat
+                .chunks(dims as usize)
+                .map(|x| (x.to_vec(), 0))
+                .collect()
+        }
+        Some(nct) => {
+
+
+        }
+    };
+
+
+
 
     centroids_table::store_centroids(centroids_result, centroid_table_name.clone(), dims);
     if !skip_index_build {
