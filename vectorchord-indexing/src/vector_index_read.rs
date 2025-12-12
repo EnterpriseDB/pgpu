@@ -41,7 +41,7 @@ impl VectorReadBatcher {
         let table_size = (vbr).num_tuples();
         assert!(num_samples <= table_size as u64, "The table has fewer records ({table_size}) than the desired number of samples ({num_samples}) based on cluster_count*sampling_factor. Unable to continue");
         let rem = num_samples % num_samples_per_batch;
-        if rem < min_samples_per_batch {
+        if rem != 0 && rem < min_samples_per_batch {
             warning!("batch size {num_samples_per_batch} will lead to a remainder of {rem} samples in the last batch; which is too small for clustering. The last batch will be enlarged to {0} to contain this remainder", vbr.num_samples_per_batch + rem)
         }
         // TODO: calculate this from a new input "max memory GB"

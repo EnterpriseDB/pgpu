@@ -1,10 +1,12 @@
-use crate::clustering_gpu_impl::{run_clustering_batch, run_clustering_consolidate};
+use crate::clustering_gpu_impl::{
+    run_clustering_batch, run_clustering_consolidate, run_clustering_multilevel,
+};
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
 use crate::{centroids_table, util};
 use pgrx::spi::quote_qualified_identifier;
-use pgrx::{error, info, warning};
+use pgrx::{info, warning};
 use std::time::Instant;
 
 #[allow(clippy::too_many_arguments)]
@@ -20,10 +22,12 @@ pub fn index(
     skip_index_build: bool,
     spherical_centroids: bool,
 ) {
-    let (num_clusters_top, num_clusters_leaf) = match lists.len() {
+    let (num_clusters_top_option, num_clusters_leaf) = match lists.len() {
         1 => (None, lists[0]),
-        2 => (Some(lists[1]), lists[0]),
-        _ => {pgrx::error!("invalid lists parameter: {lists:?}. Must be either [n] or [n, m]")}
+        2 => (Some(lists[0]), lists[1]),
+        _ => {
+            pgrx::error!("invalid lists parameter: {lists:?}. Must be either [n] or [n, m]")
+        }
     };
     if !use_gpu_acceleration() {
         pgrx::error!("GPU acceleration is not enabled. Ensure that your system is compatible and then configure: \"SET pgpu.gpu_acceleration = 'enable';\"");
@@ -52,14 +56,14 @@ pub fn index(
     let num_clusters_per_intermediate_batch: u32 = match num_batches {
         1 => {
             info!(
-                "clustering properties:\n\t uses_batching: false\n\t num_clusters: {num_clusters}"
+                "clustering properties:\n\t uses_batching: false\n\t num_clusters: {num_clusters_leaf}"
             );
             num_clusters_leaf
         }
         _ => {
             let desired_intermediate_batch_clusters = num_clusters_leaf * 4; // * 40;
             let n = desired_intermediate_batch_clusters / num_batches;
-            info!("clustering properties:\n\t uses_batching: true\n\t num_clusters_per_intermediate_batch: {n}\n\t desired_intermediate_batch_clusters: {desired_intermediate_batch_clusters}\n\t num_clusters: {num_clusters}");
+            info!("clustering properties:\n\t uses_batching: true\n\t num_clusters_per_intermediate_batch: {n}\n\t desired_intermediate_batch_clusters: {desired_intermediate_batch_clusters}\n\t num_clusters: {num_clusters_leaf}");
             n
         }
     };
@@ -107,14 +111,14 @@ pub fn index(
     batcher.end_scan();
     info!("batches finished in {:.2?}", start_time.elapsed());
 
-    let centroids_result_flat = if centroids_all.is_empty() {
+    let (centroids_leaf, weights_leaf) = if centroids_all.is_empty() {
         warning!("empty result from kmeans clustering");
         return;
     } else if centroids_all.len() == (num_clusters_leaf * dims) as usize {
         info!("All centroids computed in one batch, skipping re-clusting");
-        centroids_all
+        (centroids_all, weights_all)
     } else {
-        info!("All centroids computed in multiple batches, starting re-clusting of {} centroids into {num_clusters} clusters", centroids_all.len()/(dims as usize));
+        info!("All centroids computed in multiple batches, starting re-clusting of {} centroids into {num_clusters_leaf} clusters", centroids_all.len()/(dims as usize));
         run_clustering_consolidate(
             centroids_all,
             weights_all,
@@ -126,24 +130,54 @@ pub fn index(
         )
     };
 
-
-
-    let centroids_result: Vec<(Vec<f32>, i32)> = match num_clusters_top {
+    // elements are (centroid, parent_id)
+    // the IDs of the centroids are their vector index
+    let centroids_result: Vec<(Vec<f32>, i32)> = match num_clusters_top_option {
         None => {
-            // use "0" as parent ID if we don't have a top-level list
-            centroids_result_flat
+            // No parent ID if we don't have a top-level list
+            centroids_leaf
                 .chunks(dims as usize)
-                .map(|x| (x.to_vec(), 0))
+                // -1 indicates NULL parent
+                .map(|x| (x.to_vec(), -1))
                 .collect()
         }
-        Some(nct) => {
+        Some(num_clusters_top) => {
+            let (centroids_top, parents_leaf) = run_clustering_multilevel(
+                &centroids_leaf,
+                weights_leaf,
+                dims,
+                num_clusters_top,
+                kmeans_iterations,
+                kmeans_nredo,
+                spherical_centroids,
+            );
+            let centroids_leaf_chunked: Vec<Vec<f32>> = centroids_leaf
+                .chunks(dims as usize)
+                .map(|x| x.to_vec())
+                .collect();
 
+            // we'll add the chunked top centroids first and then append the leaf ones
+            let mut centroids_all_chunked: Vec<Vec<f32>> = centroids_top
+                .chunks(dims as usize)
+                .map(|x| x.to_vec())
+                .collect();
+            // init the NULL parents for the top centroids then append the leaf ones
+            let mut parents_all = vec![-1; centroids_all_chunked.len()];
 
+            centroids_all_chunked.extend(centroids_leaf_chunked);
+            parents_all.extend(parents_leaf);
+            assert_eq!(
+                centroids_all_chunked.len(),
+                parents_all.len(),
+                "number of centroids and parents must match"
+            );
+
+            centroids_all_chunked
+                .into_iter()
+                .zip(parents_all.into_iter())
+                .collect()
         }
     };
-
-
-
 
     centroids_table::store_centroids(centroids_result, centroid_table_name.clone(), dims);
     if !skip_index_build {
