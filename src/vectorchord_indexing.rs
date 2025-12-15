@@ -13,6 +13,7 @@ pub fn create_vector_index_on_gpu(
     distance_operator: default!(String, "'ip'"),
     skip_index_build: default!(bool, false),
     spherical_centroids: default!(bool, false),
+    residual_quantization: default!(bool, false),
 ) {
     let auto_lists: Vec<u32> = match lists {
         None => {vec![1000]}
@@ -31,5 +32,6 @@ pub fn create_vector_index_on_gpu(
         distance_operator,
         skip_index_build,
         spherical_centroids,
+        residual_quantization,
     );
 }

@@ -21,6 +21,7 @@ pub fn index(
     distance_operator: String,
     skip_index_build: bool,
     spherical_centroids: bool,
+    residual_quantization: bool,
 ) {
     let (num_clusters_top_option, num_clusters_leaf) = match lists.len() {
         1 => (None, lists[0]),
@@ -190,6 +191,7 @@ pub fn index(
             qualified_table,
             centroid_table_name,
             distance_operator,
+            residual_quantization,
         );
     } else {
         info!(

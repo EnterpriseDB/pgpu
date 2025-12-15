@@ -22,14 +22,14 @@ pub fn store_centroids(
         return;
     }
 
-    // TODO: vchord told us we don't need the root; just use NULL as parent for all entries
-    // I'm leaving it in for now since this was extensively tested, but we can remove it if we want
-    // let root = centroids
-    //     .first()
-    //     .expect("expected at least one centroid; found empty list")
-    //     .clone().0;
+    // Note: benchmarks show no improvement from using the "mean root" so we just use 0 here
+    //let root = mean_filtered(&centroids, -1).expect("no centroids with parent -1 found");
     let root = vec![0.0; vector_dimensions as usize];
-    Spi::run_with_args(&format!("INSERT INTO {table_name} (id, parent, vector) VALUES (0, NULL, $1)"), &[root.into()]).expect("unable to insert root centroid");
+    Spi::run_with_args(
+        &format!("INSERT INTO {table_name} (id, parent, vector) VALUES (0, NULL, $1)"),
+        &[root.into()],
+    )
+    .expect("unable to insert root centroid");
 
     let query = &format!(
         // note: parent ID is an option so it will be NULL for the top level of the voronoi tree
@@ -55,4 +55,28 @@ pub fn store_centroids(
     });
 
     debug1!("\tStoring centroids took: {:.2?}", start_time.elapsed());
+}
+
+/// calcluates the mean vector of all vectors with the given target ID
+fn _mean_filtered(data: &[(Vec<f32>, i32)], target_id: i32) -> Option<Vec<f32>> {
+    let mut sum_vec: Option<Vec<f32>> = None;
+    let mut count = 0.0;
+
+    for (vec, id) in data {
+        if *id == target_id {
+            if let Some(sums) = &mut sum_vec {
+                // Add current vector to existing sums
+                for (i, val) in vec.iter().enumerate() {
+                    sums[i] += val;
+                }
+            } else {
+                // First match: initialize sums with this vector's values
+                sum_vec = Some(vec.clone());
+            }
+            count += 1.0;
+        }
+    }
+
+    // Divide by count
+    sum_vec.map(|sums| sums.iter().map(|s| s / count).collect())
 }
