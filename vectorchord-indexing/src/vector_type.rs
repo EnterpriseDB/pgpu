@@ -3,7 +3,7 @@
 //  Layout: [dim: u16] [unused: u16] [x: f32...]
 pub(crate) fn decode_pgvector_vector(byte_slice: &[u8]) -> (Vec<f32>, u32) {
     if byte_slice.len() < 4 {
-        panic!("Invalid vector data: payload too short");
+        pgrx::error!("Invalid vector data: payload too short");
     }
 
     // Split off the 4-byte header (dim & unused)
@@ -15,10 +15,10 @@ pub(crate) fn decode_pgvector_vector(byte_slice: &[u8]) -> (Vec<f32>, u32) {
 
     // some sanity checking
     if float_bytes.len() % 4 != 0 {
-        panic!("Invalid vector data: byte length not a multiple of 4. We expect a seried of 4-byte float32/float4 values.");
+        pgrx::error!("Invalid vector data: byte length not a multiple of 4. We expect a seried of 4-byte float32/float4 values.");
     }
     if (float_bytes.len() / 4) != dim as usize {
-        panic!(
+        pgrx::error!(
             "Vector dimension mismatch: Header says {}, found {} floats",
             dim,
             float_bytes.len() / 4

@@ -6,6 +6,7 @@ pub fn create_vectorchord_index(
     schema_table: String,
     centroids_table_name: String,
     distance_operator: String,
+    residual_quantization: bool,
 ) {
     util::assert_valid_distance_operator(&distance_operator);
     let index_name = format!("{table}_pgpu_ext");
@@ -18,7 +19,7 @@ pub fn create_vectorchord_index(
 
     Spi::run(&format!(
         "CREATE INDEX {index_name} ON {schema_table} USING vchordrq (embedding {index_metric_type}) WITH (options = $$
-residual_quantization = true
+residual_quantization = {residual_quantization}
 build.pin = 2
 [build.external]
 table = '{centroids_table_name}'

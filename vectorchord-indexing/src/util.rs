@@ -16,7 +16,7 @@ pub(crate) fn assert_valid_distance_operator(input: &str) {
     match input {
         "ip" | "l2" | "cos" => (),
         _ => {
-            panic!("Invalid distance_operator \"{input}\": expected one of \"ip\", \"l2\", \"cos\"")
+            pgrx::error!("Invalid distance_operator \"{input}\": expected one of \"ip\", \"l2\", \"cos\"")
         }
     }
 }
@@ -57,7 +57,7 @@ pub fn parse_table_identifier(ident: &str) -> (String, String) {
             .unwrap();
 
     if parts.len() != 2 {
-        panic!(
+        pgrx::error!(
             "Invalid identifier '{ident}': must contain schema and table name (e.g \"public.table\"), got {parts:?}",
         );
     }

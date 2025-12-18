@@ -41,7 +41,7 @@ impl VectorReadBatcher {
         let table_size = (vbr).num_tuples();
         assert!(num_samples <= table_size as u64, "The table has fewer records ({table_size}) than the desired number of samples ({num_samples}) based on cluster_count*sampling_factor. Unable to continue");
         let rem = num_samples % num_samples_per_batch;
-        if rem < min_samples_per_batch {
+        if rem != 0 && rem < min_samples_per_batch {
             warning!("batch size {num_samples_per_batch} will lead to a remainder of {rem} samples in the last batch; which is too small for clustering. The last batch will be enlarged to {0} to contain this remainder", vbr.num_samples_per_batch + rem)
         }
         // TODO: calculate this from a new input "max memory GB"
@@ -122,7 +122,7 @@ impl VectorReadBatcher {
         let pg_rel = PgRelation::open_with_name_and_share_lock(&self.table_name)
             .expect("unable to open table");
         if !pg_rel.is_table() {
-            panic!(
+            pgrx::error!(
                 "table {} is not a table; only regular tables are supported",
                 self.table_name
             );
@@ -139,14 +139,14 @@ impl VectorReadBatcher {
                         .to_str()
                         .expect("invalid type name");
                     if type_name != "vector" {
-                        panic!("column \"{}\" type is not \"vector\". Only pgvector/vector types are supported", self.column_name);
+                        pgrx::error!("column \"{}\" type is not \"vector\". Only pgvector/vector types are supported", self.column_name);
                     }
                     col_num_found = Some(attr.attnum.into());
                 }
             }
         }
         let col_num = col_num_found.unwrap_or_else(|| {
-            panic!(
+            pgrx::error!(
                 "column {} not found in table {}",
                 self.column_name, self.table_name
             )

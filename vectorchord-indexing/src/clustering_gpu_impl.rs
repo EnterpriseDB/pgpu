@@ -2,7 +2,7 @@ use crate::util::{distance_type_from_str, normalize_vectors};
 use cuvs::cluster::kmeans;
 use cuvs::distance_type::DistanceType;
 use cuvs::{ManagedTensor, Resources};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayBase, Ix1, OwnedRepr};
 use pgrx::{debug1, info};
 use std::time::Instant;
 
@@ -91,11 +91,7 @@ pub fn run_clustering_batch(
         start_time.elapsed()
     );
 
-    // calculate weights
-    let mut counts = vec![0.0; num_clusters as usize];
-    for &label in labels_host.iter() {
-        counts[label as usize] += 1.0;
-    }
+    let weights = labels_to_weights(num_clusters, &labels_host);
 
     if spherical_centroids {
         debug1!("normalizing centroids");
@@ -109,7 +105,16 @@ pub fn run_clustering_batch(
         "\tClustering (k-means) done in: {:.2?}",
         start_time.elapsed()
     );
-    (centroids_owned, counts)
+    (centroids_owned, weights)
+}
+
+fn labels_to_weights(num_clusters: u32, labels_host: &ArrayBase<OwnedRepr<i32>, Ix1>) -> Vec<f32> {
+    // calculate weights
+    let mut counts = vec![0.0; num_clusters as usize];
+    for &label in labels_host.iter() {
+        counts[label as usize] += 1.0;
+    }
+    counts
 }
 
 pub fn run_clustering_consolidate(
@@ -203,4 +208,122 @@ pub fn run_clustering_consolidate(
         start_time.elapsed()
     );
     centroids_owned
+}
+
+/// clusters a the leaf centroids; i.e. the centroids being trained on the vectors in the table, into a set of parent centroids
+/// to be used as the "top / root" level of the voronoi tree
+/// the labels being assigned during prediction for from [0..(num_clusters-1)] these will be the parent IDs
+/// i.e. an input centroids being assigned the label "0" belongs to the first cluster in our output
+pub fn run_clustering_multilevel(
+    vectors: &Vec<f32>,
+    vector_dims: u32,
+    num_clusters: u32,
+    kmeans_iterations: u32,
+    kmeans_nredo: u32,
+    spherical_centroids: bool,
+) -> (Vec<f32>, Vec<i32>) {
+    info!("Clustering multilevel / leaf centroids on GPU");
+    let start_time = Instant::now();
+    let num_vectors = vectors.len() / vector_dims as usize;
+    // cuvs setup
+    let res = Resources::new().expect("GPU Resource creation failed");
+    // shape is (rows, cols). rows is determined by the length of the vector input; so we divide by dimensions to get that value
+    let vectors_array =
+        Array2::from_shape_vec((num_vectors, vector_dims as usize), vectors.to_vec())
+            .expect("shaping vectors failed");
+
+    debug1!("⏱️ preparing vectors done at: {:.2?}", start_time.elapsed());
+
+    let dataset = ManagedTensor::from(&vectors_array)
+        .to_device(&res)
+        .expect("vectors->tensor transformation failed");
+    debug1!("⏱️ copied vectors to gpu at: {:.2?}", start_time.elapsed());
+    let mut centroids_host = Array2::<f32>::zeros((num_clusters as usize, vector_dims as usize));
+    let mut centroids_gpu = ManagedTensor::from(&centroids_host)
+        .to_device(&res)
+        .expect("centroids(empty)->GPU transfer failed");
+
+    let mut labels_host = Array1::<i32>::zeros(num_vectors);
+    let mut labels_gpu = ManagedTensor::from(&labels_host)
+        .to_device(&res)
+        .expect("labels(empty)->GPU transfer failed");
+
+    // Note: we need to use non-hierarchical kmeans here since only that supports
+    // passing in weights; which are critical for accuracy
+    // and non-hiearchical only works with L2Expanded distance
+    let kmeans_params = kmeans::Params::new()
+        .expect("kmeans params create failed")
+        .set_n_clusters(num_clusters as i32)
+        .set_max_iter(kmeans_iterations as i32)
+        .set_n_init(kmeans_nredo as i32)
+        .set_metric(DistanceType::L2Expanded)
+        .set_hierarchical(false);
+
+    debug1!(
+        "⏱️ preparing/transferring data done at: {:.2?}",
+        start_time.elapsed()
+    );
+
+    debug1!("running kemans");
+    let (inertia, n_iter) = kmeans::fit(
+        &res,
+        &kmeans_params,
+        &dataset,
+        &None, // Note: we don't supply weights here on purpose. Benchmarks have shown that index accuracy drops if we use weights for this "parent clustering"
+        &mut centroids_gpu,
+    )
+    .expect("kmeans training failed");
+    debug1!("kmeans done with inertia: {inertia}, n_iter: {n_iter}");
+    debug1!(
+        "⏱️ kmeans training data done at: {:.2?}",
+        start_time.elapsed()
+    );
+
+    // now run prediction to see into which clusters the individual vectors belong
+    // these "labels" will then be used as the parent IDs in the centroids table.
+    let _inertia_pred = kmeans::predict(
+        &res,
+        &kmeans_params,
+        &dataset,
+        &None,
+        &centroids_gpu,
+        &mut labels_gpu,
+        false,
+    )
+    .expect("kmeans prediction failed");
+    debug1!(
+        "⏱️ kmeans predict data done at: {:.2?}",
+        start_time.elapsed()
+    );
+
+    debug1!("retrieve results from GPU");
+    labels_gpu
+        .to_host(&res, &mut labels_host)
+        .expect("labels->host transfer failed");
+    let labels_vec = labels_host.into_raw_vec().into();
+
+    debug1!("retrieve results from GPU");
+    //warning!("labels {:#?}", labels_vec);
+
+    centroids_gpu
+        .to_host(&res, &mut centroids_host)
+        .expect("centroids->host transfer failed");
+    debug1!(
+        "⏱️ retrieved data from GPU at: {:.2?}",
+        start_time.elapsed()
+    );
+
+    if spherical_centroids {
+        debug1!("normalizing centroids");
+        normalize_vectors(&mut centroids_host);
+        debug1!("⏱️ normlaized centroids at: {:.2?}", start_time.elapsed());
+    }
+
+    let centroids_owned: Vec<f32> = centroids_host.into_raw_vec().into();
+
+    debug1!(
+        "\tClustering (k-means) done in: {:.2?}",
+        start_time.elapsed()
+    );
+    (centroids_owned, labels_vec)
 }
