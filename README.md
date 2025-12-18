@@ -71,7 +71,8 @@ CREATE FUNCTION "create_vector_index_on_gpu"(
         "kmeans_nredo" bigint DEFAULT 1,
         "distance_operator" TEXT DEFAULT 'ip',
         "skip_index_build" bool DEFAULT false,
-        "spherical_centroids" bool DEFAULT false
+        "spherical_centroids" bool DEFAULT false,
+        "residual_quantization" bool DEFAULT false
 ) RETURNS void STRICT
 ```
 
@@ -108,6 +109,9 @@ CREATE FUNCTION "create_vector_index_on_gpu"(
 - `spherical_centroids`: whether to normalize centroids to unit sphere
   - default: `false`
   - note: this should be enabled when using `ip` distance operator and/or when using a dataset that is normalized to unit sphere
+- `residual_quantization`: enable the "residual_quantization" feature on vchord when building the index
+  - default: `false`
+  - note: this setting does not affect PGPU behavior at all. It is only used to enable the feature on vchord.
 
 
 ## Building and running
