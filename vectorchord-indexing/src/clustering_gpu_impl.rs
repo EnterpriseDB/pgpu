@@ -125,7 +125,7 @@ pub fn run_clustering_consolidate(
     kmeans_iterations: u32,
     kmeans_nredo: u32,
     spherical_centroids: bool,
-) -> (Vec<f32>, Vec<f32>) {
+) -> Vec<f32> {
     info!("Clustering intermediate centroids on GPU");
     let start_time = Instant::now();
     let num_vectors = vectors.len() / vector_dims as usize;
@@ -153,11 +153,6 @@ pub fn run_clustering_consolidate(
     let mut centroids_gpu = ManagedTensor::from(&centroids_host)
         .to_device(&res)
         .expect("centroids(empty)->GPU transfer failed");
-
-    let mut labels_host = Array1::<i32>::zeros(num_vectors);
-    let mut labels_gpu = ManagedTensor::from(&labels_host)
-        .to_device(&res)
-        .expect("labels(empty)->GPU transfer failed");
 
     // Note: we need to use non-hierarchical kmeans here since only that supports
     // passing in weights; which are critical for accuracy
@@ -190,25 +185,7 @@ pub fn run_clustering_consolidate(
         start_time.elapsed()
     );
 
-    let _inertia_pred = kmeans::predict(
-        &res,
-        &kmeans_params,
-        &dataset,
-        &None,
-        &centroids_gpu,
-        &mut labels_gpu,
-        false,
-    )
-    .expect("kmeans prediction failed");
-    debug1!(
-        "⏱️ kmeans predict data done at: {:.2?}",
-        start_time.elapsed()
-    );
-
     debug1!("retrieve results from GPU");
-    labels_gpu
-        .to_host(&res, &mut labels_host)
-        .expect("labels->host transfer failed");
 
     centroids_gpu
         .to_host(&res, &mut centroids_host)
@@ -217,8 +194,6 @@ pub fn run_clustering_consolidate(
         "⏱️ retrieved data from GPU at: {:.2?}",
         start_time.elapsed()
     );
-
-    let weights_out = labels_to_weights(num_clusters, &labels_host);
 
     if spherical_centroids {
         debug1!("normalizing centroids");
@@ -232,7 +207,7 @@ pub fn run_clustering_consolidate(
         "\tClustering (k-means) done in: {:.2?}",
         start_time.elapsed()
     );
-    (centroids_owned, weights_out)
+    centroids_owned
 }
 
 /// clusters a the leaf centroids; i.e. the centroids being trained on the vectors in the table, into a set of parent centroids
@@ -241,7 +216,6 @@ pub fn run_clustering_consolidate(
 /// i.e. an input centroids being assigned the label "0" belongs to the first cluster in our output
 pub fn run_clustering_multilevel(
     vectors: &Vec<f32>,
-    weights: Vec<f32>,
     vector_dims: u32,
     num_clusters: u32,
     kmeans_iterations: u32,
@@ -257,13 +231,6 @@ pub fn run_clustering_multilevel(
     let vectors_array =
         Array2::from_shape_vec((num_vectors, vector_dims as usize), vectors.to_vec())
             .expect("shaping vectors failed");
-
-    let weights_array =
-        Array1::from_shape_vec(num_vectors, weights.to_vec()).expect("shaping vectors failed");
-
-    let weights = ManagedTensor::from(&weights_array)
-        .to_device(&res)
-        .expect("weights(host)->GPU transfer failed");
 
     debug1!("⏱️ preparing vectors done at: {:.2?}", start_time.elapsed());
 
@@ -302,7 +269,7 @@ pub fn run_clustering_multilevel(
         &res,
         &kmeans_params,
         &dataset,
-        &Some(weights),
+        &None, // Note: we don't supply weights here on purpose. Benchmarks have shown that index accuracy drops if we use weights for this "parent clustering"
         &mut centroids_gpu,
     )
     .expect("kmeans training failed");

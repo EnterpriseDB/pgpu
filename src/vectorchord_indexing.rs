@@ -1,4 +1,4 @@
-use pgrx::{default, pg_extern, warning};
+use pgrx::{default, pg_extern};
 
 #[allow(clippy::too_many_arguments)]
 #[pg_extern]
@@ -16,19 +16,31 @@ pub fn create_vector_index_on_gpu(
     residual_quantization: default!(bool, false),
 ) {
     let auto_lists: Vec<u32> = match lists {
-        None => {vec![1000]}
-        Some(l) => {l.iter().map(|i| (*i).try_into().expect("value for lists can't be negative")).collect()}
+        None => {
+            vec![1000]
+        }
+        Some(l) => l
+            .iter()
+            .map(|i| (*i).try_into().expect("value for lists can't be negative"))
+            .collect(),
     };
-    warning!("auto_lists: {:?}", auto_lists);
 
     vectorchord_indexing::index(
         table_name,
         column_name,
         auto_lists,
-        sampling_factor.try_into().expect("value for sampling_factor can't be negative"),
-        batch_size.try_into().expect("value for batch_size can't be negative"),
-        kmeans_iterations.try_into().expect("value for kmeans_iterations can't be negative"),
-        kmeans_nredo.try_into().expect("value for kmeans_nredo can't be negative"),
+        sampling_factor
+            .try_into()
+            .expect("value for sampling_factor can't be negative"),
+        batch_size
+            .try_into()
+            .expect("value for batch_size can't be negative"),
+        kmeans_iterations
+            .try_into()
+            .expect("value for kmeans_iterations can't be negative"),
+        kmeans_nredo
+            .try_into()
+            .expect("value for kmeans_nredo can't be negative"),
         distance_operator,
         skip_index_build,
         spherical_centroids,

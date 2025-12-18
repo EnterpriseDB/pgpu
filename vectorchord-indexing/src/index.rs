@@ -57,14 +57,14 @@ pub fn index(
     let num_clusters_per_intermediate_batch: u32 = match num_batches {
         1 => {
             info!(
-                "clustering properties:\n\t uses_batching: false\n\t num_clusters: {num_clusters_leaf}"
+                "clustering properties:\n\t uses_batching: false\n\t lists: {lists:?}"
             );
             num_clusters_leaf
         }
         _ => {
             let desired_intermediate_batch_clusters = num_clusters_leaf * 4; // * 40;
             let n = desired_intermediate_batch_clusters / num_batches;
-            info!("clustering properties:\n\t uses_batching: true\n\t num_clusters_per_intermediate_batch: {n}\n\t desired_intermediate_batch_clusters: {desired_intermediate_batch_clusters}\n\t num_clusters: {num_clusters_leaf}");
+            info!("clustering properties:\n\t uses_batching: true\n\t num_clusters_per_intermediate_batch: {n}\n\t desired_intermediate_batch_clusters: {desired_intermediate_batch_clusters}\n\t lists: {lists:?}");
             n
         }
     };
@@ -112,12 +112,12 @@ pub fn index(
     batcher.end_scan();
     info!("batches finished in {:.2?}", start_time.elapsed());
 
-    let (centroids_leaf, weights_leaf) = if centroids_all.is_empty() {
+    let centroids_leaf = if centroids_all.is_empty() {
         warning!("empty result from kmeans clustering");
         return;
     } else if centroids_all.len() == (num_clusters_leaf * dims) as usize {
         info!("All centroids computed in one batch, skipping re-clusting");
-        (centroids_all, weights_all)
+        centroids_all
     } else {
         info!("All centroids computed in multiple batches, starting re-clusting of {} centroids into {num_clusters_leaf} clusters", centroids_all.len()/(dims as usize));
         run_clustering_consolidate(
@@ -145,7 +145,6 @@ pub fn index(
         Some(num_clusters_top) => {
             let (centroids_top, parents_leaf) = run_clustering_multilevel(
                 &centroids_leaf,
-                weights_leaf,
                 dims,
                 num_clusters_top,
                 kmeans_iterations,
