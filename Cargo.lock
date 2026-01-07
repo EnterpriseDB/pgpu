@@ -307,8 +307,8 @@ dependencies = [
 
 [[package]]
 name = "cuvs"
-version = "25.10.0"
-source = "git+https://github.com/rapidsai/cuvs?tag=v25.10.00#f245c1529d460a374b92e8c8448de0b0b6b84ee6"
+version = "25.12.0"
+source = "git+https://github.com/rapidsai/cuvs?tag=v25.12.00#fc27938b72ecdd4b9022d2ce71dfe4d3d0d37f95"
 dependencies = [
  "cuvs-sys",
  "ndarray",
@@ -316,8 +316,8 @@ dependencies = [
 
 [[package]]
 name = "cuvs-sys"
-version = "25.10.0"
-source = "git+https://github.com/rapidsai/cuvs?tag=v25.10.00#f245c1529d460a374b92e8c8448de0b0b6b84ee6"
+version = "25.12.0"
+source = "git+https://github.com/rapidsai/cuvs?tag=v25.12.00#fc27938b72ecdd4b9022d2ce71dfe4d3d0d37f95"
 dependencies = [
  "bindgen",
  "cmake",

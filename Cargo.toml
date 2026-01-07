@@ -15,7 +15,7 @@ members = ["vectorchord-indexing"]
 
 # workspace.dependencies can be referenced by the workspace members. Then we can declare the version only once, here.
 [workspace.dependencies]
-cuvs = { git = "https://github.com/rapidsai/cuvs", tag = "v25.10.00", version="25.10.0", default-features = false }
+cuvs = { git = "https://github.com/rapidsai/cuvs", tag = "v25.12.00", version="25.12.0", default-features = false }
 pgrx = { git = "https://github.com/EnterpriseDB/pgrx", branch = "develop-v0.16.1-edb", default-features = false }
 ndarray = "0.15.6"
 

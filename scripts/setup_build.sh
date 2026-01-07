@@ -4,7 +4,7 @@ export DIST_VERSION="9"
 export GPU_CUDA_TOOLKIT_VER="12-9"
 #export GPU_CUDA_ARCHITECTURES="89;90;100;103;120;121" # 89: L40/L4, 90: H100/H200/GH200
 export GPU_CUDA_ARCHITECTURES="89"
-export CUVS_VER="25.10.00"
+export CUVS_VER="25.12.00"
 
 # we need packages from the subscription repos to build the NVIDIA driver kernel module
 sudo subscription-manager register
@@ -16,7 +16,6 @@ sudo subscription-manager repos --enable=codeready-builder-for-rhel-9-x86_64-rpm
 sudo dnf group install -y "Development Tools"
 sudo dnf install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
 
-
 # CUDA
 sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel${DIST_VERSION}/x86_64/cuda-rhel${DIST_VERSION}.repo
 sudo dnf install -y cuda-toolkit-${GPU_CUDA_TOOLKIT_VER}
@@ -24,16 +23,11 @@ sudo dnf install -y cuda-toolkit-${GPU_CUDA_TOOLKIT_VER}
 # NVIDIA driver; needed to run PGPU
 sudo dnf install -y nvidia-driver-cuda
 
-
 sudo dnf install -y pkg-config cmake
 export PATH=/usr/local/cuda/bin:$PATH
 export CUDACXX=/usr/local/cuda/bin/nvcc
 
-
-
 # TODO: install cuVS binaries/dependencies see: https://github.com/rapidsai/cuvs/blob/94795b09444746eda80dc27f775a73c9bf8b2ecd/conda/environments/rust_cuda-129_arch-x86_64.yaml
-
-
 
 # set up git authentication for the builder; some rust dependencies need to access private repos later
 git config --global url."https://x:${GITHUB_TOKEN}@github.com".insteadOf "https://github.com"
@@ -42,7 +36,6 @@ git config --global url."https://x:${GITHUB_TOKEN}@github.com".insteadOf "https:
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
 cargo install --git https://github.com/EnterpriseDB/pgrx --branch develop-v0.16.1-edb cargo-pgrx --locked --force
-
 
 # set up PG for extension development and testing
 # Install the repository RPM:
