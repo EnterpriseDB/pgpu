@@ -10,5 +10,4 @@ default = []
 [dependencies]
 cuvs = { workspace = true }
 ndarray = { workspace = true }
-log = "0.4.28"
 pgrx = { workspace = true }

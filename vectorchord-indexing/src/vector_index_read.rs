@@ -148,7 +148,8 @@ impl VectorReadBatcher {
         let col_num = col_num_found.unwrap_or_else(|| {
             pgrx::error!(
                 "column {} not found in table {}",
-                self.column_name, self.table_name
+                self.column_name,
+                self.table_name
             )
         });
         self.col_num = Some(col_num as usize);

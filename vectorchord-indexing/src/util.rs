@@ -16,7 +16,9 @@ pub(crate) fn assert_valid_distance_operator(input: &str) {
     match input {
         "ip" | "l2" | "cos" => (),
         _ => {
-            pgrx::error!("Invalid distance_operator \"{input}\": expected one of \"ip\", \"l2\", \"cos\"")
+            pgrx::error!(
+                "Invalid distance_operator \"{input}\": expected one of \"ip\", \"l2\", \"cos\""
+            )
         }
     }
 }

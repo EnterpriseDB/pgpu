@@ -1,6 +1,5 @@
 use crate::guc::GpuAcceleration::Enable;
 use pgrx::guc::*;
-use pgrx::prelude::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, PostgresGucEnum)]
 #[name = "gpu_acceleration"]
