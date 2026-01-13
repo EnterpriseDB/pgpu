@@ -56,9 +56,7 @@ pub fn index(
     // so a much lower points/clusters ration can be used
     let num_clusters_per_intermediate_batch: u32 = match num_batches {
         1 => {
-            info!(
-                "clustering properties:\n\t uses_batching: false\n\t lists: {lists:?}"
-            );
+            info!("clustering properties:\n\t uses_batching: false\n\t lists: {lists:?}");
             num_clusters_leaf
         }
         _ => {
