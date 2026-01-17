@@ -1,5 +1,5 @@
 use crate::clustering_gpu_impl::{
-    run_clustering_batch, run_clustering_consolidate, run_clustering_multilevel,
+    run_clustering_batch, run_clustering_consolidate, run_clustering_multilevel, run_clustering_hierarchical,
 };
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
@@ -79,55 +79,107 @@ pub fn index(
         num_clusters_per_intermediate_batch as u64,
     );
 
-    let mut centroids_all: Vec<f32> = Vec::new();
-    let mut weights_all: Vec<f32> = Vec::new();
     let mut dims: u32 = 0;
 
-    let mut batch_count = 0;
-    while let Some((vecs, batch_dims)) = batcher.next_batch() {
-        batch_count += 1;
-        info!("processing batch ({batch_count}/{num_batches})");
-        dims = batch_dims; // this is not expected to change
+    // =========================================================================================
+    // START MODIFICATION: Hierarchical Branch vs Original Flat Branch
+    // =========================================================================================
 
-        util::print_memory(&vecs, "batch training vectors");
+    let centroids_leaf = if lists.len() == 2 {
+        // --- PATH A: New Optimized Top-Down Hierarchical Clustering ---
+        // This path loads all vectors into RAM to allow global partitioning, avoiding the O(N*K) brute force.
+        info!("Detected 2-level hierarchy {lists:?}. Using Optimized Top-Down GPU Clustering.");
 
-        let (centroids_batch, weights_batch) = run_clustering_batch(
-            vecs,
+        let mut all_vectors: Vec<f32> = Vec::with_capacity((num_samples * 96) as usize);
+        let mut batch_count = 0;
+
+        // Reuse the batcher to load everything
+        while let Some((vecs, batch_dims)) = batcher.next_batch() {
+            batch_count += 1;
+            dims = batch_dims;
+            all_vectors.extend_from_slice(&vecs);
+            if batch_count % 5 == 0 {
+                info!("Loaded batch {batch_count}/{num_batches} into RAM for partitioning...");
+            }
+        }
+        batcher.end_scan();
+        info!("batches finished loading in {:.2?}", start_time.elapsed());
+
+        if all_vectors.is_empty() {
+            warning!("No vectors found for clustering!");
+            return;
+        }
+
+        // Call the new hierarchical implementation
+        run_clustering_hierarchical(
+            all_vectors,
             dims,
-            num_clusters_per_intermediate_batch,
+            lists.clone(),
             kmeans_iterations,
             kmeans_nredo,
             &distance_operator,
             spherical_centroids,
-        );
-
-        centroids_all.extend_from_slice(&centroids_batch);
-        weights_all.extend_from_slice(&weights_batch);
-        util::print_memory(&centroids_batch, "centroids from this batch");
-        util::print_memory(&centroids_all, "centroids from all batches");
-        util::print_memory(&weights_all, "weights from all batches");
-    }
-    batcher.end_scan();
-    info!("batches finished in {:.2?}", start_time.elapsed());
-
-    let centroids_leaf = if centroids_all.is_empty() {
-        warning!("empty result from kmeans clustering");
-        return;
-    } else if centroids_all.len() == (num_clusters_leaf * dims) as usize {
-        info!("All centroids computed in one batch, skipping re-clusting");
-        centroids_all
-    } else {
-        info!("All centroids computed in multiple batches, starting re-clusting of {} centroids into {num_clusters_leaf} clusters", centroids_all.len()/(dims as usize));
-        run_clustering_consolidate(
-            centroids_all,
-            weights_all,
-            dims,
-            num_clusters_leaf,
-            kmeans_iterations,
-            kmeans_nredo,
-            spherical_centroids,
         )
+
+    } else {
+        // --- PATH B: Original Bottom-Up Batch Logic (Preserved Verbatim) ---
+        // Used when lists.len() == 1 or other cases.
+
+        let mut centroids_all: Vec<f32> = Vec::new();
+        let mut weights_all: Vec<f32> = Vec::new();
+        let mut batch_count = 0;
+
+        while let Some((vecs, batch_dims)) = batcher.next_batch() {
+            batch_count += 1;
+            info!("processing batch ({batch_count}/{num_batches})");
+            dims = batch_dims; // this is not expected to change
+
+            util::print_memory(&vecs, "batch training vectors");
+
+            let (centroids_batch, weights_batch) = run_clustering_batch(
+                vecs,
+                dims,
+                num_clusters_per_intermediate_batch,
+                kmeans_iterations,
+                kmeans_nredo,
+                &distance_operator,
+                spherical_centroids,
+            );
+
+            centroids_all.extend_from_slice(&centroids_batch);
+            weights_all.extend_from_slice(&weights_batch);
+            util::print_memory(&centroids_batch, "centroids from this batch");
+            util::print_memory(&centroids_all, "centroids from all batches");
+            util::print_memory(&weights_all, "weights from all batches");
+        }
+        batcher.end_scan();
+        info!("batches finished in {:.2?}", start_time.elapsed());
+
+        // Original logic to determine if we need consolidation
+        if centroids_all.is_empty() {
+            warning!("empty result from kmeans clustering");
+            return;
+        } else if centroids_all.len() == (num_clusters_leaf * dims) as usize {
+            info!("All centroids computed in one batch, skipping re-clusting");
+            centroids_all
+        } else {
+            info!("All centroids computed in multiple batches, starting re-clusting of {} centroids into {num_clusters_leaf} clusters", centroids_all.len()/(dims as usize));
+            run_clustering_consolidate(
+                centroids_all,
+                weights_all,
+                dims,
+                num_clusters_leaf,
+                kmeans_iterations,
+                kmeans_nredo,
+                spherical_centroids,
+            )
+        }
     };
+
+    // =========================================================================================
+    // END MODIFICATION: We now have 'centroids_leaf' from either path.
+    // The rest of the code is unchanged.
+    // =========================================================================================
 
     // elements are (centroid, parent_id)
     // the IDs of the centroids are their vector index

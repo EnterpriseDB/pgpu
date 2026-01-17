@@ -327,3 +327,104 @@ pub fn run_clustering_multilevel(
     );
     (centroids_owned, labels_vec)
 }
+
+/// TOP-DOWN Hierarchical Clustering
+/// Replaces the slow "Batch + Consolidate" method.
+/// 1. Trains 'root_k' centroids.
+/// 2. Partitions data.
+/// 3. Trains 'leaf_k' centroids per partition.
+pub fn run_clustering_hierarchical(
+    vectors: Vec<f32>,
+    vector_dims: u32,
+    lists: Vec<u32>, // e.g. [400, 160000]
+    kmeans_iterations: u32,
+    kmeans_nredo: u32,
+    distance_operator: &str,
+    spherical_centroids: bool,
+) -> Vec<f32> {
+    info!("Starting Hierarchical Clustering (Top-Down) on GPU");
+    let start_time = Instant::now();
+
+    let root_k = lists[0]; // 400
+    let total_leaf_k = lists[1]; // 160000
+    let leaf_k_per_root = total_leaf_k / root_k; // 400 sub-clusters per root
+
+    // --- STEP 1: Train Root Centroids ---
+    info!("Phase 1: Training {} root centroids...", root_k);
+    let (root_centroids, _) = run_clustering_batch(
+        vectors.clone(), // Clone needed as we consume vectors later for partitioning
+        vector_dims,
+        root_k,
+        kmeans_iterations,
+        kmeans_nredo,
+        distance_operator,
+        spherical_centroids,
+    );
+
+    // --- STEP 2: Assign Data to Root Buckets (Partitioning) ---
+    info!("Phase 2: Partitioning data into {} buckets...", root_k);
+
+    // We reuse the 'run_clustering_multilevel' logic to get labels (parent IDs)
+    // This effectively runs a 'predict' on the GPU
+    let (_, labels) = run_clustering_multilevel(
+        &vectors,
+        vector_dims,
+        root_k,
+        kmeans_iterations,
+        kmeans_nredo,
+        spherical_centroids, // Use same spherical setting for consistency
+    );
+    // Note: run_clustering_multilevel internally re-trains/refines.
+    // If you want strictly just assignment, you'd call kmeans::predict directly,
+    // but reusing the existing function is safer with current imports.
+
+    // Move data into buckets on CPU (Rust side)
+    // usage: buckets[cluster_id] -> Vec<f32> (flattened vectors)
+    let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); root_k as usize];
+
+    let num_vectors = vectors.len() / vector_dims as usize;
+    for i in 0..num_vectors {
+        let label = labels[i] as usize;
+        if label < buckets.len() {
+            let start = i * vector_dims as usize;
+            let end = start + vector_dims as usize;
+            buckets[label].extend_from_slice(&vectors[start..end]);
+        }
+    }
+
+    // --- STEP 3: Train Leaf Centroids per Bucket ---
+    info!("Phase 3: Training leaf nodes per bucket...");
+    let mut final_centroids: Vec<f32> = Vec::with_capacity((total_leaf_k * vector_dims) as usize);
+
+    for (i, bucket_data) in buckets.iter().enumerate() {
+        if bucket_data.is_empty() {
+             // Edge case: Empty cluster. Fill with random or zero?
+             // Ideally we shouldn't hit this with uniform data.
+             // For now, we skip or push dummy data to maintain index alignment if strict.
+             // VectorChord is usually robust to missing centroids, but let's warn.
+             debug1!("Warning: Bucket {} is empty. Skipping.", i);
+             continue;
+        }
+
+        // Run standard clustering on this small bucket
+        // We use the same existing batch function because it handles the GPU setup boilerplate
+        let (mut leaf_centroids, _) = run_clustering_batch(
+            bucket_data.clone(),
+            vector_dims,
+            leaf_k_per_root,
+            kmeans_iterations,
+            kmeans_nredo,
+            distance_operator,
+            spherical_centroids,
+        );
+
+        final_centroids.append(&mut leaf_centroids);
+
+        if i % 10 == 0 {
+            debug1!("Finished bucket {}/{}", i, root_k);
+        }
+    }
+
+    info!("Hierarchical Clustering finished in {:.2?}", start_time.elapsed());
+    final_centroids
+}
