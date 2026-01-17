@@ -427,4 +427,4 @@ pub fn run_clustering_hierarchical(
 
     println!("Hierarchical Clustering finished in {:.2?}", start_time.elapsed());
     final_centroids
-}}
+}
