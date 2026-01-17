@@ -1,9 +1,6 @@
 use pgrx::{debug1, info, warning, Spi};
 use std::time::Instant;
 
-use pgrx::{debug1, info, warning, Spi};
-use std::time::Instant;
-
 pub fn store_centroids(
     centroids: Vec<(Vec<f32>, i32)>,
     table_name: String,

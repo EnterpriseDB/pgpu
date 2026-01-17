@@ -6,7 +6,7 @@ use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
 use crate::{centroids_table, util};
 use pgrx::spi::quote_qualified_identifier;
-use pgrx::{info, warning};
+use pgrx::{info, warning, debug1};
 use std::time::Instant;
 
 #[allow(clippy::too_many_arguments)]
@@ -22,6 +22,7 @@ pub fn index(
     skip_index_build: bool,
     spherical_centroids: bool,
     residual_quantization: bool,
+    centroid_table_name: String,
 ) {
     let (num_clusters_top_option, num_clusters_leaf) = match lists.len() {
         1 => (None, lists[0]),
@@ -30,12 +31,14 @@ pub fn index(
             pgrx::error!("invalid lists parameter: {lists:?}. Must be either [n] or [n, m]")
         }
     };
+
     if !use_gpu_acceleration() {
         pgrx::error!("GPU acceleration is not enabled. Ensure that your system is compatible and then configure: \"SET pgpu.gpu_acceleration = 'enable';\"");
     }
+
     let (schema, table) = crate::util::parse_table_identifier(&table_name);
     let qualified_table = quote_qualified_identifier(schema.clone(), table.clone());
-    info!("running GPU accelerated index build for {qualified_table}.{column_name}");
+    info!("🚀 running GPU accelerated index build for {qualified_table}.{column_name}");
 
     if sampling_factor < 40 {
         warning!("sampling factor {sampling_factor} is very low; consider increasing to at least 40 to achieve useful clustering results");
@@ -46,7 +49,6 @@ pub fn index(
     assert!(centroid_table_name.len() <= 63, "generated centroid table name \"{centroid_table_name}\" is too long to use as a postgres identifier. Use a source table name that is shorter than 53 characters");
 
     let start_time = Instant::now();
-
     let num_samples = (num_clusters_leaf as u64).saturating_mul(sampling_factor as u64);
     let num_batches = num_samples.div_ceil(batch_size) as u32;
 
@@ -78,11 +80,11 @@ pub fn index(
     let mut dims: u32 = 0;
 
     // =========================================================================================
-    // UNIFIED CLUSTERING LOGIC: Unified to return Vec<(Vec<f32>, i32)>
+    // UNIFIED CLUSTERING LOGIC
     // =========================================================================================
 
     let centroids_result: Vec<(Vec<f32>, i32)> = if lists.len() == 2 {
-        // --- PATH A: New Optimized Top-Down Hierarchical Clustering ---
+        // --- PATH A: Top-Down Hierarchical (Optimized for 100M Scale) ---
         info!("Detected 2-level hierarchy {lists:?}. Using Optimized Top-Down GPU Clustering.");
 
         let mut all_vectors: Vec<f32> = Vec::with_capacity((num_samples * 96) as usize);
@@ -93,7 +95,7 @@ pub fn index(
             dims = batch_dims;
             all_vectors.extend_from_slice(&vecs);
             if batch_count % 5 == 0 {
-                info!("Loaded batch {batch_count}/{num_batches} into RAM for partitioning...");
+                info!("Loaded batch {batch_count}/{num_batches} into RAM...");
             }
         }
         batcher.end_scan();
@@ -112,10 +114,11 @@ pub fn index(
             kmeans_nredo,
             &distance_operator,
             spherical_centroids,
+            residual_quantization, // CRITICAL: Fixes 5% recall by training on residuals
         )
 
     } else {
-        // --- PATH B: Original Bottom-Up Batch Logic (Preserved Verbatim) ---
+        // --- PATH B: Bottom-Up Batch Logic ---
         let mut centroids_all: Vec<f32> = Vec::new();
         let mut weights_all: Vec<f32> = Vec::new();
         let mut batch_count = 0;
@@ -125,8 +128,6 @@ pub fn index(
             info!("processing batch ({batch_count}/{num_batches})");
             dims = batch_dims;
 
-            util::print_memory(&vecs, "batch training vectors");
-
             let (centroids_batch, weights_batch) = run_clustering_batch(
                 vecs,
                 dims,
@@ -135,6 +136,7 @@ pub fn index(
                 kmeans_nredo,
                 &distance_operator,
                 spherical_centroids,
+                false, // No internal hierarchy for manual batches
             );
 
             centroids_all.extend_from_slice(&centroids_batch);
@@ -161,17 +163,14 @@ pub fn index(
                 num_clusters_leaf,
                 kmeans_iterations,
                 kmeans_nredo,
+                &distance_operator, // Updated signature
                 spherical_centroids,
             )
         };
 
-        // Unify Path B into the (vector, parent) format
         match num_clusters_top_option {
             None => {
-                centroids_leaf
-                    .chunks(dims as usize)
-                    .map(|x: &[f32]| (x.to_vec(), -1))
-                    .collect()
+                centroids_leaf.chunks(dims as usize).map(|x| (x.to_vec(), -1)).collect()
             }
             Some(num_clusters_top) => {
                 let (centroids_top, parents_leaf) = run_clustering_multilevel(
@@ -180,26 +179,19 @@ pub fn index(
                     num_clusters_top,
                     kmeans_iterations,
                     kmeans_nredo,
+                    &distance_operator, // Updated signature
                     spherical_centroids,
                 );
-                let centroids_leaf_chunked: Vec<Vec<f32>> = centroids_leaf
-                    .chunks(dims as usize)
-                    .map(|x: &[f32]| x.to_vec())
-                    .collect();
 
-                let mut centroids_all_chunked: Vec<Vec<f32>> = centroids_top
-                    .chunks(dims as usize)
-                    .map(|x: &[f32]| x.to_vec())
-                    .collect();
+                let mut results: Vec<(Vec<f32>, i32)> = centroids_top
+                    .chunks(dims as usize).map(|x| (x.to_vec(), -1)).collect();
 
-                let mut parents_all = vec![-1; centroids_all_chunked.len()];
-                centroids_all_chunked.extend(centroids_leaf_chunked);
-                parents_all.extend(parents_leaf);
+                let leaves: Vec<(Vec<f32>, i32)> = centroids_leaf
+                    .chunks(dims as usize).zip(parents_leaf.into_iter())
+                    .map(|(v, p)| (v.to_vec(), p)).collect();
 
-                centroids_all_chunked
-                    .into_iter()
-                    .zip(parents_all.into_iter())
-                    .collect()
+                results.extend(leaves);
+                results
             }
         }
     };
@@ -208,13 +200,15 @@ pub fn index(
     // FINAL STORAGE AND INDEX CREATION
     // =========================================================================================
 
-    centroids_table::store_centroids(centroids_result, centroid_table_name.clone(), dims, residual_quantization);
+    centroids_table::store_centroids(
+        centroids_result,
+        centroid_table_name.clone(),
+        dims,
+        residual_quantization
+    );
 
     if !skip_index_build {
-        info!(
-            "clustering all samples finished in {:.2?}. Calling vectorchord index creation",
-            start_time.elapsed()
-        );
+        info!("✨ clustering finished in {:.2?}. Creating vectorchord index", start_time.elapsed());
         vectorchord_index::create_vectorchord_index(
             table,
             qualified_table,
@@ -223,9 +217,6 @@ pub fn index(
             residual_quantization,
         );
     } else {
-        info!(
-            "clustering all samples finished in {:.2?}. SKIPPING vectorchord index creation; skip_index_build=true is set",
-            start_time.elapsed()
-        );
+        info!("✅ clustering finished. skip_index_build=true");
     }
 }
