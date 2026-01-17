@@ -64,7 +64,7 @@ pub fn store_centroids(
             let pg_parent = Some(parent + 1);
 
             client
-                .update(query, None, &[i.into(), pg_parent.into(), vec.into()])
+                .update(&query, None, &[i.into(), pg_parent.into(), vec.into()])
                 .expect("error inserting centroid");
             i += 1;
         }
