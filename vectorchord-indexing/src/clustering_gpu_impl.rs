@@ -382,7 +382,7 @@ pub fn run_clustering_hierarchical(
     let safe_limit = std::cmp::min(num_vectors, labels.len());
 
     if safe_limit < num_vectors {
-        warn!("GPU returned labels for only {}/{} vectors. Phase 2 partitioning will be incomplete.", safe_limit, num_vectors);
+        log::warn!("GPU returned labels for only {}/{} vectors...", safe_limit, num_vectors);
     }
 
     for i in 0..safe_limit {
