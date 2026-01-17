@@ -22,33 +22,44 @@ pub fn store_centroids(
         return;
     }
 
-    // Note: benchmarks show no improvement from using the "mean root" so we just use 0 here
-    //let root = mean_filtered(&centroids, -1).expect("no centroids with parent -1 found");
-    let root = vec![0.0; vector_dimensions as usize];
-    Spi::run_with_args(
-        &format!("INSERT INTO {table_name} (id, parent, vector) VALUES (0, NULL, $1)"),
-        &[root.into()],
-    )
-    .expect("unable to insert root centroid");
+    // --- NEW LOGIC: Determine if we are Hierarchical ---
+    // If any centroid has a parent that is NOT -1, we are in a multi-level hierarchy.
+    let is_hierarchical = centroids.iter().any(|(_, p)| *p != -1);
 
-    let query = &format!(
-        // note: parent ID is an option so it will be NULL for the top level of the voronoi tree
-        // i.e. in a single-level case every centroid will have NULL parent, and in multi/2-level the top level (non leaves) will have NULL
-        "INSERT INTO {table_name} (id, parent, vector)
-            VALUES ($1, $2, $3)",
-    );
+    let mut start_index: i32 = 0;
 
-    // TODO: can we do a more efficient bulk insert? The only other way I found is to
-    // use string formatting and prepare a long statement.
+    if !is_hierarchical {
+        // FLAT INDEX PATH: Keep original logic of adding a "Super Root" at ID 0
+        let root = vec![0.0; vector_dimensions as usize];
+        Spi::run_with_args(
+            &format!("INSERT INTO {table_name} (id, parent, vector) VALUES (0, NULL, $1)"),
+            &[root.into()],
+        )
+        .expect("unable to insert root centroid");
+        start_index = 1; // Start user centroids at ID 1
+    } else {
+        // HIERARCHICAL PATH: Do NOT insert a root at ID 0.
+        // Let the hierarchical function's own roots be the Level 0 nodes.
+        start_index = 0; // Start user centroids at ID 0
+    }
+
+    let query = &format!("INSERT INTO {table_name} (id, parent, vector) VALUES ($1, $2, $3)");
+
     Spi::connect_mut(|client| {
-        // note: we explicitly control the IDs since they must match the parent IDs in multi-level case
-        let mut i: i32 = 1;
+        let mut i: i32 = start_index;
         for (vec, parent) in centroids {
-            // parent + 1 serves two purposes:
-            // the cluster labels start at 0 but our table has the root at ID 0 and the actual parent clusters start at 1; so need to add 1
-            // centroids without parent get assigned parent ID -1 in our upstream code. So by adding one we get 0; the root
+            let pg_parent: Option<i32>;
+
+            if is_hierarchical {
+                // In hierarchical mode, parent -1 means NULL (Top level)
+                pg_parent = if parent == -1 { None } else { Some(parent) };
+            } else {
+                // In flat mode, parent -1 points to our Super Root (ID 0)
+                pg_parent = Some(parent + 1);
+            }
+
             client
-                .update(query, None, &[i.into(), (parent + 1).into(), vec.into()])
+                .update(query, None, &[i.into(), pg_parent.into(), vec.into()])
                 .expect("error inserting centroid");
             i += 1;
         }
@@ -56,6 +67,7 @@ pub fn store_centroids(
 
     debug1!("\tStoring centroids took: {:.2?}", start_time.elapsed());
 }
+
 
 /// calcluates the mean vector of all vectors with the given target ID
 fn _mean_filtered(data: &[(Vec<f32>, i32)], target_id: i32) -> Option<Vec<f32>> {

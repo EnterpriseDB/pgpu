@@ -341,90 +341,93 @@ pub fn run_clustering_hierarchical(
     kmeans_nredo: u32,
     distance_operator: &str,
     spherical_centroids: bool,
-) -> Vec<f32> {
-    // Using println! for stability and to avoid log-crate resolution issues
-    println!("Starting Hierarchical Clustering (Top-Down) on GPU");
-    let start_time = std::time::Instant::now();
+) -> Vec<(Vec<f32>, i32)> {
+    let global_start = std::time::Instant::now();
+    println!("🚀 Starting Hierarchical Clustering (Top-Down) on GPU");
 
-    let root_k = lists[0]; // 400
-    let total_leaf_k = lists[1]; // 160000
+    let root_k = lists[0];
+    let total_leaf_k = lists[1];
     let leaf_k_per_root = total_leaf_k / root_k;
 
     // --- PHASE 1: ROOT TRAINING ---
-    let (root_centroids, _) = run_clustering_batch(
-        vectors.clone(),
-        vector_dims,
-        root_k,
-        kmeans_iterations,
-        kmeans_nredo,
-        distance_operator,
-        spherical_centroids,
+    let p1_start = std::time::Instant::now();
+    println!("[Phase 1] Training {} root centroids...", root_k);
+    let (root_centroids_raw, _) = run_clustering_batch(
+        vectors.clone(), vector_dims, root_k,
+        kmeans_iterations, kmeans_nredo, distance_operator, spherical_centroids,
     );
+    println!("✅ [Phase 1] Completed in {:.2?}", p1_start.elapsed());
 
     // --- PHASE 2: PARTITIONING ---
-    println!("Phase 2: Partitioning data into {} buckets...", root_k);
+    let p2_start = std::time::Instant::now();
+    println!("[Phase 2] Partitioning data into {} buckets (Predict Mode)...", root_k);
 
-    // We get labels via batch-0-iteration trick.
     let (_, labels) = run_clustering_batch(
-        vectors.clone(),
-        vector_dims,
-        root_k,
-        0,
-        1,
-        distance_operator,
-        spherical_centroids,
+        vectors.clone(), vector_dims, root_k,
+        0, 1, distance_operator, spherical_centroids,
     );
 
     let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); root_k as usize];
     let num_vectors = vectors.len() / vector_dims as usize;
-
-    // Safety check: ensure we don't exceed the labels the GPU actually returned
     let safe_limit = std::cmp::min(num_vectors, labels.len());
 
     for i in 0..safe_limit {
         let label = labels[i] as usize;
-        // Strict index check to prevent 'index out of bounds: len is 400 but index is 400'
         if label < root_k as usize {
             let start = i * vector_dims as usize;
-            let end = start + vector_dims as usize;
-            buckets[label].extend_from_slice(&vectors[start..end]);
+            buckets[label].extend_from_slice(&vectors[start..start + vector_dims as usize]);
         }
     }
+    println!("✅ [Phase 2] Data partitioned in {:.2?}", p2_start.elapsed());
 
     // --- PHASE 3: LEAF TRAINING ---
-    println!("Phase 3: Training leaf nodes per bucket...");
-    let mut final_centroids: Vec<f32> = Vec::with_capacity((total_leaf_k * vector_dims) as usize);
+    let p3_start = std::time::Instant::now();
+    println!("[Phase 3] Training {} leaf nodes per bucket ({} total buckets)...", leaf_k_per_root, root_k);
 
+    let mut results: Vec<(Vec<f32>, i32)> = Vec::with_capacity((root_k + total_leaf_k) as usize);
+
+    // 1. Store Roots (Parent -1)
     for i in 0..root_k as usize {
-        let bucket_data = &buckets[i];
-
-        // Ensure we always push EXACTLY leaf_k_per_root centroids per root
-        if bucket_data.len() < (leaf_k_per_root * vector_dims) as usize {
-             final_centroids.extend(vec![0.0; (leaf_k_per_root * vector_dims) as usize]);
-             continue;
-        }
-
-        let (mut leaf_centroids, _) = run_clustering_batch(
-            bucket_data.clone(),
-            vector_dims,
-            leaf_k_per_root,
-            kmeans_iterations,
-            kmeans_nredo,
-            distance_operator,
-            spherical_centroids,
-        );
-
-        // Pad if specific batch training returned fewer than requested (rare but possible)
-        if leaf_centroids.len() < (leaf_k_per_root * vector_dims) as usize {
-            leaf_centroids.resize((leaf_k_per_root * vector_dims) as usize, 0.0);
-        }
-
-        final_centroids.append(&mut leaf_centroids);
+        let start = i * vector_dims as usize;
+        results.push((root_centroids_raw[start..start + vector_dims as usize].to_vec(), -1));
     }
 
-    // FINAL GUARD: Guarantee the total size is exactly 160k * dims
-    final_centroids.resize((total_leaf_k * vector_dims) as usize, 0.0);
+    // 2. Train and Store Leaves
+    let mut empty_buckets = 0;
+    for root_id in 0..root_k as usize {
+        let bucket_data = &buckets[root_id];
+        let bucket_start = std::time::Instant::now();
 
-    println!("Hierarchical Clustering finished in {:.2?}", start_time.elapsed());
-    final_centroids
+        if bucket_data.len() < (leaf_k_per_root * vector_dims) as usize {
+            empty_buckets += 1;
+            for _ in 0..leaf_k_per_root {
+                results.push((vec![0.0; vector_dims as usize], root_id as i32));
+            }
+        } else {
+            let (leaf_centroids, _) = run_clustering_batch(
+                bucket_data.clone(), vector_dims, leaf_k_per_root,
+                kmeans_iterations, kmeans_nredo, distance_operator, spherical_centroids,
+            );
+
+            for j in 0..leaf_k_per_root as usize {
+                let start = j * vector_dims as usize;
+                results.push((leaf_centroids[start..start + vector_dims as usize].to_vec(), root_id as i32));
+            }
+        }
+
+        // Progress logging every 20 buckets
+        if (root_id + 1) % 20 == 0 || (root_id + 1) == root_k as usize {
+            let elapsed = p3_start.elapsed();
+            let est_total = elapsed.as_secs_f64() / (root_id + 1) as f64 * root_k as f64;
+            println!(
+                "   -> Progress: {}/{} buckets. Elapsed: {:.1?}. Est. remaining: {:.1?}",
+                root_id + 1, root_k, elapsed, std::time::Duration::from_secs_f64(est_total - elapsed.as_secs_f64())
+            );
+        }
+    }
+
+    println!("✅ [Phase 3] Leaf training finished in {:.2?} ({} buckets were empty/padded)", p3_start.elapsed(), empty_buckets);
+    println!("✨ Total Hierarchical Clustering Time: {:.2?}", global_start.elapsed());
+
+    results
 }
