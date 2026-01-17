@@ -6,7 +6,7 @@ use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
 use crate::{centroids_table, util};
 use pgrx::spi::quote_qualified_identifier;
-use pgrx::{info, warning, debug1};
+use pgrx::{info, warning};
 use std::time::Instant;
 
 #[allow(clippy::too_many_arguments)]
@@ -22,7 +22,7 @@ pub fn index(
     skip_index_build: bool,
     spherical_centroids: bool,
     residual_quantization: bool,
-    centroid_table_name: String,
+    _centroid_table_name: String,
 ) {
     let (num_clusters_top_option, num_clusters_leaf) = match lists.len() {
         1 => (None, lists[0]),
@@ -40,13 +40,14 @@ pub fn index(
     let qualified_table = quote_qualified_identifier(schema.clone(), table.clone());
     info!("🚀 running GPU accelerated index build for {qualified_table}.{column_name}");
 
+    let centroid_table_name = quote_qualified_identifier(schema, format!("{table}_centroids"));
+    assert!(centroid_table_name.len() <= 63, "centroid table name too long");
+
     if sampling_factor < 40 {
         warning!("sampling factor {sampling_factor} is very low; consider increasing to at least 40 to achieve useful clustering results");
     }
 
     util::assert_valid_distance_operator(&distance_operator);
-    let centroid_table_name = quote_qualified_identifier(schema, format!("{table}_centroids"));
-    assert!(centroid_table_name.len() <= 63, "generated centroid table name \"{centroid_table_name}\" is too long to use as a postgres identifier. Use a source table name that is shorter than 53 characters");
 
     let start_time = Instant::now();
     let num_samples = (num_clusters_leaf as u64).saturating_mul(sampling_factor as u64);

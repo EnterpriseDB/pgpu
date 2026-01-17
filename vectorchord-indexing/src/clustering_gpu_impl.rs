@@ -410,6 +410,7 @@ pub fn run_clustering_hierarchical(
     let p3_start = Instant::now();
     debug1!("[Phase 3] Training {} leaf nodes per bucket...", leaf_k_per_root);
     let mut results: Vec<(Vec<f32>, i32)> = Vec::with_capacity((root_k + total_leaf_k) as usize);
+    let mut empty_buckets = 0;
 
     // Add Roots (Level 1: Still absolute from Super Root)
     for i in 0..root_k as usize {
