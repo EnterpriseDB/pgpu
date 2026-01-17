@@ -53,7 +53,7 @@ pub fn store_centroids(
         &[root_vec.into()],
     ).expect("unable to insert root centroid");
 
-    let query = "INSERT INTO {table_name} (id, parent, vector) VALUES ($1, $2, $3)";
+    let query = format!("INSERT INTO {table_name} (id, parent, vector) VALUES ($1, $2, $3)");
 
     Spi::connect_mut(|client| {
         let mut i: i32 = 1;

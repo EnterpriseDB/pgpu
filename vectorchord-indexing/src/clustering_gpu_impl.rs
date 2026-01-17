@@ -349,7 +349,7 @@ pub fn run_clustering_hierarchical(
     let total_leaf_k = lists[1];
     let leaf_k_per_root = total_leaf_k / root_k;
 
-    // --- PHASE 1: ROOT TRAINING ---
+    // Phase 1: Roots
     let p1_start = std::time::Instant::now();
     println!("[Phase 1] Training {} root centroids...", root_k);
     let (root_centroids_raw, _) = run_clustering_batch(
@@ -358,19 +358,15 @@ pub fn run_clustering_hierarchical(
     );
     println!("✅ [Phase 1] Completed in {:.2?}", p1_start.elapsed());
 
-    // --- PHASE 2: PARTITIONING ---
+    // Phase 2: Partitioning
     let p2_start = std::time::Instant::now();
-    println!("[Phase 2] Partitioning data into {} buckets (Predict Mode)...", root_k);
-
+    println!("[Phase 2] Partitioning data into {} buckets...", root_k);
     let (_, labels) = run_clustering_batch(
-        vectors.clone(), vector_dims, root_k,
-        0, 1, distance_operator, spherical_centroids,
+        vectors.clone(), vector_dims, root_k, 0, 1, distance_operator, spherical_centroids,
     );
-
     let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); root_k as usize];
     let num_vectors = vectors.len() / vector_dims as usize;
     let safe_limit = std::cmp::min(num_vectors, labels.len());
-
     for i in 0..safe_limit {
         let label = labels[i] as usize;
         if label < root_k as usize {
@@ -380,26 +376,20 @@ pub fn run_clustering_hierarchical(
     }
     println!("✅ [Phase 2] Data partitioned in {:.2?}", p2_start.elapsed());
 
-    // --- PHASE 3: LEAF TRAINING ---
+    // Phase 3: Leaf Training
     let p3_start = std::time::Instant::now();
-    println!("[Phase 3] Training {} leaf nodes per bucket ({} total buckets)...", leaf_k_per_root, root_k);
-
     let mut results: Vec<(Vec<f32>, i32)> = Vec::with_capacity((root_k + total_leaf_k) as usize);
 
-    // 1. Store Roots (Parent -1)
+    // Add Roots (-1)
     for i in 0..root_k as usize {
         let start = i * vector_dims as usize;
         results.push((root_centroids_raw[start..start + vector_dims as usize].to_vec(), -1));
     }
 
-    // 2. Train and Store Leaves
-    let mut empty_buckets = 0;
+    // Add Leaves
     for root_id in 0..root_k as usize {
         let bucket_data = &buckets[root_id];
-        let bucket_start = std::time::Instant::now();
-
         if bucket_data.len() < (leaf_k_per_root * vector_dims) as usize {
-            empty_buckets += 1;
             for _ in 0..leaf_k_per_root {
                 results.push((vec![0.0; vector_dims as usize], root_id as i32));
             }
@@ -408,26 +398,15 @@ pub fn run_clustering_hierarchical(
                 bucket_data.clone(), vector_dims, leaf_k_per_root,
                 kmeans_iterations, kmeans_nredo, distance_operator, spherical_centroids,
             );
-
             for j in 0..leaf_k_per_root as usize {
                 let start = j * vector_dims as usize;
                 results.push((leaf_centroids[start..start + vector_dims as usize].to_vec(), root_id as i32));
             }
         }
-
-        // Progress logging every 20 buckets
         if (root_id + 1) % 20 == 0 || (root_id + 1) == root_k as usize {
-            let elapsed = p3_start.elapsed();
-            let est_total = elapsed.as_secs_f64() / (root_id + 1) as f64 * root_k as f64;
-            println!(
-                "   -> Progress: {}/{} buckets. Elapsed: {:.1?}. Est. remaining: {:.1?}",
-                root_id + 1, root_k, elapsed, std::time::Duration::from_secs_f64(est_total - elapsed.as_secs_f64())
-            );
+            println!("   -> Progress: {}/{} buckets. P3 Elapsed: {:.1?}", root_id + 1, root_k, p3_start.elapsed());
         }
     }
-
-    println!("✅ [Phase 3] Leaf training finished in {:.2?} ({} buckets were empty/padded)", p3_start.elapsed(), empty_buckets);
-    println!("✨ Total Hierarchical Clustering Time: {:.2?}", global_start.elapsed());
-
+    println!("✨ Total Hierarchical Time: {:.2?}", global_start.elapsed());
     results
 }
