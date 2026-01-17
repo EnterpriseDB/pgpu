@@ -421,6 +421,7 @@ pub fn run_clustering_hierarchical(
     for root_id in 0..root_k as usize {
         let bucket_data = &buckets[root_id];
         if bucket_data.is_empty() {
+            empty_buckets += 1;
             for _ in 0..leaf_k_per_root { results.push((vec![0.0; vector_dims as usize], root_id as i32)); }
         } else {
             // Because bucket_data contains residuals (if RQ=true), these results will be residuals!

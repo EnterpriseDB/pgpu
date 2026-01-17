@@ -22,7 +22,6 @@ pub fn index(
     skip_index_build: bool,
     spherical_centroids: bool,
     residual_quantization: bool,
-    _centroid_table_name: String,
 ) {
     let (num_clusters_top_option, num_clusters_leaf) = match lists.len() {
         1 => (None, lists[0]),

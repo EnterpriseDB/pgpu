@@ -1,4 +1,4 @@
-use pgrx::{debug1, info, warning, Spi};
+use pgrx::{debug1, info, Spi};
 use std::time::Instant;
 
 pub fn store_centroids(
