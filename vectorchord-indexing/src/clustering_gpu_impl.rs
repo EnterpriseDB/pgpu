@@ -54,7 +54,7 @@ pub fn run_clustering_batch(
         .set_n_clusters(num_clusters as i32)
         .set_max_iter(kmeans_iterations as i32)
         .set_n_init(kmeans_nredo as i32)
-        .set_metric(distance_operator_cuvs)
+        .set_metric(DistanceType::L2Expanded) // Hardcode to L2Expanded for training
         .set_hierarchical(use_internal_hierarchy);
 
     // Only set internal hierarchical iters if flag is true
