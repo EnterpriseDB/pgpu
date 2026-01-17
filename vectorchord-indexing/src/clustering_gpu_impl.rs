@@ -342,8 +342,9 @@ pub fn run_clustering_hierarchical(
     distance_operator: &str,
     spherical_centroids: bool,
 ) -> Vec<f32> {
-    info!("Starting Hierarchical Clustering (Top-Down) on GPU");
-    let start_time = Instant::now();
+    // Using println! for stability and to avoid log-crate resolution issues
+    println!("Starting Hierarchical Clustering (Top-Down) on GPU");
+    let start_time = std::time::Instant::now();
 
     let root_k = lists[0]; // 400
     let total_leaf_k = lists[1]; // 160000
@@ -361,15 +362,14 @@ pub fn run_clustering_hierarchical(
     );
 
     // --- PHASE 2: PARTITIONING ---
-    info!("Phase 2: Partitioning data into {} buckets...", root_k);
+    println!("Phase 2: Partitioning data into {} buckets...", root_k);
 
-    // We get labels from the batch function.
-    // WARNING: If this returns fewer labels than vectors, we handle it below.
+    // We get labels via batch-0-iteration trick.
     let (_, labels) = run_clustering_batch(
         vectors.clone(),
         vector_dims,
         root_k,
-        0, // Predict-only mode (0 iterations)
+        0,
         1,
         distance_operator,
         spherical_centroids,
@@ -378,16 +378,12 @@ pub fn run_clustering_hierarchical(
     let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); root_k as usize];
     let num_vectors = vectors.len() / vector_dims as usize;
 
-    // FIX: Only loop up to the number of labels we actually received to avoid "index out of bounds"
+    // Safety check: ensure we don't exceed the labels the GPU actually returned
     let safe_limit = std::cmp::min(num_vectors, labels.len());
-
-    if safe_limit < num_vectors {
-        log::warn!("GPU returned labels for only {}/{} vectors...", safe_limit, num_vectors);
-    }
 
     for i in 0..safe_limit {
         let label = labels[i] as usize;
-        // Double check bounds for the bucket index
+        // Strict index check to prevent 'index out of bounds: len is 400 but index is 400'
         if label < root_k as usize {
             let start = i * vector_dims as usize;
             let end = start + vector_dims as usize;
@@ -396,16 +392,14 @@ pub fn run_clustering_hierarchical(
     }
 
     // --- PHASE 3: LEAF TRAINING ---
-    info!("Phase 3: Training leaf nodes per bucket...");
+    println!("Phase 3: Training leaf nodes per bucket...");
     let mut final_centroids: Vec<f32> = Vec::with_capacity((total_leaf_k * vector_dims) as usize);
 
     for i in 0..root_k as usize {
         let bucket_data = &buckets[i];
 
-        // Ensure we always add exactly leaf_k_per_root centroids per bucket
-        // Even if the bucket is empty, we must pad to maintain 160k total count
+        // Ensure we always push EXACTLY leaf_k_per_root centroids per root
         if bucket_data.len() < (leaf_k_per_root * vector_dims) as usize {
-             // Padding with zeros for consistency
              final_centroids.extend(vec![0.0; (leaf_k_per_root * vector_dims) as usize]);
              continue;
         }
@@ -420,7 +414,7 @@ pub fn run_clustering_hierarchical(
             spherical_centroids,
         );
 
-        // If for some reason leaf training returns wrong count, pad it
+        // Pad if specific batch training returned fewer than requested (rare but possible)
         if leaf_centroids.len() < (leaf_k_per_root * vector_dims) as usize {
             leaf_centroids.resize((leaf_k_per_root * vector_dims) as usize, 0.0);
         }
@@ -428,9 +422,9 @@ pub fn run_clustering_hierarchical(
         final_centroids.append(&mut leaf_centroids);
     }
 
-    // FINAL GUARD: VectorChord will crash if the total size isn't exactly 160k * dims
+    // FINAL GUARD: Guarantee the total size is exactly 160k * dims
     final_centroids.resize((total_leaf_k * vector_dims) as usize, 0.0);
 
-    info!("Hierarchical Clustering finished in {:.2?}", start_time.elapsed());
+    println!("Hierarchical Clustering finished in {:.2?}", start_time.elapsed());
     final_centroids
-}
+}}
