@@ -157,12 +157,15 @@ pub fn run_clustering_consolidate(
     // Note: we need to use non-hierarchical kmeans here since only that supports
     // passing in weights; which are critical for accuracy
     // and non-hiearchical only works with L2Expanded distance
+    let distance_operator_cuvs = crate::util::distance_type_from_str(&distance_operator)
+        .unwrap_or(DistanceType::L2Expanded); // default to L2Expanded if unknow
+
     let kmeans_params = kmeans::Params::new()
         .expect("kmeans params create failed")
         .set_n_clusters(num_clusters as i32)
         .set_max_iter(kmeans_iterations as i32)
         .set_n_init(kmeans_nredo as i32)
-        .set_metric(DistanceType::L2Expanded)
+        .set_metric(distance_operator_cuvs) // Use the dynamic metric
         .set_hierarchical(false);
 
     debug1!(
@@ -251,12 +254,15 @@ pub fn run_clustering_multilevel(
     // Note: we need to use non-hierarchical kmeans here since only that supports
     // passing in weights; which are critical for accuracy
     // and non-hiearchical only works with L2Expanded distance
+    let distance_operator_cuvs = crate::util::distance_type_from_str(&distance_operator)
+        .unwrap_or(DistanceType::L2Expanded);
+
     let kmeans_params = kmeans::Params::new()
         .expect("kmeans params create failed")
         .set_n_clusters(num_clusters as i32)
         .set_max_iter(kmeans_iterations as i32)
         .set_n_init(kmeans_nredo as i32)
-        .set_metric(DistanceType::L2Expanded)
+        .set_metric(distance_operator_cuvs) // Use the dynamic metric
         .set_hierarchical(false);
 
     debug1!(
@@ -343,30 +349,33 @@ pub fn run_clustering_hierarchical(
     spherical_centroids: bool,
 ) -> Vec<(Vec<f32>, i32)> {
     let global_start = std::time::Instant::now();
-    println!("🚀 Starting Hierarchical Clustering (Top-Down) on GPU");
+    debug1!("🚀 Starting Hierarchical Clustering (Top-Down) on GPU");
 
     let root_k = lists[0];
     let total_leaf_k = lists[1];
     let leaf_k_per_root = total_leaf_k / root_k;
 
-    // Phase 1: Roots
+    // --- PHASE 1: ROOT TRAINING ---
     let p1_start = std::time::Instant::now();
-    println!("[Phase 1] Training {} root centroids...", root_k);
+    debug1!("[Phase 1] Training {} root centroids...", root_k);
     let (root_centroids_raw, _) = run_clustering_batch(
         vectors.clone(), vector_dims, root_k,
         kmeans_iterations, kmeans_nredo, distance_operator, spherical_centroids,
     );
-    println!("✅ [Phase 1] Completed in {:.2?}", p1_start.elapsed());
+    let p1_elapsed = p1_start.elapsed();
+    debug1!("✅ [Phase 1] Completed in {:.2?}", p1_elapsed);
 
-    // Phase 2: Partitioning
+    // --- PHASE 2: PARTITIONING ---
     let p2_start = std::time::Instant::now();
-    println!("[Phase 2] Partitioning data into {} buckets...", root_k);
+    debug1!("[Phase 2] Partitioning data into {} buckets...", root_k);
     let (_, labels) = run_clustering_batch(
         vectors.clone(), vector_dims, root_k, 0, 1, distance_operator, spherical_centroids,
     );
+
     let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); root_k as usize];
     let num_vectors = vectors.len() / vector_dims as usize;
     let safe_limit = std::cmp::min(num_vectors, labels.len());
+
     for i in 0..safe_limit {
         let label = labels[i] as usize;
         if label < root_k as usize {
@@ -374,39 +383,70 @@ pub fn run_clustering_hierarchical(
             buckets[label].extend_from_slice(&vectors[start..start + vector_dims as usize]);
         }
     }
-    println!("✅ [Phase 2] Data partitioned in {:.2?}", p2_start.elapsed());
+    let p2_elapsed = p2_start.elapsed();
+    debug1!("✅ [Phase 2] Data partitioned in {:.2?}", p2_elapsed);
 
-    // Phase 3: Leaf Training
+    // --- PHASE 3: LEAF TRAINING ---
     let p3_start = std::time::Instant::now();
+    debug1!("[Phase 3] Training {} leaf nodes per bucket...", leaf_k_per_root);
+
     let mut results: Vec<(Vec<f32>, i32)> = Vec::with_capacity((root_k + total_leaf_k) as usize);
 
-    // Add Roots (-1)
     for i in 0..root_k as usize {
         let start = i * vector_dims as usize;
         results.push((root_centroids_raw[start..start + vector_dims as usize].to_vec(), -1));
     }
 
-    // Add Leaves
+    let mut empty_buckets = 0;
     for root_id in 0..root_k as usize {
         let bucket_data = &buckets[root_id];
         if bucket_data.len() < (leaf_k_per_root * vector_dims) as usize {
+            empty_buckets += 1;
             for _ in 0..leaf_k_per_root {
                 results.push((vec![0.0; vector_dims as usize], root_id as i32));
             }
         } else {
-            let (leaf_centroids, _) = run_clustering_batch(
+            let (mut leaf_centroids, _) = run_clustering_batch(
                 bucket_data.clone(), vector_dims, leaf_k_per_root,
                 kmeans_iterations, kmeans_nredo, distance_operator, spherical_centroids,
             );
+
+            // --- CRITICAL FIX FOR RECALL: CALCULATE RESIDUALS ---
+            // For Residual Quantization, the leaf must be (Absolute_Leaf - Parent_Root)
+            let root_start = root_id * vector_dims as usize;
+            let root_vec = &root_centroids_raw[root_start..root_start + vector_dims as usize];
+
             for j in 0..leaf_k_per_root as usize {
-                let start = j * vector_dims as usize;
-                results.push((leaf_centroids[start..start + vector_dims as usize].to_vec(), root_id as i32));
+                let leaf_start = j * vector_dims as usize;
+                let leaf_vec = &mut leaf_centroids[leaf_start..leaf_start + vector_dims as usize];
+
+                // Subtract root from leaf to create the residual
+                for k in 0..vector_dims as usize {
+                    leaf_vec[k] -= root_vec[k];
+                }
+
+                results.push((leaf_vec.to_vec(), root_id as i32));
             }
         }
         if (root_id + 1) % 20 == 0 || (root_id + 1) == root_k as usize {
-            println!("   -> Progress: {}/{} buckets. P3 Elapsed: {:.1?}", root_id + 1, root_k, p3_start.elapsed());
+            debug1!("   -> Progress: {}/{} buckets. P3 Elapsed: {:.1?}", root_id + 1, root_k, p3_start.elapsed());
         }
     }
-    println!("✨ Total Hierarchical Time: {:.2?}", global_start.elapsed());
+    let p3_elapsed = p3_start.elapsed();
+
+    // --- FINAL SUMMARY BLOCK ---
+    debug1!("==========================================================");
+    debug1!("📊 HIERARCHICAL CLUSTERING COMPLETE");
+    debug1!("----------------------------------------------------------");
+    debug1!("Phase 1 (Root Training):    {:>12.2?}", p1_elapsed);
+    debug1!("Phase 2 (Partitioning):     {:>12.2?}", p2_elapsed);
+    debug1!("Phase 3 (Leaf Training):    {:>12.2?}", p3_elapsed);
+    debug1!("----------------------------------------------------------");
+    debug1!("Total Padded Buckets:       {:>12}", empty_buckets);
+    debug1!("Total Points Clustered:     {:>12}", num_vectors);
+    debug1!("Total GPU Clusters:         {:>12}", results.len());
+    debug1!("OVERALL EXECUTION TIME:     {:>12.2?}", global_start.elapsed());
+    debug1!("==========================================================");
+
     results
 }

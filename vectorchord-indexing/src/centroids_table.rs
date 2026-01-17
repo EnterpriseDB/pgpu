@@ -1,71 +1,54 @@
 use pgrx::{debug1, info, warning, Spi};
 use std::time::Instant;
 
+use pgrx::{debug1, info, warning, Spi};
+use std::time::Instant;
+
 pub fn store_centroids(
     centroids: Vec<(Vec<f32>, i32)>,
     table_name: String,
     vector_dimensions: u32,
+    residual_quantization: bool, // Add this parameter to the function signature
 ) {
     info!("Storing {} centroids in {table_name}", centroids.len());
     let start_time = Instant::now();
 
-    pgrx::notice!("Deleting old centroids table (if it exists from a previous run)");
-    Spi::run(&format!("DROP TABLE IF EXISTS {table_name}"))
-        .expect("error deleting old centroids table");
+    // 1. Prepare the table
+    Spi::run(&format!("DROP TABLE IF EXISTS {table_name}")).ok();
     Spi::run(&format!(
         "CREATE TABLE {table_name} (id INT, parent INT, vector vector({vector_dimensions}))"
-    ))
-    .expect("error creating centroids table");
+    )).expect("Failed to create centroids table");
 
-    if centroids.is_empty() {
-        warning!("\tNo centroids to store, skipping");
-        return;
-    }
-
-    // --- NEW: Detect Hierarchy and Calculate Single Root ---
     let is_hierarchical = centroids.iter().any(|(_, p)| *p != -1);
 
-    let root_vec = if is_hierarchical {
-        // For 2-layer hierarchical: The Super Root (ID 0) is the average of all Roots (-1)
-        let mut sum_vec = vec![0.0; vector_dimensions as usize];
-        let mut count = 0.0;
-        for (vec, parent) in &centroids {
-            if *parent == -1 {
-                for (i, val) in vec.iter().enumerate() {
-                    sum_vec[i] += val;
-                }
-                count += 1.0;
-            }
-        }
-        if count > 0.0 {
-            sum_vec.iter().map(|v| v / count).collect()
-        } else {
-            vec![0.0; vector_dimensions as usize]
-        }
-    } else {
-        // For Flat: Just use a zero vector as the Super Root
-        vec![0.0; vector_dimensions as usize]
-    };
-
-    // Insert the ONLY NULL parent allowed
+    // 2. Insert Super Root (ID 0)
+    // For IP/RQ, we MUST use a zero vector for ID 0.
+    // This ensures Level 1 (Roots) are treated as absolute offsets.
+    let root_vec = vec![0.0; vector_dimensions as usize];
     Spi::run_with_args(
         &format!("INSERT INTO {table_name} (id, parent, vector) VALUES (0, NULL, $1)"),
         &[root_vec.into()],
-    ).expect("unable to insert root centroid");
+    ).expect("Unable to insert ID 0 root");
 
+    // 3. Prepare Insert Query (Using owned String to resolve table name)
     let query = format!("INSERT INTO {table_name} (id, parent, vector) VALUES ($1, $2, $3)");
 
     Spi::connect_mut(|client| {
         let mut i: i32 = 1;
+
+        // Note: For RQ math, we need the absolute root vectors to calculate residuals
+        // only if they weren't already residuals in the input
         for (vec, parent) in centroids {
-            // parent + 1 mapping:
-            // parent -1 (Roots) -> 0 (points to Super Root ID 0)
-            // parent 0-399 (Leaves) -> 1-400 (points to their specific Root ID)
+            // Parent mapping:
+            // parent -1 (Root) -> points to 0 (Super Root)
+            // parent 0..399 (Leaf) -> points to 1..400 (Root)
             let pg_parent = Some(parent + 1);
 
+            // FIX: Use &query to satisfy pgrx SpiClient::update's Query trait bound
             client
                 .update(&query, None, &[i.into(), pg_parent.into(), vec.into()])
-                .expect("error inserting centroid");
+                .expect("Error inserting centroid");
+
             i += 1;
         }
     });

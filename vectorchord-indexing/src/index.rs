@@ -208,7 +208,7 @@ pub fn index(
     // FINAL STORAGE AND INDEX CREATION
     // =========================================================================================
 
-    centroids_table::store_centroids(centroids_result, centroid_table_name.clone(), dims);
+    centroids_table::store_centroids(centroids_result, centroid_table_name.clone(), dims, residual_quantization);
 
     if !skip_index_build {
         info!(
