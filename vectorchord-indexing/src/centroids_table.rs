@@ -22,41 +22,46 @@ pub fn store_centroids(
         return;
     }
 
-    // --- NEW LOGIC: Determine if we are Hierarchical ---
-    // If any centroid has a parent that is NOT -1, we are in a multi-level hierarchy.
+    // --- NEW: Detect Hierarchy and Calculate Single Root ---
     let is_hierarchical = centroids.iter().any(|(_, p)| *p != -1);
 
-    let mut start_index: i32 = 0;
-
-    if !is_hierarchical {
-        // FLAT INDEX PATH: Keep original logic of adding a "Super Root" at ID 0
-        let root = vec![0.0; vector_dimensions as usize];
-        Spi::run_with_args(
-            &format!("INSERT INTO {table_name} (id, parent, vector) VALUES (0, NULL, $1)"),
-            &[root.into()],
-        )
-        .expect("unable to insert root centroid");
-        start_index = 1; // Start user centroids at ID 1
+    let root_vec = if is_hierarchical {
+        // For 2-layer hierarchical: The Super Root (ID 0) is the average of all Roots (-1)
+        let mut sum_vec = vec![0.0; vector_dimensions as usize];
+        let mut count = 0.0;
+        for (vec, parent) in &centroids {
+            if *parent == -1 {
+                for (i, val) in vec.iter().enumerate() {
+                    sum_vec[i] += val;
+                }
+                count += 1.0;
+            }
+        }
+        if count > 0.0 {
+            sum_vec.iter().map(|v| v / count).collect()
+        } else {
+            vec![0.0; vector_dimensions as usize]
+        }
     } else {
-        // HIERARCHICAL PATH: Do NOT insert a root at ID 0.
-        // Let the hierarchical function's own roots be the Level 0 nodes.
-        start_index = 0; // Start user centroids at ID 0
-    }
+        // For Flat: Just use a zero vector as the Super Root
+        vec![0.0; vector_dimensions as usize]
+    };
 
-    let query = &format!("INSERT INTO {table_name} (id, parent, vector) VALUES ($1, $2, $3)");
+    // Insert the ONLY NULL parent allowed
+    Spi::run_with_args(
+        &format!("INSERT INTO {table_name} (id, parent, vector) VALUES (0, NULL, $1)"),
+        &[root_vec.into()],
+    ).expect("unable to insert root centroid");
+
+    let query = "INSERT INTO {table_name} (id, parent, vector) VALUES ($1, $2, $3)";
 
     Spi::connect_mut(|client| {
-        let mut i: i32 = start_index;
+        let mut i: i32 = 1;
         for (vec, parent) in centroids {
-            let pg_parent: Option<i32>;
-
-            if is_hierarchical {
-                // In hierarchical mode, parent -1 means NULL (Top level)
-                pg_parent = if parent == -1 { None } else { Some(parent) };
-            } else {
-                // In flat mode, parent -1 points to our Super Root (ID 0)
-                pg_parent = Some(parent + 1);
-            }
+            // parent + 1 mapping:
+            // parent -1 (Roots) -> 0 (points to Super Root ID 0)
+            // parent 0-399 (Leaves) -> 1-400 (points to their specific Root ID)
+            let pg_parent = Some(parent + 1);
 
             client
                 .update(query, None, &[i.into(), pg_parent.into(), vec.into()])
