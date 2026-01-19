@@ -39,8 +39,8 @@ impl VectorReadBatcher {
             let mut detected_dims = 0;
             let mut row_count = 0;
 
-            // Fixed: Added Some(&[]) for arguments to match pgrx signature
-            let tuple_table = client.select(&query, None, Some(&[])).expect("Failed to fetch samples");
+            // signature: select(query, limit, args)
+            let tuple_table = client.select(&query, None, &[]).expect("Failed to fetch samples");
 
             let decode_start = Instant::now();
             for row in tuple_table {
