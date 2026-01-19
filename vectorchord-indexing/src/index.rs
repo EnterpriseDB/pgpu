@@ -249,4 +249,3 @@ pub fn index(
         info!("🛑 Skipping index build (skip_index_build=true). Centroids saved.");
     }
 }
-}
