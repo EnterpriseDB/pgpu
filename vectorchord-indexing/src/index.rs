@@ -330,7 +330,7 @@ pub fn index(
     // CREATE INDEX (Common Step)
     // ========================================================================================
     if !skip_index_build {
-        info!("💾 Training complete ({:.2?}). Building VectorChord Index...", start_time.elapsed());
+        info!("💾 Training complete ({:.2?}). Building VectorChord Index...", global_start.elapsed());
         vectorchord_index::create_vectorchord_index(
             table,
             qualified_table,
