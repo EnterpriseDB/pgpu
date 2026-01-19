@@ -12,9 +12,8 @@ pub struct VectorReadBatcher {
     num_samples_per_batch: u64,
     min_samples_per_batch: u64,
     vectors_read: u64,
-    //table_scan: Option<SysScanDesc>,
-    //pg_rel: Option<PgRelation>,
-    //col_num: Option<usize>,
+    cached_vectors: Vec<f32>,
+    dims: u32,
 }
 
 impl VectorReadBatcher {
@@ -27,54 +26,49 @@ impl VectorReadBatcher {
     ) -> Self {
         let start_time = Instant::now();
 
-        // We use Bernoulli sampling to get a random distribution across the whole table.
-        // 2.5% is a safe bet for a 1M sample from 40M rows.
+        // SQL using the fixed 2.5% rate as requested
         let query = format!(
             "SELECT {column_name} FROM {table_name} TABLESAMPLE BERNOULLI (2.5) LIMIT {num_samples}"
-        );
+        ); // Still not fully random as we use LIMIT, but better than SeqScan
 
-        info!("🚀 [PHASE 1] Initializing Random Sampler...");
-        info!("🔍 Executing SQL: {}  ", query);
+        info!("🚀 [PHASE 1] Initializing Sampler (Fixed 2.5% Rate)");
+        info!("⚡ Executing SQL: {}", query);
 
         let (cached_vectors, dims) = Spi::connect(|client| {
             let mut all_vecs = Vec::new();
             let mut detected_dims = 0;
             let mut row_count = 0;
 
-            let tuple_table = client.select(&query, None, None).expect("Failed to fetch samples");
+            // Fixed: Added Some(&[]) for arguments to match pgrx signature
+            let tuple_table = client.select(&query, None, Some(&[])).expect("Failed to fetch samples");
 
             let decode_start = Instant::now();
             for row in tuple_table {
-                let datum = row.get_datum_by_ordinal(1).expect("Column not found");
-                if let Some(raw_ptr) = datum {
-                    let byte_slice = unsafe { pgrx::varlena_to_byte_slice(raw_ptr.cast_mut_ptr()) };
+                // Fixed: get_datum_by_ordinal(1) returns an entry we must extract carefully
+                let entry = row.get_datum_by_ordinal(1).expect("Column not found");
+
+                // Fixed: Extract the internal Datum pointer safely
+                if let Some(raw_datum) = entry.value::<Datum>() {
+                    let byte_slice = unsafe { pgrx::varlena_to_byte_slice(raw_datum.cast_mut_ptr()) };
                     let (vec_vals, v_dims) = vector_type::decode_pgvector_vector(byte_slice);
                     all_vecs.extend(vec_vals);
                     detected_dims = v_dims;
                     row_count += 1;
                 }
 
-                // Log progress every 250k rows so you know it hasn't crashed
                 if row_count % 250_000 == 0 {
-                    debug1!("   ... decoded {}/{} vectors", row_count, num_samples);
+                    info!("   ... decoded {}/{} vectors", row_count, num_samples);
                 }
             }
 
-            info!("✅ Decoding complete. Processed {} rows in {:?}  ", row_count, decode_start.elapsed());
+            info!("✅ Decoding complete. Processed {} rows in {:?}", row_count, decode_start.elapsed());
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((all_vecs, detected_dims))
         }).expect("SPI Error");
-
-        let total_init_time = start_time.elapsed();
-        info!(
-            "📊 Sampler Ready: Loaded {} vectors ({} dims) in {:.2?}",
-            cached_vectors.len() / (dims as usize),
-            dims,
-            total_init_time
-        );
 
         VectorReadBatcher {
             table_name,
             column_name,
+            num_tuples_in_table: None,
             num_samples,
             num_samples_per_batch,
             min_samples_per_batch,
@@ -96,9 +90,8 @@ impl VectorReadBatcher {
             samples_to_read = remaining;
         }
 
-        // Detailed logging for the batching process
         debug1!(
-            "📦 Batching: Rows {}-{} of {}  ",
+            "📦 Batching: {}-{} of {}  ",
             self.vectors_read,
             self.vectors_read + samples_to_read as u64,
             self.num_samples
@@ -107,6 +100,11 @@ impl VectorReadBatcher {
         let start_idx = self.vectors_read as usize * self.dims as usize;
         let end_idx = (self.vectors_read as usize + samples_to_read) * self.dims as usize;
 
+        // Ensure we don't overflow if the cache is smaller than num_samples
+        if end_idx > self.cached_vectors.len() {
+            return None;
+        }
+
         let batch = self.cached_vectors[start_idx..end_idx].to_vec();
         self.vectors_read += samples_to_read as u64;
 
@@ -114,12 +112,19 @@ impl VectorReadBatcher {
     }
 
     pub(crate) fn num_tuples(&mut self) -> u64 {
-        Spi::get_one::<i64>(&format!("SELECT COUNT(1) FROM {}", self.table_name))
-            .expect("SQL error")
-            .unwrap_or(0) as u64
+        match self.num_tuples_in_table {
+            Some(count) => count,
+            None => {
+                let count: i64 = Spi::get_one(&format!("SELECT COUNT(1) FROM {}  ", self.table_name))
+                    .expect("SQL error")
+                    .unwrap_or(0);
+                self.num_tuples_in_table = Some(count as u64);
+                count as u64
+            }
+        }
     }
 
     pub(crate) fn end_scan(self) {
-        info!("🏁 Scan session ended. Memory released.");
+        info!("🏁 Training sample session ended.");
     }
 }
