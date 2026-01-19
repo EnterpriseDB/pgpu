@@ -197,3 +197,82 @@ pub fn index(
     );
     }
 }
+// alfer changes
+
+pub fn build_hierarchical_index(
+    mut vectors: Vec<f32>, // Assume 100M vectors loaded in RAM (approx 300GB)
+    vector_dims: u32,
+    num_roots: u32,       // e.g. 400
+    num_leaves: u32,      // e.g. 400 (Total = 160,000)
+) {
+    let total_vectors = vectors.len() / vector_dims as usize;
+    info!("🏗️ STARTING TOP-DOWN HIERARCHICAL BUILD");
+    info!("📊 Dataset: {} vectors, {} dims", total_vectors, vector_dims);
+    info!("🎯 Target: {} roots * {} leaves = {} total clusters", num_roots, num_leaves, num_roots * num_leaves);
+
+    // --- PHASE 1: Train Roots ---
+    // We pass the full vector list, but the function internally samples 1M for speed/stability.
+    let root_centroids = clustering_gpu_impl::train_roots_gpu(
+        &vectors,
+        vector_dims,
+        num_roots,
+        10,   // Iterations
+        "ip"  // Distance operator
+    );
+
+    // --- PHASE 2: Partition ---
+    // Assign every single vector to a root.
+    let assignments = clustering_gpu_impl::assign_to_roots_gpu(
+        &vectors,
+        &root_centroids,
+        vector_dims,
+        num_roots
+    );
+
+    // --- PHASE 3: Train Leaves (Bucket by Bucket) ---
+    info!("🚀 PHASE 3 (Leaves): Processing {} buckets...", num_roots);
+
+    // We need to physically group vectors by their assignment to send them to GPU.
+    // This is CPU intensive but necessary.
+    let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
+
+    // Scatter vectors into buckets
+    // OPTIMIZATION: This loop runs on CPU. For 100M vectors, this takes time.
+    // In production, consider doing this in parallel with rayon.
+    for (idx, &label) in assignments.iter().enumerate() {
+        if label >= 0 && (label as usize) < num_roots as usize {
+            let start = idx * vector_dims as usize;
+            let end = start + vector_dims as usize;
+            buckets[label as usize].extend_from_slice(&vectors[start..end]);
+        }
+    }
+
+    // Now iterate and train leaves
+    let mut final_centroids = Vec::new();
+
+    for (root_idx, bucket_vecs) in buckets.iter().enumerate() {
+        let n_vecs = bucket_vecs.len() / vector_dims as usize;
+
+        if n_vecs == 0 {
+            warning!("⚠️ Root {} is empty! No vectors assigned.", root_idx);
+            continue;
+        }
+
+        // Logging every 10 roots to keep logs clean
+        if root_idx % 10 == 0 {
+            info!("🌿 Processing Root {}/{} | Bucket Size: {} vectors", root_idx, num_roots, n_vecs);
+        }
+
+        let leaf_centroids = clustering_gpu_impl::train_leaves_for_bucket_gpu(
+            bucket_vecs,
+            vector_dims,
+            num_leaves, // Target leaves per root
+            15,         // Iterations (can be lower for leaves)
+        );
+
+        // Store result (you would likely write this to your Postgres table here)
+        final_centroids.extend(leaf_centroids);
+    }
+
+    info!("🏁 HIERARCHICAL INDEX BUILD COMPLETE");
+}
