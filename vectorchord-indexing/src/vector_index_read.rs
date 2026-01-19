@@ -115,7 +115,7 @@ impl VectorReadBatcher {
                     info!("📦 Disk Pages: {} | 📈 Catalog Tuples: {}", pages, tuples);
                 }
             } else {
-                warning!("❌ Table [{}] not found in pg_class. Check schema or quotes.", table_name);
+                debug1!("❌ Table [{}] not found in pg_class. Check schema or quotes.", table_name);
             }
             info!("--- [END DIAGNOSTIC] ---");
             Ok::<(), pgrx::spi::Error>(())
