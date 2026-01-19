@@ -182,7 +182,7 @@ pub fn index(
             let parent_id = i as i32;
 
             if n_vecs == 0 {
-                missing_leaves += (num_leaves / num_roots); // Approx
+                missing_leaves += num_leaves / num_roots; // Approx
                 continue;
             }
 
@@ -223,13 +223,12 @@ pub fn index(
         info!(
             "\n⏱️  [TIMING SUMMARY]\n\
             \t• 📥 Data Loading:     {:.2?}\n\
-            \t• 🌍 Phase 0 (Global): {:.2?}\n\
             \t• 🏗️ Phase 1 (Roots):  {:.2?}\n\
             \t• 🔮 Phase 2 (Part.):  {:.2?}\n\
             \t• 🌿 Phase 3 (Leaves): {:.2?}\n\
             \t• 💾 Storage:          {:.2?}\n\
             \t-----------------------------\n\
-            \t👉 TOTAL TIME:         {:.2?}  ",
+            \t👉 TOTAL TIME:         {:.2?}",
             d_load, d_p1, d_p2, d_p3, d_store, global_start.elapsed()
         );
 
