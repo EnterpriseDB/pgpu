@@ -1,0 +1,42 @@
+FROM ubuntu:24.04 AS builder
+
+ARG PG_VERSION_NUM=17
+ENV PG_VERSION_NUM=${PG_VERSION_NUM}
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install the dependencies
+RUN apt-get update && \
+  apt-get install -y sudo
+
+# Configure environment using a different user from root, required to create the cargo-pgrx environment
+RUN useradd -m -s /bin/bash -G sudo appuser ; \
+  chown -R appuser:appuser /home/appuser ; \
+  echo "appuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/appuser ; \
+  chmod 0440 /etc/sudoers.d/appuser ;
+WORKDIR /home/appuser
+ENV HOME="/home/appuser"
+USER appuser
+
+# Copy the repo files
+COPY --chown=appuser:appuser . .
+
+SHELL [ "bash" , "-c" ]
+
+# Setup the build environment
+RUN scripts/setup_build.sh setup
+
+# Build the extension
+RUN scripts/setup_build.sh build
+
+# Postgres ports
+EXPOSE 28813-28818
+
+# Set cargo to path variable
+ENV PATH="${PATH}:$HOME/.cargo/bin"
+
+ENTRYPOINT ["/bin/bash", "-c", \
+  "cargo pgrx start && \
+  $(cargo pgrx info path pg${PG_VERSION_NUM})/bin/psql -h \"localhost\" -p \"288${PG_VERSION_NUM}\" -U \"$USER\" -d \"postgres\" \
+  -v ON_ERROR_STOP=1 -e -P pager=off \
+  "]

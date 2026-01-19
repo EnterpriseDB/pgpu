@@ -46,13 +46,13 @@ FROM generate_series(1, 10000) AS g(i)
 
 #### Run PGPU
 ```sql
-SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_10k_vecs', 
-                                       column_name => 'embedding', 
-                                       batch_size => 1000, 
-                                       lists => ARRAY[1000], 
-                                       sampling_factor => 10, 
-                                       kmeans_iterations=>10, 
-                                       kmeans_nredo=>1, 
+SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_10k_vecs',
+                                       column_name => 'embedding',
+                                       batch_size => 1000,
+                                       lists => ARRAY[1000],
+                                       sampling_factor => 10,
+                                       kmeans_iterations=>10,
+                                       kmeans_nredo=>1,
                                        distance_operator=>'ip',
                                        skip_index_build=>true,
                                        spherical_centroids=>true
@@ -100,7 +100,7 @@ CREATE FUNCTION "create_vector_index_on_gpu"(
 - `kmeans_nredo`: how many times to rerun the clustering algorithm
   - default: `1`
   - note: this rarely needs to be changed
-- `distance_operator`: what distance operator to use for clustering 
+- `distance_operator`: what distance operator to use for clustering
   - default: `'ip'`
   - valid values: `'ip'`, `'l2'`, `'cos'`
   - note: the index will be built for this specific distance operator. So it will only be used for queries with the same distance operator. Typically, this is determined by the dataset.
@@ -119,3 +119,29 @@ See script [scripts/setup_build.sh](scripts/setup_build.sh)
 
 - PGPU uses NVIDIA cuVS for GPU accelerated k-means clustering https://github.com/rapidsai/cuvs/tree/main/rust
 - `vectorchord` (aka. `vchord`) and `pgvector` (aka. `vector`) PG extensions need to be installed
+
+### Docker
+
+You can also use the Docker environment to have a clean environment for testing your changes. The first step is to ensure that the Docker environment has GPUs enabled in the containers, by doing the following:
+
+```bash
+sudo apt-get install -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+**Note:** this is step is only required if you want to test the container using a real GPU, but this is not required to build the extension.
+
+After you need to build the image by running:
+
+```bash
+./scripts/setup_build.sh docker-build
+```
+
+And finally, start the image:
+
+```bash
+./scripts/setup_build.sh docker-start
+```
+
+**Note:** if you want to disable the GPU usage in your container, please export variable DISABLE_GPU_SUPPORT by executing in your terminal: `export DISABLE_GPU_SUPPORT="1"`.

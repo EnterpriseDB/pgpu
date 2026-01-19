@@ -17,11 +17,9 @@ members = ["vectorchord-indexing"]
 [workspace.dependencies]
 cuvs = { git = "https://github.com/rapidsai/cuvs", tag = "v25.12.00", version = "25.12.0", default-features = false }
 ndarray = "0.15.6"
-pgrx = { git = "https://github.com/EnterpriseDB/pgrx", branch = "develop-v0.16.1-edb", default-features = false }
+pgrx = { git = "https://github.com/pgcentralfoundation/pgrx", tag = "v0.16.1", default-features = false }
 
 [features]
-EPAS = ["pgrx/EPAS"]
-PGE = ["pgrx/PGE"]
 default = ["pg17"]
 pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
 pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
@@ -36,7 +34,7 @@ vectorchord-indexing = { path = "vectorchord-indexing" }
 
 
 [dev-dependencies]
-pgrx-tests = { git = "https://github.com/EnterpriseDB/pgrx", branch = "develop-v0.16.1-edb", default-features = false }
+pgrx-tests = { git = "https://github.com/pgcentralfoundation/pgrx", tag = "v0.16.1", default-features = false }
 
 [profile.dev]
 panic = "unwind"
