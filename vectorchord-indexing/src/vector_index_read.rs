@@ -5,6 +5,9 @@ use pgrx::pg_sys::Datum;
 
 
 pub struct VectorReadBatcher {
+    table_name: String,
+    column_name: String,
+    num_tuples_in_table: Option<u64>,
     num_samples: u64,
     num_samples_per_batch: u64,
     min_samples_per_batch: u64,
@@ -41,18 +44,15 @@ impl VectorReadBatcher {
 
             let decode_start = Instant::now();
             for row in tuple_table {
-                // Fixed: get_datum_by_ordinal(1) returns an entry we must extract carefully
                 let entry = row.get_datum_by_ordinal(1).expect("Column not found");
 
-                // Fixed: Extract the internal Datum pointer safely
+                // Latest Fix: Result<Option<T>, E> requires Ok(Some(val)) matching
                 if let Ok(Some(raw_datum)) = entry.value::<Datum>() {
                     let byte_slice = unsafe { pgrx::varlena_to_byte_slice(raw_datum.cast_mut_ptr()) };
                     let (vec_vals, v_dims) = vector_type::decode_pgvector_vector(byte_slice);
                     all_vecs.extend(vec_vals);
                     detected_dims = v_dims;
-                    row_count += 1;
                 }
-
             }
 
             info!("✅ Decoding complete. Processed {} rows in {:?}", row_count, decode_start.elapsed());
