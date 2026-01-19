@@ -22,33 +22,34 @@ impl VectorReadBatcher {
     ) -> Self {
         let start_time = Instant::now();
 
-        // 1. Get the total row count to determine the "skip" range
-        let total_rows: i64 = Spi::get_one(&format!("SELECT COUNT(1) FROM {}", table_name))
-            .expect("SQL error fetching table size")
-            .unwrap_or(0);
+        // 1. Get total rows AND a random offset in one SQL call
+        let (total_rows, random_offset) = Spi::connect(|client| {
+            let count_query = format!("SELECT COUNT(*) FROM {}", table_name);
+            let total = client.select(&count_query, None, &[])
+                .and_then(|t| t.get_one::<i64>())
+                .unwrap_or(Some(0))
+                .unwrap_or(0);
 
-        // 2. Calculate a random starting point (The VectorChord Strategy)
-        // We ensure that (offset + num_samples) does not exceed the table size.
-        let max_offset = if total_rows > num_samples as i64 {
-            total_rows - num_samples as i64
-        } else {
-            0
-        };
+            let mut offset = 0i64;
+            if total > num_samples as i64 {
+                let max_off = total - num_samples as i64;
+                // Use Postgres SQL to generate the random offset
+                let off_query = format!("SELECT (random() * {})::bigint", max_off);
+                offset = client.select(&off_query, None, &[])
+                    .and_then(|t| t.get_one::<i64>())
+                    .unwrap_or(Some(0))
+                    .unwrap_or(0);
+            }
+            Ok::<(i64, i64), pgrx::spi::Error>((total, offset))
+        }).expect("Failed to calculate offset");
 
-        // Generate a random offset using Postgres's internal random() function
-        let random_offset: i64 = if max_offset > 0 {
-            unsafe { (pgrx::pg_sys::random() % max_offset).abs() }
-        } else {
-            0
-        };
-
-        // 3. Use OFFSET/LIMIT for a guaranteed sequential block read
+        // 2. Execute the Block-Offset Query
         let query = format!(
             "SELECT {column_name} FROM {table_name} OFFSET {random_offset} LIMIT {num_samples}"
         );
 
-        info!("🚀 [PHASE 1] Initializing Block-Offset Sampler (VectorChord Approach)");
-        info!("🎲 Choosing random start at row: {} of {}  ", random_offset, total_rows);
+        info!("🚀 [PHASE 1] Random Sampler Initialized");
+        info!("🎲 Random Start: row {} | Total: {} | Samples: {}  ", random_offset, total_rows, num_samples);
 
         let (cached_vectors, dims) = Spi::connect(|client| {
             let mut all_vecs = Vec::new();
@@ -57,11 +58,8 @@ impl VectorReadBatcher {
 
             let tuple_table = client.select(&query, None, &[]).expect("Failed to fetch samples");
 
-            let decode_start = Instant::now();
             for row in tuple_table {
                 let entry = row.get_datum_by_ordinal(1).expect("Column not found");
-
-                // Using the Ok(Some(..)) pattern for Result<Option<Datum>>
                 if let Ok(Some(raw_datum)) = entry.value::<Datum>() {
                     let byte_slice = unsafe { pgrx::varlena_to_byte_slice(raw_datum.cast_mut_ptr()) };
                     let (vec_vals, v_dims) = vector_type::decode_pgvector_vector(byte_slice);
@@ -73,18 +71,16 @@ impl VectorReadBatcher {
             }
 
             if row_count == 0 && total_rows > 0 {
-                pgrx::error!("SQL returned 0 rows despite table having data. Check permissions for {}", table_name);
+                pgrx::error!("SQL returned 0 rows. Verify permissions for table: {}", table_name);
             }
 
-            info!("✅ Decoding complete. Loaded {} vectors in {:?}", row_count, decode_start.elapsed());
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((all_vecs, detected_dims))
         }).expect("SPI Error");
 
-        // Guard against divide-by-zero in logs
         let safe_dims = if dims == 0 { 768 } else { dims };
 
         info!(
-            "📊 Sampler Ready: Loaded {} total vectors in {:.2?}  ",
+            "✅ Loaded {} vectors in {:.2?}",
             cached_vectors.len() / (safe_dims as usize),
             start_time.elapsed()
         );
@@ -121,7 +117,6 @@ impl VectorReadBatcher {
         let start_idx = (self.vectors_read as usize) * (self.dims as usize);
         let end_idx = (self.vectors_read as usize + samples_to_read) * (self.dims as usize);
 
-        // Safety slice check
         if end_idx > self.cached_vectors.len() {
             return None;
         }
@@ -133,6 +128,6 @@ impl VectorReadBatcher {
     }
 
     pub(crate) fn end_scan(self) {
-        info!("🏁 Training sample session ended. Memory released.");
+        info!("🏁 Training sample scan complete.");
     }
 }
