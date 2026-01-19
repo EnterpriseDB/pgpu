@@ -341,6 +341,7 @@ pub fn train_roots_gpu(
     vector_dims: u32,
     num_roots: u32,
     iterations: u32,
+    n_redo: u32,
 ) -> Vec<f32> {
     let total_count = full_vectors.len() / vector_dims as usize;
     let train_limit = 1_000_000;
@@ -359,6 +360,7 @@ pub fn train_roots_gpu(
         .set_n_clusters(num_roots as i32)
         .set_max_iter(iterations as i32)
         .set_metric(DistanceType::L2Expanded)
+        .set_n_init(n_redo as i32)
         .set_n_init(1)
         .set_batch_samples(0)
         .set_batch_centroids(0);

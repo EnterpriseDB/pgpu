@@ -64,6 +64,13 @@ pub fn index(
         info!("🏗️ [HIERARCHICAL DETECTED] Starting Top-Down Build");
         info!("📊 Target: {} Roots | {} Leaves ({} per root)", num_roots, num_leaves, num_leaves_per_root);
         info!("📉 Sampling: Factor={} -> Reading {} vectors for training", sampling_factor, num_samples_to_read);
+        info!("⚙️ Clustering Configuration:\n\
+           \t• Target Lists (Leaf):  {}\n\
+           \t• Sampling Factor:      {}\n\
+           \t• Batch Size:           {}\n\
+           \t• KMeans Iterations:    {}\n\
+           \t• KMeans N-Redo:        {} (Best of N runs)",
+           num_clusters_leaf, sampling_factor, batch_size, kmeans_iterations, kmeans_nredo);
 
         // 2. Load Samples into RAM
         // We use the batcher to read exactly 'num_samples_to_read'
@@ -116,7 +123,8 @@ pub fn index(
             &training_dataset,
             vector_dims,
             num_roots,
-            kmeans_iterations
+            kmeans_iterations,
+            kmeans_nredo
         );
         let d_p1 = t_p1_start.elapsed();
 
@@ -131,7 +139,7 @@ pub fn index(
         );
         let d_p2 = t_p2_start.elapsed();
 
-        // 5. Phase 3: Train Leaves
+        // --- PHASE 3: SCATTER & TRAIN LEAVES ---
         let t_p3_start = Instant::now();
         info!("🚀 [PHASE 3] Scattering vectors & Training Leaves...");
         let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
@@ -163,37 +171,48 @@ pub fn index(
             root_ids.push(current_id);
         }
 
+        // DYNAMIC LEAF ALLOCATION
+        info!("⚖️ Rebalancing leaf targets based on data density...");
+
+        let leaves_per_vector_ratio = num_leaves as f64 / loaded_count as f64;
+
         let mut total_leaves_trained = 0;
         let mut missing_leaves = 0;
+        let mut min_bucket = usize::MAX;
+        let mut max_bucket = 0;
 
         for (i, bucket_vecs) in buckets.iter().enumerate() {
             let n_vecs = bucket_vecs.len() / vector_dims as usize;
-            // Get the ID of the root that owns this bucket
             let parent_id = root_ids[i];
 
-            // Edge Case: Empty Bucket (No vectors assigned to this root)
             if n_vecs == 0 {
-                warning!("⚠️ Root {} (ID {}) is empty! 0 centroids created for this branch.", i, parent_id);
-                missing_leaves += num_leaves_per_root;
                 continue;
             }
+            if n_vecs < min_bucket { min_bucket = n_vecs; }
+            if n_vecs > max_bucket { max_bucket = n_vecs; }
 
-            if i % 20 == 0 {
-                info!("🌿 Root {}/{} | Bucket: {} vectors | Parent ID: {}  ", i, num_roots, n_vecs, parent_id);
+            // Dynamic Target Calculation
+            let raw_target = n_vecs as f64 * leaves_per_vector_ratio;
+            let mut target_leaves = raw_target.round() as u32;
+
+            // Clamps
+            if target_leaves < 1 { target_leaves = 1; }
+            if target_leaves > n_vecs as u32 { target_leaves = n_vecs as u32; }
+
+            if i % 50 == 0 {
+                info!("🌿 Root {} | Size: {} | Target Leaves: {} (Dynamic)", i, n_vecs, target_leaves);
             }
 
             let leaf_centroids_flat = train_leaves_for_bucket_gpu(
                 bucket_vecs,
                 vector_dims,
-                num_leaves_per_root,
-                15
+                target_leaves,
+                15 // Leaves converge fast, 15 is usually plenty
             );
 
-            // 3. Store Leaves (Parent = The specific Root ID)
             let leaves_created = leaf_centroids_flat.len() / vector_dims as usize;
-            if leaves_created < num_leaves_per_root as usize {
-                 // This happens if bucket size < requested leaves. It's expected mathematically.
-                 missing_leaves += num_leaves_per_root - (leaves_created as u32);
+            if leaves_created < target_leaves as usize {
+                 missing_leaves += target_leaves - (leaves_created as u32);
             }
 
             for leaf_vec in leaf_centroids_flat.chunks(vector_dims as usize) {
@@ -203,6 +222,7 @@ pub fn index(
         }
         let d_p3 = t_p3_start.elapsed();
 
+        info!("📊 [SKEW REPORT] Min Bucket: {} | Max Bucket: {}  ", min_bucket, max_bucket);
         info!("🏁 [HIERARCHY COMPLETE] Trained {} Leaves ({} missing due to sparsity).", total_leaves_trained, missing_leaves);
         info!("💾 Total Centroids (Super+Roots+Leaves): {}  ", final_results.len());
 
@@ -220,7 +240,7 @@ pub fn index(
             \t• 🌿 Phase 3 (Leaves): {:.2?}\n\
             \t• 💾 Storage:          {:.2?}\n\
             \t-----------------------------\n\
-            \t👉 TOTAL TIME:         {:.2?}",
+            \t👉 TOTAL TIME:         {:.2?}  ",
             d_load, d_p0, d_p1, d_p2, d_p3, d_store, global_start.elapsed()
         );
 
