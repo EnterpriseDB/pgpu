@@ -46,8 +46,7 @@ pub fn index(
     util::assert_valid_distance_operator(&distance_operator);
     let centroid_table_name = quote_qualified_identifier(schema, format!("{table}_centroids"));
     assert!(centroid_table_name.len() <= 63, "generated centroid table name \"{centroid_table_name}\" is too long to use as a postgres identifier. Use a source table name that is shorter than 53 characters");
-
-    let start_time = Instant::now();
+    let global_start = Instant::now();
 
     // ========================================================================================
     // PATH A: TOP-DOWN HIERARCHICAL BUILD (New Logic)
@@ -99,7 +98,7 @@ pub fn index(
         }
         batcher.end_scan();
         let d_load = t_load_start.elapsed();
-        info!("✅ Training Dataset Loaded: {} vectors. Time: {:.2?}", loaded_count, start_time.elapsed());
+        info!("✅ Training Dataset Loaded: {} vectors. Time: {:.2?}", loaded_count, d_load);
 
         // --- PHASE 0: SUPER ROOT (Global Mean) ---
         // Level 0: The single center of the entire dataset.
