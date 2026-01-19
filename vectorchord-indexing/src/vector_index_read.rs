@@ -22,28 +22,26 @@ impl VectorReadBatcher {
     ) -> Self {
         let start_time = Instant::now();
 
-        // LOG 1: The Culprit Hunter
-        // We use brackets [] to reveal any hidden spaces or newlines in the string
-        info!("🔍 DEBUG: Target Table: [{}] | Target Column: [{}] ", table_name, column_name);
+        // --- STEP 1: RUN DEBUGGER ---
+        Self::debug_session_context(&table_name);
 
+        // --- STEP 2: CALCULATE OFFSET ---
         let (total_rows, random_offset) = Spi::connect(|client| {
-            let count_query = format!("SELECT count(*) FROM {}", table_name);
-            debug1!("⚡ Executing Count: {}", count_query);
+            let count_sql = format!("SELECT count(*) FROM {}", table_name);
+            info!("🛠️ [SQL CHECK] Count query: {}  ", count_sql);
 
-            let total = client.select(&count_query, None, &[])
+            let total = client.select(&count_sql, None, &[])
                 .and_then(|t| t.get_one::<i64>())
                 .unwrap_or(Some(0))
                 .unwrap_or(0);
 
-            if total == 0 {
-                debug1!("⚠️ WARNING: Postgres reported 0 rows for table [{}].", table_name);
-            }
-
             let mut offset = 0i64;
             if total > num_samples as i64 {
                 let max_off = total - num_samples as i64;
-                let off_query = format!("SELECT (random() * {})::bigint", max_off);
-                offset = client.select(&off_query, None, &[])
+                let off_sql = format!("SELECT (random() * {})::bigint", max_off);
+                info!("🛠️ [SQL CHECK] Offset query: {}  ", off_sql);
+
+                offset = client.select(&off_sql, None, &[])
                     .and_then(|t| t.get_one::<i64>())
                     .unwrap_or(Some(0))
                     .unwrap_or(0);
@@ -51,14 +49,11 @@ impl VectorReadBatcher {
             Ok::<(i64, i64), pgrx::spi::Error>((total, offset))
         }).expect("SPI Error during pre-scan");
 
-        // 2. The Main Query
+        // --- STEP 3: EXECUTE DATA LOAD ---
         let query = format!(
             "SELECT {column_name} FROM {table_name} OFFSET {random_offset} LIMIT {num_samples}"
         );
-
-        info!("🚀 [PHASE 1] VectorChord Sampler Initialized");
-        info!("🎲 Random Start: row {} | Total Table Rows: {}  ", random_offset, total_rows);
-        debug1!("⚡ Final Sampling SQL: {}", query);
+        info!("🛠️ [SQL CHECK] Main Data Query: {}  ", query);
 
         let (cached_vectors, dims) = Spi::connect(|client| {
             let mut all_vecs = Vec::new();
@@ -72,34 +67,22 @@ impl VectorReadBatcher {
                 if let Ok(Some(raw_datum)) = entry.value::<Datum>() {
                     let byte_slice = unsafe { pgrx::varlena_to_byte_slice(raw_datum.cast_mut_ptr()) };
                     let (vec_vals, v_dims) = vector_type::decode_pgvector_vector(byte_slice);
-
                     if detected_dims == 0 { detected_dims = v_dims; }
                     all_vecs.extend(vec_vals);
                     row_count += 1;
                 }
             }
 
-            // Safety Guard: Stop here if no data was found
             if row_count == 0 {
-                debug1!("❌ FATAL: Loaded 0 vectors. Check if [{}] is populated and accessible.", table_name);
+                error!("❌ FATAL: 0 vectors returned. Check the 'Main Data Query' above in psql.");
             }
 
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((all_vecs, detected_dims))
         }).expect("SPI Error during data load");
 
-        // Safety Guard: Prevent Divide by Zero
-        let safe_dims = if dims == 0 {
-            debug1!("⚠️ Warning: Dimensions detected as 0. Defaulting to 1 to prevent crash.");
-            1
-        } else {
-            dims
-        };
+        let safe_dims = if dims == 0 { 1 } else { dims };
 
-        info!(
-            "✅ Phase 1 Ready: Loaded {} vectors in {:.2?}",
-            cached_vectors.len() / (safe_dims as usize),
-            start_time.elapsed()
-        );
+        info!("✅ Phase 1 Ready: Loaded {} vectors in {:.2?}", cached_vectors.len() / (safe_dims as usize), start_time.elapsed());
 
         VectorReadBatcher {
             num_samples,
@@ -111,33 +94,42 @@ impl VectorReadBatcher {
         }
     }
 
-    pub fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
-        // Stop if we have read everything or if data is invalid
-        if self.vectors_read >= self.num_samples || self.dims <= 1 {
-            return None;
-        }
+    /// Isolated forensic function to check why Postgres might think a table is empty
+    fn debug_session_context(table_name: &str) {
+        Spi::connect(|client| {
+            let user: String = client.select("SELECT current_user", None, &[]).and_then(|t| t.get_one()).unwrap_or(Some("?".into())).unwrap();
+            let database: String = client.select("SELECT current_database()", None, &[]).and_then(|t| t.get_one()).unwrap_or(Some("?".into())).unwrap();
 
+            // Check if the table actually has data pages in the buffer cache/disk
+            let relpages: i32 = client.select(
+                &format!("SELECT relpages FROM pg_class WHERE oid = '{}'::regclass", table_name),
+                None, &[]
+            ).and_then(|t| t.get_one()).unwrap_or(Some(0)).unwrap();
+
+            info!("--- [FORENSIC DEBUG START] ---");
+            info!("👤 Current User: {}  ", user);
+            info!("📂 Current DB:   {}  ", database);
+            info!("📦 Physical Pages (relpages): {}  ", relpages);
+            if relpages == 0 {
+                warning!("⚠️ Postgres reports 0 physical pages for {}. This usually means the table is empty or uncommitted.", table_name);
+            }
+            info!("--- [FORENSIC DEBUG END] ---");
+            Ok::<(), pgrx::spi::Error>(())
+        }).ok();
+    }
+
+    pub fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
+        if self.vectors_read >= self.num_samples || self.dims <= 1 { return None; }
         let mut samples_to_read = self.num_samples_per_batch as usize;
         let remaining = (self.num_samples - self.vectors_read) as usize;
-
-        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize {
-            samples_to_read = remaining;
-        }
-
+        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize { samples_to_read = remaining; }
         let start_idx = (self.vectors_read as usize) * (self.dims as usize);
         let end_idx = (self.vectors_read as usize + samples_to_read) * (self.dims as usize);
-
-        if end_idx > self.cached_vectors.len() {
-            return None;
-        }
-
+        if end_idx > self.cached_vectors.len() { return None; }
         let batch = self.cached_vectors[start_idx..end_idx].to_vec();
         self.vectors_read += samples_to_read as u64;
-
         Some((batch, self.dims))
     }
 
-    pub(crate) fn end_scan(self) {
-        info!("🏁 Training sample scan complete.");
-    }
+    pub(crate) fn end_scan(self) { info!("🏁 Training scan complete."); }
 }
