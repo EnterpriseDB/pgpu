@@ -186,6 +186,10 @@ pub fn index(
                 continue;
             }
 
+            // Track skew statistics
+            if n_vecs < min_bucket { min_bucket = n_vecs; }
+            if n_vecs > max_bucket { max_bucket = n_vecs; }
+
             if i % 50 == 0 {
                 info!("🌿 Root {}/{} | Bucket: {} | Parent ID: {}  ", i, num_roots, n_vecs, parent_id);
             }
@@ -211,7 +215,6 @@ pub fn index(
         }
         let d_p3 = t_p3_start.elapsed();
 
-        info!("📊 [SKEW REPORT] Min Bucket: {} | Max Bucket: {}  ", min_bucket, max_bucket);
         info!("🏁 [HIERARCHY COMPLETE] Trained {} Leaves. Total Centroids: {}  ", total_leaves_trained, final_results.len());
         info!("💾 Total Centroids (Roots+Leaves): {}  ", final_results.len());
 
@@ -222,14 +225,22 @@ pub fn index(
         // --- SUMMARY LOG ---
         info!(
             "\n⏱️  [TIMING SUMMARY]\n\
-            \t• 📥 Data Loading:     {:.2?}\n\
-            \t• 🏗️ Phase 1 (Roots):  {:.2?}\n\
-            \t• 🔮 Phase 2 (Part.):  {:.2?}\n\
-            \t• 🌿 Phase 3 (Leaves): {:.2?}\n\
-            \t• 💾 Storage:          {:.2?}\n\
+            \t• 📥 Data Loading:     {:.2?}  \n\
+            \t• 🏗️ Phase 1 (Roots):  {:.2?}  \n\
+            \t• 🔮 Phase 2 (Part.):  {:.2?}  \n\
+            \t• 🌿 Phase 3 (Leaves): {:.2?}  \n\
+            \t• 💾 Storage:          {:.2?}  \n\
             \t-----------------------------\n\
-            \t👉 TOTAL TIME:         {:.2?}",
-            d_load, d_p1, d_p2, d_p3, d_store, global_start.elapsed()
+            \t📊 [SKEW & QUALITY REPORT]\n\
+            \t• Min Bucket Size:     {}\n\
+            \t• Max Bucket Size:     {}\n\
+            \t• Leaves Trained:      {}\n\
+            \t• Leaves Dropped:      {}\n\
+            \t-----------------------------\n\
+            \t👉 TOTAL TIME:         {:.2?}  ",
+            d_load, d_p1, d_p2, d_p3, d_store,
+            min_bucket, max_bucket, total_leaves_trained, missing_leaves,
+            global_start.elapsed()
         );
 
     // ========================================================================================
