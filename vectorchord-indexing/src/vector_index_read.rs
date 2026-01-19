@@ -48,7 +48,7 @@ impl VectorReadBatcher {
                 let entry = row.get_datum_by_ordinal(1).expect("Column not found");
 
                 // Fixed: Extract the internal Datum pointer safely
-                if let Some(raw_datum) = entry.value::<Datum>() {
+                if let Ok(Some(raw_datum)) = entry.value::<Datum>() {
                     let byte_slice = unsafe { pgrx::varlena_to_byte_slice(raw_datum.cast_mut_ptr()) };
                     let (vec_vals, v_dims) = vector_type::decode_pgvector_vector(byte_slice);
                     all_vecs.extend(vec_vals);
@@ -56,9 +56,6 @@ impl VectorReadBatcher {
                     row_count += 1;
                 }
 
-                if row_count % 250_000 == 0 {
-                    info!("   ... decoded {}/{} vectors", row_count, num_samples);
-                }
             }
 
             info!("✅ Decoding complete. Processed {} rows in {:?}", row_count, decode_start.elapsed());
