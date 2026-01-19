@@ -26,7 +26,7 @@ impl VectorReadBatcher {
         Self::debug_session_context(&table_name);
 
         // --- STEP 2: CALCULATE OFFSET ---
-        let (total_rows, random_offset) = Spi::connect(|client| {
+        let (_total_rows, random_offset) = Spi::connect(|client| {
             let count_sql = format!("SELECT count(*) FROM {}", table_name);
             info!("🛠️ [SQL CHECK] Count query: {}  ", count_sql);
 
@@ -100,23 +100,22 @@ impl VectorReadBatcher {
             let user: String = client.select("SELECT current_user", None, &[]).and_then(|t| t.get_one()).unwrap_or(Some("?".into())).unwrap();
             let db: String = client.select("SELECT current_database()", None, &[]).and_then(|t| t.get_one()).unwrap_or(Some("?".into())).unwrap();
 
-            // Simpler metadata check using pgrx select
-            let stats = client.select(
-                &format!("SELECT relpages, reltuples FROM pg_class WHERE oid = '{}'::regclass", table_name),
-                None, &[]
-            );
+            // Checking the global system catalog for physical presence
+            let stats_query = format!("SELECT relpages, reltuples FROM pg_class WHERE oid = '{}'::regclass", table_name);
+            let stats = client.select(&stats_query, None, &[]);
 
             info!("--- [DIAGNOSTIC] ---");
-            info!("👤 User: {} | 📂 DB: {}  ", user, db);
+            info!("👤 User: {} | 📂 DB: {}", user, db);
 
             if let Ok(table) = stats {
                 for row in table {
-                    let pages: i32 = row.get_datum_by_ordinal(1).unwrap().value().unwrap().unwrap();
-                    let tuples: f32 = row.get_datum_by_ordinal(2).unwrap().value().unwrap().unwrap();
-                    info!("📦 Disk Pages: {} | 📈 Catalog Tuples: {}  ", pages, tuples);
+                    // Safe extraction of i32 (pages) and f32 (tuples)
+                    let pages: i32 = row.get_datum_by_ordinal(1).unwrap().value().unwrap().unwrap_or(0);
+                    let tuples: f32 = row.get_datum_by_ordinal(2).unwrap().value().unwrap().unwrap_or(0.0);
+                    info!("📦 Disk Pages: {} | 📈 Catalog Tuples: {}", pages, tuples);
                 }
             } else {
-                debug1!("❌ Could not find table [{}] in pg_class", table_name);
+                warning!("❌ Table [{}] not found in pg_class. Check schema or quotes.", table_name);
             }
             info!("--- [END DIAGNOSTIC] ---");
             Ok::<(), pgrx::spi::Error>(())
