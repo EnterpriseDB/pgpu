@@ -26,36 +26,43 @@ impl VectorReadBatcher {
     ) -> Self {
         let start_time = Instant::now();
 
-        // SQL using the fixed 2.5% rate as requested
+        // 1. FORCE STATS UPDATE (The "Fix")
+        // This ensures Postgres knows exactly how many pages the table occupies.
+        info!("🧹 [PHASE 1] Forcing table statistics update (ANALYZE)...");
+        Spi::connect(|client| {
+            client.select(&format!("ANALYZE {table_name}"), None, &[])
+        }).expect("Failed to analyze table");
+
+        // 2. Now run the Bernoulli Sample
         let query = format!(
             "SELECT {column_name} FROM {table_name} TABLESAMPLE BERNOULLI (2.5) LIMIT {num_samples}"
-        ); // Still not fully random as we use LIMIT, but better than SeqScan
+        );
 
         info!("🚀 [PHASE 1] Initializing Sampler (Fixed 2.5% Rate)");
-        info!("⚡ Executing SQL: {}", query);
 
         let (cached_vectors, dims) = Spi::connect(|client| {
             let mut all_vecs = Vec::new();
             let mut detected_dims = 0;
-            let mut row_count = 0;
 
-            // signature: select(query, limit, args)
             let tuple_table = client.select(&query, None, &[]).expect("Failed to fetch samples");
 
-            let decode_start = Instant::now();
+            let mut row_count = 0;
             for row in tuple_table {
                 let entry = row.get_datum_by_ordinal(1).expect("Column not found");
-
-                // Latest Fix: Result<Option<T>, E> requires Ok(Some(val)) matching
                 if let Ok(Some(raw_datum)) = entry.value::<Datum>() {
                     let byte_slice = unsafe { pgrx::varlena_to_byte_slice(raw_datum.cast_mut_ptr()) };
                     let (vec_vals, v_dims) = vector_type::decode_pgvector_vector(byte_slice);
                     all_vecs.extend(vec_vals);
                     detected_dims = v_dims;
+                    row_count += 1;
                 }
             }
 
-            info!("✅ Decoding complete. Processed {} rows in {:?}", row_count, decode_start.elapsed());
+            // Check for the 0-row case to prevent Divide by Zero
+            if row_count == 0 {
+                pgrx::error!("TABLESAMPLE still returned 0 rows after ANALYZE. Check if {} is a View or Foreign Table.", table_name);
+            }
+
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((all_vecs, detected_dims))
         }).expect("SPI Error");
 
