@@ -1,6 +1,4 @@
-use crate::clustering_gpu_impl::{
-    run_clustering_batch, run_clustering_consolidate, run_clustering_multilevel,
-};
+use crate::clustering_gpu_impl;
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
@@ -206,22 +204,21 @@ pub fn build_hierarchical_index(
     num_leaves: u32,      // e.g. 400 (Total = 160,000)
 ) {
     let total_vectors = vectors.len() / vector_dims as usize;
-    info!("🏗️ STARTING TOP-DOWN HIERARCHICAL BUILD");
-    info!("📊 Dataset: {} vectors, {} dims", total_vectors, vector_dims);
+    info!("🏗️ [HIERARCHICAL BUILD] Starting Top-Down Index Construction");
+    info!("📊 Dataset: {} vectors | Root K: {} | Leaf K per Root: {}  ", total_vectors, num_roots, num_leaves_per_root);
     info!("🎯 Target: {} roots * {} leaves = {} total clusters", num_roots, num_leaves, num_roots * num_leaves);
 
-    // --- PHASE 1: Train Roots ---
-    // We pass the full vector list, but the function internally samples 1M for speed/stability.
+    // --- PHASE 1: TRAIN ROOTS ---
+    // Internally caps training at 1M vectors for stability
     let root_centroids = clustering_gpu_impl::train_roots_gpu(
         &vectors,
         vector_dims,
         num_roots,
-        10,   // Iterations
-        "ip"  // Distance operator
+        20 // iterations
     );
 
-    // --- PHASE 2: Partition ---
-    // Assign every single vector to a root.
+    // --- PHASE 2: PARTITION ---
+    // Assign every single vector to a root
     let assignments = clustering_gpu_impl::assign_to_roots_gpu(
         &vectors,
         &root_centroids,
@@ -229,50 +226,54 @@ pub fn build_hierarchical_index(
         num_roots
     );
 
-    // --- PHASE 3: Train Leaves (Bucket by Bucket) ---
-    info!("🚀 PHASE 3 (Leaves): Processing {} buckets...", num_roots);
+    // --- PHASE 3: SCATTER & TRAIN LEAVES ---
+    info!("🚀 [PHASE 3 START] Scattering vectors into {} buckets...", num_roots);
 
-    // We need to physically group vectors by their assignment to send them to GPU.
-    // This is CPU intensive but necessary.
+    // We group vectors by their root assignment.
+    // vectors_per_bucket[root_id] -> List of vectors belonging to that root
     let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
 
-    // Scatter vectors into buckets
-    // OPTIMIZATION: This loop runs on CPU. For 100M vectors, this takes time.
-    // In production, consider doing this in parallel with rayon.
+    // CPU SCATTER LOOP
+    // NOTE: For 100M vectors, this loop is CPU-bound.
     for (idx, &label) in assignments.iter().enumerate() {
         if label >= 0 && (label as usize) < num_roots as usize {
             let start = idx * vector_dims as usize;
             let end = start + vector_dims as usize;
+            // Copy vector slice into specific bucket
             buckets[label as usize].extend_from_slice(&vectors[start..end]);
         }
     }
 
-    // Now iterate and train leaves
-    let mut final_centroids = Vec::new();
+    info!("📦 Buckets prepared. Starting Leaf Training...");
+
+    let mut total_leaves_trained = 0;
 
     for (root_idx, bucket_vecs) in buckets.iter().enumerate() {
         let n_vecs = bucket_vecs.len() / vector_dims as usize;
 
+        // Skip empty buckets
         if n_vecs == 0 {
-            warning!("⚠️ Root {} is empty! No vectors assigned.", root_idx);
             continue;
         }
 
-        // Logging every 10 roots to keep logs clean
+        // Log progress every 10 roots
         if root_idx % 10 == 0 {
-            info!("🌿 Processing Root {}/{} | Bucket Size: {} vectors", root_idx, num_roots, n_vecs);
+            info!("🌿 Root {}/{} | Bucket: {} vectors | Training {} leaves",
+                  root_idx, num_roots, n_vecs, num_leaves_per_root);
         }
 
-        let leaf_centroids = clustering_gpu_impl::train_leaves_for_bucket_gpu(
+        let _leaf_centroids = clustering_gpu_impl::train_leaves_for_bucket_gpu(
             bucket_vecs,
             vector_dims,
-            num_leaves, // Target leaves per root
-            15,         // Iterations (can be lower for leaves)
+            num_leaves_per_root,
+            15 // iterations
         );
 
-        // Store result (you would likely write this to your Postgres table here)
-        final_centroids.extend(leaf_centroids);
+        // TODO: Here you would save 'leaf_centroids' to your Postgres table.
+        // Format: (root_id, leaf_id, centroid_vector)
+
+        total_leaves_trained += num_leaves_per_root;
     }
 
-    info!("🏁 HIERARCHICAL INDEX BUILD COMPLETE");
+    info!("🏁 [INDEX COMPLETE] Trained {} Total Leaves across {} Roots.", total_leaves_trained, num_roots);
 }
