@@ -1,8 +1,8 @@
 use crate::vector_type;
-use pgrx::pg_sys::{format_type_be, SysScanDesc};
-use pgrx::{debug1, heap_getattr_raw, info, pg_sys, warning, PgRelation, Spi};
-use std::ffi::CStr;
+use pgrx::{debug1, info, Spi};
 use std::time::Instant;
+use pgrx::pg_sys::Datum;
+
 
 pub struct VectorReadBatcher {
     table_name: String,
