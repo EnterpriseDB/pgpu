@@ -36,7 +36,7 @@ impl VectorReadBatcher {
                 .unwrap_or(0);
 
             if total == 0 {
-                warning!("⚠️ WARNING: Postgres reported 0 rows for table [{}].", table_name);
+                debug1!("⚠️ WARNING: Postgres reported 0 rows for table [{}].", table_name);
             }
 
             let mut offset = 0i64;
@@ -81,7 +81,7 @@ impl VectorReadBatcher {
 
             // Safety Guard: Stop here if no data was found
             if row_count == 0 {
-                error!("❌ FATAL: Loaded 0 vectors. Check if [{}] is populated and accessible.", table_name);
+                debug1!("❌ FATAL: Loaded 0 vectors. Check if [{}] is populated and accessible.", table_name);
             }
 
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((all_vecs, detected_dims))
@@ -89,7 +89,7 @@ impl VectorReadBatcher {
 
         // Safety Guard: Prevent Divide by Zero
         let safe_dims = if dims == 0 {
-            warning!("⚠️ Warning: Dimensions detected as 0. Defaulting to 1 to prevent crash.");
+            debug1!("⚠️ Warning: Dimensions detected as 0. Defaulting to 1 to prevent crash.");
             1
         } else {
             dims
