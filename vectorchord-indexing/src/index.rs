@@ -123,7 +123,7 @@ pub fn index(
         // PHASE 1: MANUAL QUALITY-CONTROLLED ROOTS
         // ========================================================================================
         let t_p1_start = Instant::now();
-        let num_attempts = 20;
+        let num_attempts = kmeans_nredo;
         info!("🏗️ [PHASE 1] Starting Manual Quality-Control (Attempts: {}) ", num_attempts);
 
         // Initialize trackers OUTSIDE the loop scope
