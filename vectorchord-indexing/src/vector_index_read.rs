@@ -1,6 +1,6 @@
 use crate::vector_type;
 use pgrx::pg_sys::Datum;
-use pgrx::{info, Spi, warning};
+use pgrx::{info, Spi, warning, error};
 use std::time::Instant;
 
 pub struct VectorReadBatcher {
