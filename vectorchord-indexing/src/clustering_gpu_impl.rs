@@ -366,6 +366,7 @@ pub fn train_roots_gpu(
         .set_max_iter(iterations as i32)
         .set_metric(DistanceType::L2Expanded)
         .set_n_init(n_redo as i32)
+        .set_init_method(InitMethod::KMeansPlusPlus)
         .set_batch_samples(0)
         .set_batch_centroids(0);
 

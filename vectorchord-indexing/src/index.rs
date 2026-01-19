@@ -142,76 +142,80 @@ pub fn index(
         );
         let d_p2 = t_p2_start.elapsed();
 
-        // --- PHASE 3: SCATTER & TRAIN LEAVES ---
+        // --- PHASE 3: SCATTER & RESIDUAL TRAINING ---
         let t_p3_start = Instant::now();
-        info!("🚀 [PHASE 3] Scattering vectors & Training Leaves...");
+        info!("🚀 [PHASE 3] Training Leaves on RESIDUALS (CPU-Alignment Mode)");
+
         let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
 
-        // Scatter
+        // [RESIDUAL CHANGE]: Store residuals in buckets instead of raw vectors
         for (idx, &label) in assignments.iter().enumerate() {
             if label >= 0 && (label as usize) < num_roots as usize {
                 let start = idx * vector_dims as usize;
                 let end = start + vector_dims as usize;
-                buckets[label as usize].extend_from_slice(&training_dataset[start..end]);
+
+                let root_start = label as usize * vector_dims as usize;
+                let root_vec = &root_centroids[root_start..root_start + vector_dims as usize];
+                let raw_vec = &training_dataset[start..end];
+
+                // Compute: Vector - RootCentroid
+                for j in 0..vector_dims as usize {
+                    buckets[label as usize].push(raw_vec[j] - root_vec[j]);
+                }
             }
         }
 
-        // --- STORAGE ASSEMBLY
-        // Structure: [(Vector, ParentID)]
-        // The Row ID in this vector corresponds to the Centroid ID.
         let mut final_results: Vec<(Vec<f32>, i32)> = Vec::new();
 
-        // 1. Store Roots (IDs 1..400,
+        // 1. Store Roots (ID 0..399, Parent -1)
         for root_vec in root_centroids.chunks(vector_dims as usize) {
-            final_results.push((root_vec.to_vec(), -1)); // Parent is NULL/Flat
+            final_results.push((root_vec.to_vec(), -1));
         }
 
-        // DYNAMIC LEAF ALLOCATION
-        info!("⚖️ Rebalancing leaf targets based on data density...");
-
-        let leaves_per_vector_ratio = num_leaves as f64 / loaded_count as f64;
-
+        // 2. Train on Residuals & Convert back to Absolute
         let mut total_leaves_trained = 0;
         let mut missing_leaves = 0;
         let mut min_bucket = usize::MAX;
         let mut max_bucket = 0;
 
-        for (i, bucket_vecs) in buckets.iter().enumerate() {
-            let n_vecs = bucket_vecs.len() / vector_dims as usize;
-            // Parent ID is the index of the root we just pushed
+        let leaves_per_vector_ratio = num_leaves as f64 / loaded_count as f64;
+
+        for (i, bucket_residuals) in buckets.iter().enumerate() {
+            let n_vecs = bucket_residuals.len() / vector_dims as usize;
             let parent_id = i as i32;
 
             if n_vecs == 0 {
-                missing_leaves += num_leaves / num_roots; // Approx
+                missing_leaves += num_leaves / num_roots;
                 continue;
             }
-
-            // Track skew statistics
             if n_vecs < min_bucket { min_bucket = n_vecs; }
             if n_vecs > max_bucket { max_bucket = n_vecs; }
 
-            if i % 50 == 0 {
-                info!("🌿 Root {}/{} | Bucket: {} | Parent ID: {}  ", i, num_roots, n_vecs, parent_id);
-            }
-
-            // Calculate Dynamic Target
             let raw_target = n_vecs as f64 * leaves_per_vector_ratio;
             let mut target_leaves = raw_target.round() as u32;
-            if target_leaves < 1 { target_leaves = 1; }
-            if target_leaves > n_vecs as u32 { target_leaves = n_vecs as u32; }
+            target_leaves = target_leaves.clamp(1, n_vecs as u32);
 
-            let leaf_centroids_flat = train_leaves_for_bucket_gpu(
-                bucket_vecs,
+            // Train on the residuals
+            let leaf_residuals = train_leaves_for_bucket_gpu(
+                bucket_residuals,
                 vector_dims,
                 target_leaves,
-                15
+                15,
+                1
             );
 
-            let leaves_created = leaf_centroids_flat.len() / vector_dims as usize;
-            for leaf_vec in leaf_centroids_flat.chunks(vector_dims as usize) {
-                final_results.push((leaf_vec.to_vec(), parent_id));
+            // [RESIDUAL CHANGE]: Add Root back to Residual to store absolute position
+            let root_start = i * vector_dims as usize;
+            let root_vec = &root_centroids[root_start..root_start + vector_dims as usize];
+
+            for leaf_res_chunk in leaf_residuals.chunks(vector_dims as usize) {
+                let mut absolute_leaf = vec![0.0f32; vector_dims as usize];
+                for j in 0..vector_dims as usize {
+                    absolute_leaf[j] = root_vec[j] + leaf_res_chunk[j];
+                }
+                final_results.push((absolute_leaf, parent_id));
             }
-            total_leaves_trained += leaves_created as u32;
+            total_leaves_trained += leaf_residuals.len() / vector_dims as usize;
         }
         let d_p3 = t_p3_start.elapsed();
 
