@@ -22,18 +22,18 @@ impl VectorReadBatcher {
     ) -> Self {
         let start_time = Instant::now();
 
-        // 1. DIRECT COUNT: Get the exact row count via SQL
+        // 1. DIRECT COUNT
         let total: i64 = Spi::connect(|client| {
             let result = client.select(&format!("SELECT COUNT(*) FROM {}", table_name), None, &[])
                 .expect("Failed to execute COUNT query");
 
-            // Extract the first column of the first row safely
+            // Extract i64 and handle the Result/Option safely
             result.get_one::<i64>().unwrap_or(Some(0)).unwrap_or(0)
-        }).expect("SPI Connection Error");
+        });
 
         info!("📊 [SQL] Table: {} | Row Count: {}", table_name, total);
 
-        // 2. RANDOM OFFSET: Calculate where to start the block read
+        // 2. RANDOM OFFSET
         let offset: i64 = if total > num_samples as i64 {
             Spi::connect(|client| {
                 let max_off = total - num_samples as i64;
@@ -43,12 +43,12 @@ impl VectorReadBatcher {
                     .get_one::<i64>()
                     .unwrap_or(Some(0))
                     .unwrap_or(0)
-            }).expect("SPI Connection Error")
+            })
         } else {
             0
         };
 
-        // 3. DATA LOAD: Fetch the sample block
+        // 3. DATA LOAD
         let (cached_vectors, dims) = Spi::connect(|client| {
             let mut vecs = Vec::new();
             let mut detected_dims = 0;
@@ -66,7 +66,6 @@ impl VectorReadBatcher {
                 let datum = row.get_datum_by_ordinal(1).expect("Column 1 missing").value::<Datum>();
 
                 if let Ok(Some(d)) = datum {
-                    // Safety: cast to varlena for decoding
                     let byte_slice = unsafe {
                         pgrx::varlena_to_byte_slice(d.cast_mut_ptr::<pgrx::pg_sys::varlena>())
                     };
@@ -79,7 +78,6 @@ impl VectorReadBatcher {
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((vecs, detected_dims))
         }).expect("SPI Data Connection Failed");
 
-        // Prevent crash on logging if 0 rows returned
         let safe_dims = if dims == 0 { 1 } else { dims };
         let count_loaded = cached_vectors.len() / (safe_dims as usize);
 
