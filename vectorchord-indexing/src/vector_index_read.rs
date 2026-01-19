@@ -1,6 +1,6 @@
 use crate::vector_type;
-use pgrx::pg_sys::Datum; // Fixed import path
-use pgrx::{info, Spi};
+use pgrx::pg_sys::Datum;
+use pgrx::{info, warning, Spi};
 use std::time::Instant;
 
 pub struct VectorReadBatcher {
@@ -22,85 +22,83 @@ impl VectorReadBatcher {
     ) -> Self {
         let start_time = Instant::now();
 
-        // 1. Get Count and Offset with proper pgrx arguments (&[])
-        let (total, offset) = Spi::connect(|client| {
-            let total = client
-                .select(&format!("SELECT count(*) FROM {}", table_name), None, &[])
-                .expect("SQL Count Failed")
-                .get_one::<i64>()
-                .expect("Result was not i64")
-                .unwrap_or(0);
-
-            let mut offset = 0i64;
-            if total > num_samples as i64 {
-                let max_off = total - num_samples as i64;
-                offset = client
-                    .select(
-                        &format!("SELECT (random() * {})::bigint", max_off),
-                        None,
-                        &[],
-                    )
-                    .expect("SQL Offset Failed")
-                    .get_one::<i64>()
-                    .expect("Result was not i64")
-                    .unwrap_or(0);
+        // --- MULTI-STRATEGY COUNT ---
+        let total = Spi::connect(|client| {
+            // Strategy 1: Explicit COUNT(*)
+            if let Ok(Some(count)) = client.select(&format!("SELECT COUNT(*) FROM {table_name}"), None, &[])
+                .and_then(|t| t.get_one::<i64>()) {
+                if count > 0 { return Ok(count); }
             }
-            Ok::<(i64, i64), pgrx::spi::Error>((total, offset))
-        })
-        .expect("SPI Connection Failed");
 
-        info!(
-            "📊 Table: {} | Total: {} | Sampling: {} from offset {}  ",
-            table_name, total, num_samples, offset
-        );
+            // Strategy 2: Fast Catalog Lookup (Estimate)
+            // Useful if the table is locked or COUNT is failing for session reasons
+            if let Ok(Some(estimate)) = client.select(
+                &format!("SELECT reltuples::bigint FROM pg_class WHERE oid = '{table_name}'::regclass"),
+                None, &[]
+            ).and_then(|t| t.get_one::<i64>()) {
+                if estimate > 0 {
+                    warning!("⚠️ Strategy 1 failed. Using Catalog Estimate: {}", estimate);
+                    return Ok(estimate);
+                }
+            }
 
-        if total == 0 {
-            panic!(
-                "FATAL: Table '{}' reports 0 rows. This session cannot see the data.",
-                table_name
-            );
-        }
+            // Strategy 3: Information Schema
+            if let Ok(Some(info_count)) = client.select(
+                &format!("SELECT n_live_tup FROM pg_stat_user_tables WHERE relname = '{table_name}'"),
+                None, &[]
+            ).and_then(|t| t.get_one::<i64>()) {
+                if info_count > 0 { return Ok(info_count); }
+            }
 
-        // 2. Load Data using &[] for parameters
+            // Final Fallback: If we can't find a count, assume it's large enough for our sample
+            warning!("❗ All count strategies failed for {table_name}. Defaulting to sample size.");
+            Ok(num_samples as i64)
+        }).expect("SPI Connection Failed during count phase");
+
+        // Calculate offset safely
+        let offset = if total > num_samples as i64 {
+            Spi::connect(|client| {
+                client.select(&format!("SELECT (random() * {})::bigint", total - num_samples as i64), None, &[])
+                    .and_then(|t| t.get_one::<i64>())
+            }).unwrap_or(Some(0)).unwrap_or(0)
+        } else {
+            0
+        };
+
+        info!("📊 Dataset Detected: {} rows | Offset: {} | Target: {}", total, offset, num_samples);
+
+        // --- DATA LOAD ---
         let (cached_vectors, dims) = Spi::connect(|client| {
-            let mut vecs = Vec::with_capacity((num_samples * 768) as usize);
+            let mut vecs = Vec::new();
             let mut detected_dims = 0;
 
-            let query = format!(
-                "SELECT {} FROM {} OFFSET {} LIMIT {}",
-                column_name, table_name, offset, num_samples
-            );
+            // Note: If the table is truly empty, this simply returns an empty iterator (no panic)
+            let query = format!("SELECT {column_name} FROM {table_name} OFFSET {offset} LIMIT {num_samples}");
             let table = client.select(&query, None, &[]).expect("Data load query failed");
 
             for row in table {
-                let datum = row
-                    .get_datum_by_ordinal(1)
-                    .expect("Column 1 missing")
-                    .value::<Datum>();
+                let datum = row.get_datum_by_ordinal(1).expect("Column 1 missing").value::<Datum>();
 
                 if let Ok(Some(d)) = datum {
-                    // Fixed: Added explicit type annotation *mut pgrx::pg_sys::varlena
                     let byte_slice = unsafe {
                         pgrx::varlena_to_byte_slice(d.cast_mut_ptr::<pgrx::pg_sys::varlena>())
                     };
                     let (vals, d_dims) = vector_type::decode_pgvector_vector(byte_slice);
-                    if detected_dims == 0 {
-                        detected_dims = d_dims;
-                    }
+                    if detected_dims == 0 { detected_dims = d_dims; }
                     vecs.extend(vals);
                 }
             }
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((vecs, detected_dims))
-        })
-        .expect("SPI Data Connection Failed");
+        }).expect("SPI Data Connection Failed");
 
         let safe_dims = if dims == 0 { 1 } else { dims };
+        let loaded_count = cached_vectors.len() / (safe_dims as usize);
 
-        info!(
-            "✅ Load Complete: {} vectors in {:.2?}",
-            cached_vectors.len() / (safe_dims as usize),
-            start_time.elapsed()
-        );
+        if loaded_count == 0 {
+            warning!("🛑 LOADED 0 VECTORS. Check if table {table_name} is in the same database.");
+        } else {
+            info!("✅ Success: Loaded {} vectors in {:.2?}", loaded_count, start_time.elapsed());
+        }
 
         VectorReadBatcher {
             num_samples,
@@ -113,22 +111,15 @@ impl VectorReadBatcher {
     }
 
     pub fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
-        if self.vectors_read >= self.num_samples || self.dims <= 1 {
-            return None;
-        }
-
+        if self.vectors_read >= self.num_samples || self.dims <= 1 { return None; }
         let mut to_read = self.num_samples_per_batch as usize;
         let remaining = (self.num_samples - self.vectors_read) as usize;
-        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize {
-            to_read = remaining;
-        }
+        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize { to_read = remaining; }
 
         let start = (self.vectors_read as usize) * (self.dims as usize);
         let end = start + (to_read * self.dims as usize);
 
-        if end > self.cached_vectors.len() {
-            return None;
-        }
+        if end > self.cached_vectors.len() { return None; }
 
         let batch = self.cached_vectors[start..end].to_vec();
         self.vectors_read += to_read as u64;
