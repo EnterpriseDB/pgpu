@@ -119,32 +119,58 @@ pub fn index(
         let d_p0 = t_p0_start.elapsed();
         */
 
-        // --- PHASE 1: TRAIN ROOTS ---
-        // Level 1: Coarse Clusters
+        // --- PHASE 1: TRAIN ROOTS --- MANUAL QUALITY-CONTROLLED ROOTS ---
+        // This is because cuvs skips K-means n_redo after few attempts
         let t_p1_start = Instant::now();
-        let root_centroids = train_roots_gpu(
-            &training_dataset,
-            vector_dims,
-            num_roots,
-            kmeans_iterations,
-            kmeans_nredo
-        );
+        let num_attempts = 20; // Running 20 separate trials
+        info!("🏗️ [PHASE 1] Starting Manual Quality-Control (Attempts: {}) ", num_attempts);
+
+        let mut best_roots = Vec::new();
+        let mut lowest_skew = usize::MAX;
+        let mut best_assignments = Vec::new();
+
+        for attempt in 1..=num_attempts {
+            let candidate_roots = train_roots_gpu(
+                &training_dataset,
+                vector_dims,
+                num_roots,
+                100, // iterations
+                1    // n_redo (we handle the loop here)
+            );
+
+            // Calculate assignments for this attempt
+            let candidate_assignments = assign_to_roots_gpu(&training_dataset, &candidate_roots, vector_dims, num_roots);
+
+            let mut counts = vec![0usize; num_roots as usize];
+            for &label in &candidate_assignments {
+                if label >= 0 { counts[label as usize] += 1; }
+            }
+
+            let current_max = *counts.iter().max().unwrap_or(&usize::MAX);
+            info!("  ↳ Attempt {}: Max Bucket = {}", attempt, current_max);
+
+            if current_max < lowest_max_bucket {
+                lowest_max_bucket = current_max;
+                best_roots = candidate_roots;
+                best_assignments = candidate_assignments;
+            }
+        }
+
+        let root_centroids = best_roots;
+        let assignments = best_assignments; // This ensures Phase 3 uses the best mapping
+        info!("✅ Selected Best Roots (Max Bucket: {})", lowest_max_bucket);
         let d_p1 = t_p1_start.elapsed();
 
-        // --- PHASE 2: PARTITION ---
-        // Assign the loaded TRAINING samples to roots
-        let t_p2_start = Instant::now();
-        let assignments = assign_to_roots_gpu(
-            &training_dataset,
-            &root_centroids,
-            vector_dims,
-            num_roots
-        );
-        let d_p2 = t_p2_start.elapsed();
+        // ========================================================================================
+        // PHASE 2: PARTITION (Placeholder)
+        // ========================================================================================
+        // We already have 'assignments' from Phase 1, so we skip the 95s GPU call here.
+        let d_p2 = std::time::Duration::from_secs(0);
+        info!("🔮 [PHASE 2] Skipping redundant partitioning (Reuse from Phase 1)");
 
         // --- PHASE 3: SCATTER & RESIDUAL TRAINING ---
         let t_p3_start = Instant::now();
-        info!("🚀 [PHASE 3] Training Leaves on RESIDUALS (CPU-Alignment Mode)");
+        info!("🚀 [PHASE 3] Training Leaves on RESIDUALS (Matching CPU Logic)");
 
         let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
 
