@@ -351,6 +351,11 @@ pub fn train_roots_gpu(
     let start = Instant::now();
     let res = Resources::new().expect("GPU Resource failed");
 
+    // LOGGING VERIFICATION
+    info!("🛠️ GPU Kernel Config: n_clusters={}, max_iter={}, n_init={}  ",
+          num_roots, iterations, n_redo);
+
+
     let train_slice = &full_vectors[..(num_train * vector_dims as usize)];
     let train_array = Array2::from_shape_vec((num_train, vector_dims as usize), train_slice.to_vec()).expect("reshape failed");
     let dataset = ManagedTensor::from(&train_array).to_device(&res).expect("xfer failed");
@@ -361,7 +366,6 @@ pub fn train_roots_gpu(
         .set_max_iter(iterations as i32)
         .set_metric(DistanceType::L2Expanded)
         .set_n_init(n_redo as i32)
-        .set_n_init(1)
         .set_batch_samples(0)
         .set_batch_centroids(0);
 
