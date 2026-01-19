@@ -1,7 +1,6 @@
 use crate::vector_type;
-use pgrx::{debug1, info, Spi};
+use pgrx::{info, Spi, Datum};
 use std::time::Instant;
-use pgrx::pg_sys::Datum;
 
 pub struct VectorReadBatcher {
     num_samples: u64,
@@ -22,44 +21,43 @@ impl VectorReadBatcher {
     ) -> Self {
         let start_time = Instant::now();
 
-        // 1. SIMPLEST POSSIBLE SQL CALLS
+        // 1. Get Count and Offset with proper pgrx arguments (&[])
         let (total, offset) = Spi::connect(|client| {
-            // Get count
-            let total = client.select(&format!("SELECT count(*) FROM {}", table_name), None, None)
+            // Passing &[] for the third argument (parameters)
+            let total = client.select(&format!("SELECT count(*) FROM {}", table_name), None, &[])
                 .expect("SQL Count Failed")
                 .get_one::<i64>()
                 .expect("Result was not i64")
                 .unwrap_or(0);
 
-            // Get random offset
-            let offset = if total > num_samples as i64 {
-                client.select(&format!("SELECT (random() * {})::bigint", total - num_samples as i64), None, None)
+            let mut offset = 0i64;
+            if total > num_samples as i64 {
+                let max_off = total - num_samples as i64;
+                offset = client.select(&format!("SELECT (random() * {})::bigint", max_off), None, &[])
                     .expect("SQL Offset Failed")
                     .get_one::<i64>()
                     .expect("Result was not i64")
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+                    .unwrap_or(0);
+            }
             Ok::<(i64, i64), pgrx::spi::Error>((total, offset))
         }).expect("SPI Connection Failed");
 
         info!("📊 Table: {} | Total: {} | Sampling: {} from offset {}", table_name, total, num_samples, offset);
 
         if total == 0 {
-            panic!("FATAL: Table '{}' reports 0 rows. Verify data is COMMITTED and you are in the correct database.", table_name);
+            // Using a hard panic here because if the count is 0, nothing else works.
+            panic!("FATAL: Table '{}' reports 0 rows. This session cannot see the data.", table_name);
         }
 
-        // 2. LOAD DATA
+        // 2. Load Data using &[] for parameters
         let (cached_vectors, dims) = Spi::connect(|client| {
-            let mut vecs = Vec::with_capacity((num_samples * 768) as usize); // Assume 768 dims as hint
+            let mut vecs = Vec::with_capacity((num_samples * 768) as usize);
             let mut detected_dims = 0;
 
             let query = format!("SELECT {} FROM {} OFFSET {} LIMIT {}", column_name, table_name, offset, num_samples);
-            let table = client.select(&query, None, None).expect("Data load query failed");
+            let table = client.select(&query, None, &[]).expect("Data load query failed");
 
             for row in table {
-                // Get the datum directly from the first column
                 let datum = row.get_datum_by_ordinal(1).expect("Column 1 missing").value::<Datum>();
 
                 if let Ok(Some(d)) = datum {
