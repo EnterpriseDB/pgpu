@@ -200,8 +200,7 @@ pub fn index(
                 bucket_residuals,
                 vector_dims,
                 target_leaves,
-                15,
-                1
+                15
             );
 
             // [RESIDUAL CHANGE]: Add Root back to Residual to store absolute position
