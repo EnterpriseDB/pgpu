@@ -3,11 +3,7 @@ use pgrx::{debug1, info, Spi};
 use std::time::Instant;
 use pgrx::pg_sys::Datum;
 
-
 pub struct VectorReadBatcher {
-    table_name: String,
-    column_name: String,
-    num_tuples_in_table: Option<u64>,
     num_samples: u64,
     num_samples_per_batch: u64,
     min_samples_per_batch: u64,
@@ -26,62 +22,80 @@ impl VectorReadBatcher {
     ) -> Self {
         let start_time = Instant::now();
 
-        // 1. FORCE STATS UPDATE (The "Fix")
-        // This ensures Postgres knows exactly how many pages the table occupies.
-        info!("🧹 [PHASE 1] Forcing table statistics update (ANALYZE)...");
-        Spi::connect(|client| {
-            client.select(&format!("ANALYZE {table_name}"), None, &[])
-        }).expect("Failed to analyze table");
+        // 1. Get the total row count to determine the "skip" range
+        let total_rows: i64 = Spi::get_one(&format!("SELECT COUNT(1) FROM {}", table_name))
+            .expect("SQL error fetching table size")
+            .unwrap_or(0);
 
-        // 2. Now run the Bernoulli Sample
+        // 2. Calculate a random starting point (The VectorChord Strategy)
+        // We ensure that (offset + num_samples) does not exceed the table size.
+        let max_offset = if total_rows > num_samples as i64 {
+            total_rows - num_samples as i64
+        } else {
+            0
+        };
+
+        // Generate a random offset using Postgres's internal random() function
+        let random_offset: i64 = if max_offset > 0 {
+            unsafe { (pgrx::pg_sys::random() % max_offset).abs() }
+        } else {
+            0
+        };
+
+        // 3. Use OFFSET/LIMIT for a guaranteed sequential block read
         let query = format!(
-            "SELECT {column_name} FROM {table_name} TABLESAMPLE BERNOULLI (2.5) LIMIT {num_samples}"
+            "SELECT {column_name} FROM {table_name} OFFSET {random_offset} LIMIT {num_samples}"
         );
 
-        info!("🚀 [PHASE 1] Initializing Sampler (Fixed 2.5% Rate)");
+        info!("🚀 [PHASE 1] Initializing Block-Offset Sampler (VectorChord Approach)");
+        info!("🎲 Choosing random start at row: {} of {}  ", random_offset, total_rows);
 
         let (cached_vectors, dims) = Spi::connect(|client| {
             let mut all_vecs = Vec::new();
             let mut detected_dims = 0;
+            let mut row_count = 0;
 
             let tuple_table = client.select(&query, None, &[]).expect("Failed to fetch samples");
 
-            let mut row_count = 0;
+            let decode_start = Instant::now();
             for row in tuple_table {
                 let entry = row.get_datum_by_ordinal(1).expect("Column not found");
+
+                // Using the Ok(Some(..)) pattern for Result<Option<Datum>>
                 if let Ok(Some(raw_datum)) = entry.value::<Datum>() {
                     let byte_slice = unsafe { pgrx::varlena_to_byte_slice(raw_datum.cast_mut_ptr()) };
                     let (vec_vals, v_dims) = vector_type::decode_pgvector_vector(byte_slice);
+
+                    if detected_dims == 0 { detected_dims = v_dims; }
                     all_vecs.extend(vec_vals);
-                    detected_dims = v_dims;
                     row_count += 1;
                 }
             }
 
-            // Check for the 0-row case to prevent Divide by Zero
-            if row_count == 0 {
-                pgrx::error!("TABLESAMPLE still returned 0 rows after ANALYZE. Check if {} is a View or Foreign Table.", table_name);
+            if row_count == 0 && total_rows > 0 {
+                pgrx::error!("SQL returned 0 rows despite table having data. Check permissions for {}", table_name);
             }
 
+            info!("✅ Decoding complete. Loaded {} vectors in {:?}", row_count, decode_start.elapsed());
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((all_vecs, detected_dims))
         }).expect("SPI Error");
 
+        // Guard against divide-by-zero in logs
+        let safe_dims = if dims == 0 { 768 } else { dims };
+
         info!(
-            "📊 Sampler Ready: Loaded {} vectors in {:.2?}  ",
-            cached_vectors.len() / (dims as usize),
+            "📊 Sampler Ready: Loaded {} total vectors in {:.2?}  ",
+            cached_vectors.len() / (safe_dims as usize),
             start_time.elapsed()
         );
 
         VectorReadBatcher {
-            table_name,
-            column_name,
-            num_tuples_in_table: None,
             num_samples,
             num_samples_per_batch,
             min_samples_per_batch,
             vectors_read: 0,
             cached_vectors,
-            dims,
+            dims: safe_dims,
         }
     }
 
@@ -98,16 +112,16 @@ impl VectorReadBatcher {
         }
 
         debug1!(
-            "📦 Batching: {}-{} of {}  ",
+            "📦 Feeding Batch: {}-{} of {}  ",
             self.vectors_read,
-            self.vectors_read + samples_to_read as u64,
+            self.vectors_read + (samples_to_read as u64),
             self.num_samples
         );
 
-        let start_idx = self.vectors_read as usize * self.dims as usize;
-        let end_idx = (self.vectors_read as usize + samples_to_read) * self.dims as usize;
+        let start_idx = (self.vectors_read as usize) * (self.dims as usize);
+        let end_idx = (self.vectors_read as usize + samples_to_read) * (self.dims as usize);
 
-        // Ensure we don't overflow if the cache is smaller than num_samples
+        // Safety slice check
         if end_idx > self.cached_vectors.len() {
             return None;
         }
@@ -118,20 +132,7 @@ impl VectorReadBatcher {
         Some((batch, self.dims))
     }
 
-    pub(crate) fn num_tuples(&mut self) -> u64 {
-        match self.num_tuples_in_table {
-            Some(count) => count,
-            None => {
-                let count: i64 = Spi::get_one(&format!("SELECT COUNT(1) FROM {}  ", self.table_name))
-                    .expect("SQL error")
-                    .unwrap_or(0);
-                self.num_tuples_in_table = Some(count as u64);
-                count as u64
-            }
-        }
-    }
-
     pub(crate) fn end_scan(self) {
-        info!("🏁 Training sample session ended.");
+        info!("🏁 Training sample session ended. Memory released.");
     }
 }
