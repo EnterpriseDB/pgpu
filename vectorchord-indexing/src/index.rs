@@ -58,55 +58,59 @@ pub fn index(
         let num_leaves = num_clusters_leaf;
         let num_leaves_per_root = num_leaves / num_roots;
 
-        info!("🏗️ [HIERARCHICAL DETECTED] Starting Top-Down Build (in-memory)");
-        info!("📊 Target: {} Roots | {} Leaves ({} per root)", num_roots, num_leaves, num_leaves_per_root);
+        // 1. Calculate Sample Size based on Sampling Factor
+        let num_samples_to_read = (num_leaves as u64).saturating_mul(sampling_factor as u64);
 
-        // 1. Load ALL Data into RAM (as requested)
-        // We use the batcher to drain the table into a single Vec<f32>
-        // NOTE: For 100M vectors @ 768 dims, this requires ~300GB RAM.
-        let num_samples_total = 100_000_000; // Large upper bound to read everything
+        info!("🏗️ [HIERARCHICAL DETECTED] Starting Top-Down Build");
+        info!("📊 Target: {} Roots | {} Leaves ({} per root)", num_roots, num_leaves, num_leaves_per_root);
+        info!("📉 Sampling: Factor={} -> Reading {} vectors for training", sampling_factor, num_samples_to_read);
+
+        // 2. Load Samples into RAM
+        // We use the batcher to read exactly 'num_samples_to_read'
         let mut batcher = VectorReadBatcher::new(
             qualified_table.clone(),
             column_name.clone(),
-            num_samples_total,
+            num_samples_to_read,
             batch_size,
             1, // Unused for simple read
         );
 
-        let mut full_dataset: Vec<f32> = Vec::new();
+        let mut training_dataset: Vec<f32> = Vec::with_capacity((num_samples_to_read as usize) * 768);
         let mut vector_dims = 0;
         let mut loaded_count = 0;
 
-        info!("📥 Loading dataset into RAM...");
+        info!("📥 Loading training samples into RAM...");
         while let Some((vecs, dims)) = batcher.next_batch() {
             if vector_dims == 0 { vector_dims = dims; }
             loaded_count += vecs.len() / dims as usize;
-            full_dataset.extend(vecs);
+            training_dataset.extend(vecs);
 
             if loaded_count % 5_000_000 == 0 {
-                info!("... Loaded {} vectors", loaded_count);
+                info!("... Loaded {}/{} samples", loaded_count, num_samples_to_read);
             }
         }
         batcher.end_scan();
-        info!("✅ Dataset Loaded: {} vectors. Time: {:.2?}", loaded_count, start_time.elapsed());
+        info!("✅ Training Dataset Loaded: {} vectors. Time: {:.2?}", loaded_count, start_time.elapsed());
 
-        // 2. Phase 1: Train Roots
+        // 3. Phase 1: Train Roots
+        // We use the full loaded sample (capped internally at 1M by the function for stability if needed)
         let root_centroids = train_roots_gpu(
-            &full_dataset,
+            &training_dataset,
             vector_dims,
             num_roots,
             kmeans_iterations
         );
 
-        // 3. Phase 2: Partition
+        // 4. Phase 2: Partition
+        // Assign the loaded TRAINING samples to roots
         let assignments = assign_to_roots_gpu(
-            &full_dataset,
+            &training_dataset,
             &root_centroids,
             vector_dims,
             num_roots
         );
 
-        // 4. Phase 3: Train Leaves
+        // 5. Phase 3: Train Leaves
         info!("🚀 [PHASE 3] Scattering vectors & Training Leaves...");
         let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
 
@@ -115,7 +119,7 @@ pub fn index(
             if label >= 0 && (label as usize) < num_roots as usize {
                 let start = idx * vector_dims as usize;
                 let end = start + vector_dims as usize;
-                buckets[label as usize].extend_from_slice(&full_dataset[start..end]);
+                buckets[label as usize].extend_from_slice(&training_dataset[start..end]);
             }
         }
 
@@ -133,7 +137,7 @@ pub fn index(
             if n_vecs == 0 { continue; }
 
             if root_idx % 20 == 0 {
-                info!("🌿 Root {}/{} | Size: {} | Training Leaves...", root_idx, num_roots, n_vecs);
+                info!("🌿 Root {}/{} | Bucket Size: {} | Training Leaves...", root_idx, num_roots, n_vecs);
             }
 
             let leaf_centroids_flat = train_leaves_for_bucket_gpu(
@@ -151,7 +155,6 @@ pub fn index(
 
         info!("🏁 [HIERARCHY COMPLETE] Trained {} Leaves. Saving...", total_leaves_trained);
         centroids_table::store_centroids(final_results, centroid_table_name.clone(), vector_dims);
-
     // ========================================================================================
     // PATH B: FLAT / LEGACY BUILD
     // Triggered if `lists` has 1 element (e.g. [2000])
