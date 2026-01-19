@@ -6,6 +6,10 @@ use ndarray::{Array1, Array2, ArrayBase, Ix1, OwnedRepr};
 use pgrx::{debug1, info, warning};
 use std::time::Instant;
 
+// ============================================================================================
+// SECTION 1: EXISTING FLAT INDEXING LOGIC
+// ============================================================================================
+
 pub fn run_clustering_batch(
     vectors: Vec<f32>,
     vector_dims: u32,
@@ -328,25 +332,11 @@ pub fn run_clustering_multilevel(
     (centroids_owned, labels_vec)
 }
 
-// alfer changes
-
-
-/// Helper to log stage transitions with memory context
-fn log_stage_start(stage: &str, details: &str) -> Instant {
-    let (free, total) = get_gpu_memory_info();
-    let free_gb = free as f64 / 1024.0 / 1024.0 / 1024.0;
-    info!(
-        "🚀 [STAGE START] {}: {} | VRAM Free: {:.2} GB / {:.2} GB",
-        stage,
-        details,
-        free_gb,
-        total as f64 / 1024.0 / 1024.0 / 1024.0
-    );
-    Instant::now()
-}
+// ============================================================================================
+// SECTION 2: NEW HIERARCHICAL INDEXING LOGIC (Top-Down)
+// ============================================================================================
 
 // PHASE 1: TRAIN ROOTS (Coarse Quantizer)
-// ============================================================================================
 
 /// Trains the top-level "Root" centroids using a safe subset.
 pub fn train_roots_gpu(
@@ -358,16 +348,14 @@ pub fn train_roots_gpu(
     let total_count = full_vectors.len() / vector_dims as usize;
 
     // SAFETY: Cap training at 1M vectors.
-    // Training 400 roots on 1M vectors is statistically optimal (2500:1 ratio).
-    // Using 100M here is wasteful and causes GPU integer overflows.
     let train_limit = 1_000_000;
     let num_train = std::cmp::min(total_count, train_limit);
 
-    info!("🚀 [PHASE 1 START] Training {} Roots on {} sampled vectors (Total dataset: {} )",
+    info!("🚀 [PHASE 1 START] Training {} Roots on {} sampled vectors (Total dataset: {})",
           num_roots, num_train, total_count);
     let start = Instant::now();
 
-    let res = Resources::new().expect("Failed to acquire GPU resources ");
+    let res = Resources::new().expect("Failed to acquire GPU resources");
 
     // 1. Prepare Subset (Host Slice)
     let train_slice = &full_vectors[..(num_train * vector_dims as usize)];
@@ -392,6 +380,7 @@ pub fn train_roots_gpu(
         .set_batch_centroids(0);
 
     // 3. Fit
+    info!("⚙️ [PHASE 1] Launching KMeans::fit kernel...");
     kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
         .expect("Root training failed");
 
@@ -403,9 +392,7 @@ pub fn train_roots_gpu(
     centroids_host.into_raw_vec()
 }
 
-// ============================================================================================
 // PHASE 2: PARTITION (Assign all vectors to Roots)
-// ============================================================================================
 
 /// Assigns ALL vectors to their nearest root centroid.
 /// Returns a parallel Vec<i32> of labels.
@@ -437,12 +424,15 @@ pub fn assign_to_roots_gpu(
         .set_n_clusters(num_roots as i32)
         .set_metric(DistanceType::L2Expanded);
 
+    info!("⚙️ [PHASE 2] Starting batch prediction loop (Batch Size: {})", batch_size);
     while processed < total_vectors {
         let end = std::cmp::min(processed + batch_size, total_vectors);
         let current_batch_len = end - processed;
 
-        if processed % 10_000_000 == 0 {
-             info!("... Partitioned {}/{} vectors ({:.1}%)", processed, total_vectors, (processed as f64 / total_vectors as f64) * 100.0);
+        // Log progress every 10M vectors
+        if processed > 0 && processed % 10_000_000 == 0 {
+             info!("📊 [PHASE 2] Partitioned {}/{} vectors ({:.1}%) - Elapsed: {:.2?}  ",
+                 processed, total_vectors, (processed as f64 / total_vectors as f64) * 100.0, start.elapsed());
         }
 
         // Slice batch
@@ -472,9 +462,7 @@ pub fn assign_to_roots_gpu(
     final_labels
 }
 
-// ============================================================================================
 // PHASE 3: TRAIN LEAVES (Per Bucket)
-// ============================================================================================
 
 /// Trains leaf centroids for a single bucket.
 pub fn train_leaves_for_bucket_gpu(
@@ -488,8 +476,7 @@ pub fn train_leaves_for_bucket_gpu(
     // Safety check for small buckets
     if num_vecs < num_leaves_this_bucket as usize {
         warning!("⚠️ Bucket too small ({} vectors < {} leaves). Using vectors as centroids.", num_vecs, num_leaves_this_bucket);
-        // If we have fewer vectors than target clusters, just return the vectors themselves (padded if needed)
-        // For now, return vectors directly. Real implementation might pad with zeros.
+        // Fallback: return vectors as is
         return bucket_vectors.clone();
     }
 
