@@ -119,36 +119,50 @@ pub fn index(
         let d_p0 = t_p0_start.elapsed();
         */
 
-        // --- PHASE 1: TRAIN ROOTS --- MANUAL QUALITY-CONTROLLED ROOTS ---
-        // This is because cuvs skips K-means n_redo after few attempts
+        // ========================================================================================
+        // PHASE 1: MANUAL QUALITY-CONTROLLED ROOTS
+        // ========================================================================================
         let t_p1_start = Instant::now();
-        let num_attempts = 20; // Running 20 separate trials
+        let num_attempts = 20;
         info!("🏗️ [PHASE 1] Starting Manual Quality-Control (Attempts: {}) ", num_attempts);
 
-        let mut best_roots = Vec::new();
-        let mut lowest_skew = usize::MAX;
-        let mut best_assignments = Vec::new();
+        // Initialize trackers OUTSIDE the loop scope
+        let mut best_roots: Vec<f32> = Vec::new();
+        let mut best_assignments: Vec<i32> = Vec::new();
+        let mut lowest_max_bucket: usize = usize::MAX;
 
         for attempt in 1..=num_attempts {
+            let attempt_start = Instant::now();
+
+            // 1. Train candidate roots on GPU
             let candidate_roots = train_roots_gpu(
                 &training_dataset,
                 vector_dims,
                 num_roots,
                 100, // iterations
-                1    // n_redo (we handle the loop here)
+                1    // single redo (loop handles the rest)
             );
 
-            // Calculate assignments for this attempt
-            let candidate_assignments = assign_to_roots_gpu(&training_dataset, &candidate_roots, vector_dims, num_roots);
+            // 2. PARTITION: Find assignments to evaluate this attempt
+            let candidate_assignments = assign_to_roots_gpu(
+                &training_dataset,
+                &candidate_roots,
+                vector_dims,
+                num_roots
+            );
 
+            // 3. ANALYZE: Count bucket sizes
             let mut counts = vec![0usize; num_roots as usize];
             for &label in &candidate_assignments {
-                if label >= 0 { counts[label as usize] += 1; }
+                if label >= 0 && (label as usize) < num_roots as usize {
+                    counts[label as usize] += 1;
+                }
             }
 
             let current_max = *counts.iter().max().unwrap_or(&usize::MAX);
-            info!("  ↳ Attempt {}: Max Bucket = {}", attempt, current_max);
+            info!("  ↳ Attempt {}: Max Bucket = {} (Time: {:.2?})  ", attempt, current_max, attempt_start.elapsed());
 
+            // 4. UPDATE: If this is the best distribution we've seen, save it
             if current_max < lowest_max_bucket {
                 lowest_max_bucket = current_max;
                 best_roots = candidate_roots;
@@ -156,17 +170,19 @@ pub fn index(
             }
         }
 
+        // Move the best results into the final variables
         let root_centroids = best_roots;
-        let assignments = best_assignments; // This ensures Phase 3 uses the best mapping
-        info!("✅ Selected Best Roots (Max Bucket: {})", lowest_max_bucket);
+        let assignments = best_assignments;
         let d_p1 = t_p1_start.elapsed();
+        info!("✅ Phase 1 Done. Selected Roots with Max Bucket: {}  ", lowest_max_bucket);
 
         // ========================================================================================
         // PHASE 2: PARTITION (Placeholder)
         // ========================================================================================
-        // We already have 'assignments' from Phase 1, so we skip the 95s GPU call here.
+        // Assignments were already computed during the winning attempt of Phase 1
         let d_p2 = std::time::Duration::from_secs(0);
-        info!("🔮 [PHASE 2] Skipping redundant partitioning (Reuse from Phase 1)");
+        info!("🔮 [PHASE 2] Reusing best assignments from Phase 1. Skipped 95s redundant call.");
+
 
         // --- PHASE 3: SCATTER & RESIDUAL TRAINING ---
         let t_p3_start = Instant::now();
