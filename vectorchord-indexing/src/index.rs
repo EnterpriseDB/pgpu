@@ -92,25 +92,47 @@ pub fn index(
         batcher.end_scan();
         info!("✅ Training Dataset Loaded: {} vectors. Time: {:.2?}", loaded_count, start_time.elapsed());
 
-        // 3. Phase 1: Train Roots
-        // We use the full loaded sample (capped internally at 1M by the function for stability if needed)
+        // --- PHASE 0: SUPER ROOT (Global Mean) ---
+        // Level 0: The single center of the entire dataset.
+        let t_p0_start = Instant::now();
+        info!("🌍 [PHASE 0] Calculating Super Root (Global Mean)...");
+        let mut super_root = vec![0.0f32; vector_dims as usize];
+        for chunk in training_dataset.chunks(vector_dims as usize) {
+            for (i, val) in chunk.iter().enumerate() {
+                super_root[i] += val;
+            }
+        }
+
+        let total_vecs_f32 = loaded_count as f32;
+        for val in super_root.iter_mut() {
+            *val /= total_vecs_f32;
+        }
+        let d_p0 = t_p0_start.elapsed();
+
+        // --- PHASE 1: TRAIN ROOTS ---
+        // Level 1: Coarse Clusters
+        let t_p1_start = Instant::now();
         let root_centroids = train_roots_gpu(
             &training_dataset,
             vector_dims,
             num_roots,
             kmeans_iterations
         );
+        let d_p1 = t_p1_start.elapsed();
 
-        // 4. Phase 2: Partition
+        // --- PHASE 2: PARTITION ---
         // Assign the loaded TRAINING samples to roots
+        let t_p2_start = Instant::now();
         let assignments = assign_to_roots_gpu(
             &training_dataset,
             &root_centroids,
             vector_dims,
             num_roots
         );
+        let d_p2 = t_p2_start.elapsed();
 
         // 5. Phase 3: Train Leaves
+        let t_p3_start = Instant::now();
         info!("🚀 [PHASE 3] Scattering vectors & Training Leaves...");
         let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
 
@@ -123,21 +145,41 @@ pub fn index(
             }
         }
 
+        // --- STORAGE ASSEMBLY
+        // Structure: [(Vector, ParentID)]
+        // The Row ID in this vector corresponds to the Centroid ID.
         let mut final_results: Vec<(Vec<f32>, i32)> = Vec::new();
 
-        // Store Roots (Parent = -1)
+        // 1. Store Super Root (ID 0, Parent -1)
+        final_results.push((super_root, -1));
+
+        // 2. Store Roots (IDs 1..400, Parent 0)
+        // We track their IDs to assign them as parents to the leaves
+        let mut root_ids: Vec<i32> = Vec::with_capacity(num_roots as usize);
+
         for root_vec in root_centroids.chunks(vector_dims as usize) {
-            final_results.push((root_vec.to_vec(), -1));
+            let current_id = final_results.len() as i32;
+            final_results.push((root_vec.to_vec(), 0)); // Parent is Super Root (0)
+            root_ids.push(current_id);
         }
 
-        // Train & Store Leaves (Parent = root_idx)
         let mut total_leaves_trained = 0;
-        for (root_idx, bucket_vecs) in buckets.iter().enumerate() {
-            let n_vecs = bucket_vecs.len() / vector_dims as usize;
-            if n_vecs == 0 { continue; }
+        let mut missing_leaves = 0;
 
-            if root_idx % 20 == 0 {
-                info!("🌿 Root {}/{} | Bucket Size: {} | Training Leaves...", root_idx, num_roots, n_vecs);
+        for (i, bucket_vecs) in buckets.iter().enumerate() {
+            let n_vecs = bucket_vecs.len() / vector_dims as usize;
+            // Get the ID of the root that owns this bucket
+            let parent_id = root_ids[i];
+
+            // Edge Case: Empty Bucket (No vectors assigned to this root)
+            if n_vecs == 0 {
+                warning!("⚠️ Root {} (ID {}) is empty! 0 centroids created for this branch.", i, parent_id);
+                missing_leaves += num_leaves_per_root;
+                continue;
+            }
+
+            if i % 20 == 0 {
+                info!("🌿 Root {}/{} | Bucket: {} vectors | Parent ID: {}  ", i, num_roots, n_vecs, parent_id);
             }
 
             let leaf_centroids_flat = train_leaves_for_bucket_gpu(
@@ -147,14 +189,41 @@ pub fn index(
                 15
             );
 
-            for leaf_vec in leaf_centroids_flat.chunks(vector_dims as usize) {
-                final_results.push((leaf_vec.to_vec(), root_idx as i32));
+            // 3. Store Leaves (Parent = The specific Root ID)
+            let leaves_created = leaf_centroids_flat.len() / vector_dims as usize;
+            if leaves_created < num_leaves_per_root as usize {
+                 // This happens if bucket size < requested leaves. It's expected mathematically.
+                 missing_leaves += num_leaves_per_root - (leaves_created as u32);
             }
-            total_leaves_trained += num_leaves_per_root;
-        }
 
-        info!("🏁 [HIERARCHY COMPLETE] Trained {} Leaves. Saving...", total_leaves_trained);
+            for leaf_vec in leaf_centroids_flat.chunks(vector_dims as usize) {
+                final_results.push((leaf_vec.to_vec(), parent_id));
+            }
+            total_leaves_trained += leaves_created as u32;
+        }
+        let d_p3 = t_p3_start.elapsed();
+
+        info!("🏁 [HIERARCHY COMPLETE] Trained {} Leaves ({} missing due to sparsity).", total_leaves_trained, missing_leaves);
+        info!("💾 Total Centroids (Super+Roots+Leaves): {}  ", final_results.len());
+
+        let t_store_start = Instant::now();
         centroids_table::store_centroids(final_results, centroid_table_name.clone(), vector_dims);
+        let d_store = t_store_start.elapsed();
+
+        // --- SUMMARY LOG ---
+        info!(
+            "\n⏱️  [TIMING SUMMARY]\n\
+            \t• 📥 Data Loading:     {:.2?}\n\
+            \t• 🌍 Phase 0 (Global): {:.2?}\n\
+            \t• 🏗️  Phase 1 (Roots):  {:.2?}\n\
+            \t• 🔮 Phase 2 (Part.):  {:.2?}\n\
+            \t• 🌿 Phase 3 (Leaves): {:.2?}\n\
+            \t• 💾 Storage:          {:.2?}\n\
+            \t-----------------------------\n\
+            \t👉 TOTAL TIME:         {:.2?}",
+            d_load, d_p0, d_p1, d_p2, d_p3, d_store, global_start.elapsed()
+        );
+
     // ========================================================================================
     // PATH B: FLAT / LEGACY BUILD
     // Triggered if `lists` has 1 element (e.g. [2000])
