@@ -5,9 +5,6 @@ use pgrx::pg_sys::Datum;
 
 
 pub struct VectorReadBatcher {
-    table_name: String,
-    column_name: String,
-    num_tuples_in_table: Option<u64>,
     num_samples: u64,
     num_samples_per_batch: u64,
     min_samples_per_batch: u64,
@@ -61,6 +58,12 @@ impl VectorReadBatcher {
             info!("✅ Decoding complete. Processed {} rows in {:?}", row_count, decode_start.elapsed());
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((all_vecs, detected_dims))
         }).expect("SPI Error");
+
+        info!(
+            "📊 Sampler Ready: Loaded {} vectors in {:.2?}  ",
+            cached_vectors.len() / (dims as usize),
+            start_time.elapsed()
+        );
 
         VectorReadBatcher {
             table_name,
