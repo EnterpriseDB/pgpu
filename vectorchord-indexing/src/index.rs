@@ -74,6 +74,7 @@ pub fn index(
 
         // 2. Load Samples into RAM
         // We use the batcher to read exactly 'num_samples_to_read'
+        let t_load_start = Instant::now();
         let mut batcher = VectorReadBatcher::new(
             qualified_table.clone(),
             column_name.clone(),
@@ -97,6 +98,7 @@ pub fn index(
             }
         }
         batcher.end_scan();
+        let d_load = t_load_start.elapsed();
         info!("✅ Training Dataset Loaded: {} vectors. Time: {:.2?}", loaded_count, start_time.elapsed());
 
         // --- PHASE 0: SUPER ROOT (Global Mean) ---
