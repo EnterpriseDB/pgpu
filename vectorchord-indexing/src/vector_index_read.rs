@@ -82,7 +82,7 @@ impl VectorReadBatcher {
 
         let safe_dims = if dims == 0 { 1 } else { dims };
 
-        info!("✅ Phase 1 Ready: Loaded {} vectors in {:.2?}", cached_vectors.len() / (safe_dims as usize), start_time.elapsed());
+        info!("✅ Phase 1 Ready: Loaded {} vectors in {:.2?}  ", cached_vectors.len() / (safe_dims as usize), start_time.elapsed());
 
         VectorReadBatcher {
             num_samples,
@@ -96,43 +96,32 @@ impl VectorReadBatcher {
 
     /// Isolated forensic function to check why Postgres might think a table is empty
     fn debug_session_context(table_name: &str) {
-    Spi::connect(|client| {
-        // 1. Get User and Database
-        let user: String = client.select("SELECT current_user", None, &[])
-            .and_then(|t| t.get_one()).unwrap_or(None).unwrap_or_else(|| "NULL_USER".into());
+        Spi::connect(|client| {
+            let user: String = client.select("SELECT current_user", None, &[]).and_then(|t| t.get_one()).unwrap_or(Some("?".into())).unwrap();
+            let db: String = client.select("SELECT current_database()", None, &[]).and_then(|t| t.get_one()).unwrap_or(Some("?".into())).unwrap();
 
-        let database: String = client.select("SELECT current_database()", None, &[])
-            .and_then(|t| t.get_one()).unwrap_or(None).unwrap_or_else(|| "NULL_DB".into());
+            // Simpler metadata check using pgrx select
+            let stats = client.select(
+                &format!("SELECT relpages, reltuples FROM pg_class WHERE oid = '{}'::regclass", table_name),
+                None, &[]
+            );
 
-        // 2. Check table existence in the catalog
-        let oid_check: Option<pgrx::pg_sys::Oid> = client.select(
-            &format!("SELECT '{}'::regclass::oid", table_name), None, &[]
-        ).and_then(|t| t.get_one()).unwrap_or(None);
+            info!("--- [DIAGNOSTIC] ---");
+            info!("👤 User: {} | 📂 DB: {}  ", user, db);
 
-        info!("--- [ROOT CAUSE ANALYSIS] ---");
-        info!("👤 User: [{}] | 📂 DB: [{}] ", user, database);
-
-        match oid_check {
-            Some(oid) => {
-                let stats: (i32, f32) = client.select(
-                    &format!("SELECT relpages, reltuples FROM pg_class WHERE oid = {} ", oid),
-                    None, &[]
-                ).and_then(|t| {
-                    let r = t.get_bin_tuple(1).expect("Tuple error");
-                    let pages: i32 = r.get_datum_by_ordinal(1).unwrap().value().unwrap().unwrap();
-                    let tuples: f32 = r.get_datum_by_ordinal(2).unwrap().value().unwrap().unwrap();
-                    Ok((pages, tuples))
-                }).unwrap_or((0, 0.0));
-
-                info!("🆔 Table OID: {} ", oid);
-                info!("📦 Catalog Pages: {} | 📈 Catalog Tuples: {} ", stats.0, stats.1);
-            },
-            None => debug1!("❌ Table [{}] NOT FOUND in this database!", table_name),
-        }
-        info!("--- [END DEBUG] ---");
-        Ok::<(), pgrx::spi::Error>(())
-    }).ok();
-}
+            if let Ok(table) = stats {
+                for row in table {
+                    let pages: i32 = row.get_datum_by_ordinal(1).unwrap().value().unwrap().unwrap();
+                    let tuples: f32 = row.get_datum_by_ordinal(2).unwrap().value().unwrap().unwrap();
+                    info!("📦 Disk Pages: {} | 📈 Catalog Tuples: {}  ", pages, tuples);
+                }
+            } else {
+                debug1!("❌ Could not find table [{}] in pg_class", table_name);
+            }
+            info!("--- [END DIAGNOSTIC] ---");
+            Ok::<(), pgrx::spi::Error>(())
+        }).ok();
+    }
 
     pub fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
         if self.vectors_read >= self.num_samples || self.dims <= 1 { return None; }
