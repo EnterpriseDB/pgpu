@@ -74,7 +74,7 @@ impl VectorReadBatcher {
             }
 
             if row_count == 0 {
-                error!("❌ FATAL: 0 vectors returned. Check the 'Main Data Query' above in psql.");
+                debug1!("❌ FATAL: 0 vectors returned. Check the 'Main Data Query' above in psql.");
             }
 
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((all_vecs, detected_dims))
@@ -111,7 +111,7 @@ impl VectorReadBatcher {
             info!("📂 Current DB:   {}  ", database);
             info!("📦 Physical Pages (relpages): {}  ", relpages);
             if relpages == 0 {
-                warning!("⚠️ Postgres reports 0 physical pages for {}. This usually means the table is empty or uncommitted.", table_name);
+                debug1!("⚠️ Postgres reports 0 physical pages for {}. This usually means the table is empty or uncommitted.", table_name);
             }
             info!("--- [FORENSIC DEBUG END] ---");
             Ok::<(), pgrx::spi::Error>(())
