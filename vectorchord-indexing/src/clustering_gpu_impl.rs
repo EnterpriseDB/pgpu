@@ -336,9 +336,6 @@ pub fn run_clustering_multilevel(
 // SECTION 2: NEW HIERARCHICAL INDEXING LOGIC (Top-Down)
 // ============================================================================================
 
-// PHASE 1: TRAIN ROOTS (Coarse Quantizer)
-
-/// Trains the top-level "Root" centroids using a safe subset.
 pub fn train_roots_gpu(
     full_vectors: &Vec<f32>,
     vector_dims: u32,
@@ -346,56 +343,35 @@ pub fn train_roots_gpu(
     iterations: u32,
 ) -> Vec<f32> {
     let total_count = full_vectors.len() / vector_dims as usize;
-
-    // SAFETY: Cap training at 1M vectors.
     let train_limit = 1_000_000;
     let num_train = std::cmp::min(total_count, train_limit);
 
-    info!("🚀 [PHASE 1 START] Training {} Roots on {} sampled vectors (Total dataset: {})",
-          num_roots, num_train, total_count);
+    info!("🚀 [PHASE 1 START] Training {} Roots on {} sampled vectors (Total dataset: {} )", num_roots, num_train, total_count);
     let start = Instant::now();
+    let res = Resources::new().expect("GPU Resource failed");
 
-    let res = Resources::new().expect("Failed to acquire GPU resources");
-
-    // 1. Prepare Subset (Host Slice)
     let train_slice = &full_vectors[..(num_train * vector_dims as usize)];
-    let train_array = Array2::from_shape_vec(
-        (num_train, vector_dims as usize),
-        train_slice.to_vec()
-    ).expect("Failed to reshape training sample");
+    let train_array = Array2::from_shape_vec((num_train, vector_dims as usize), train_slice.to_vec()).expect("reshape failed");
+    let dataset = ManagedTensor::from(&train_array).to_device(&res).expect("xfer failed");
+    let mut centroids_gpu = ManagedTensor::from(&Array2::<f32>::zeros((num_roots as usize, vector_dims as usize))).to_device(&res).expect("alloc failed");
 
-    let dataset = ManagedTensor::from(&train_array).to_device(&res).expect("GPU transfer failed");
-
-    let mut centroids_gpu = ManagedTensor::from(&Array2::<f32>::zeros((num_roots as usize, vector_dims as usize)))
-        .to_device(&res).expect("Centroid buffer alloc failed");
-
-    // 2. Configure Parameters (L2Expanded works for IP on normalized vectors)
-    let params = kmeans::Params::new().expect("Params failed")
+    let params = kmeans::Params::new().expect("params failed")
         .set_n_clusters(num_roots as i32)
         .set_max_iter(iterations as i32)
         .set_metric(DistanceType::L2Expanded)
         .set_n_init(1)
-        // Set batching to 0 to let RAFT auto-tune for this small N
         .set_batch_samples(0)
         .set_batch_centroids(0);
 
-    // 3. Fit
-    info!("⚙️ [PHASE 1] Launching KMeans::fit kernel...");
-    kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
-        .expect("Root training failed");
+    kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu).expect("fit failed");
 
-    // 4. Retrieve
     let mut centroids_host = Array2::<f32>::zeros((num_roots as usize, vector_dims as usize));
-    centroids_gpu.to_host(&res, &mut centroids_host).expect("Retrieval failed");
+    centroids_gpu.to_host(&res, &mut centroids_host).expect("retrieval failed");
 
     info!("✅ [PHASE 1 DONE] Roots trained in {:.2?}", start.elapsed());
     centroids_host.into_raw_vec()
 }
 
-// PHASE 2: PARTITION (Assign all vectors to Roots)
-
-/// Assigns ALL vectors to their nearest root centroid.
-/// Returns a parallel Vec<i32> of labels.
 pub fn assign_to_roots_gpu(
     all_vectors: &Vec<f32>,
     root_centroids: &Vec<f32>,
@@ -405,56 +381,41 @@ pub fn assign_to_roots_gpu(
     let total_vectors = all_vectors.len() / vector_dims as usize;
     info!("🚀 [PHASE 2 START] Partitioning {} vectors into {} buckets...", total_vectors, num_roots);
     let start = Instant::now();
-
     let res = Resources::new().expect("GPU Resource failed");
 
-    // Transfer roots to GPU once
-    let roots_array = Array2::from_shape_vec((num_roots as usize, vector_dims as usize), root_centroids.clone())
-        .expect("Roots shape mismatch");
-    let roots_gpu = ManagedTensor::from(&roots_array).to_device(&res).expect("Roots transfer failed");
+    let roots_array = Array2::from_shape_vec((num_roots as usize, vector_dims as usize), root_centroids.clone()).expect("shape failed");
+    let roots_gpu = ManagedTensor::from(&roots_array).to_device(&res).expect("xfer failed");
 
     let mut final_labels = Vec::with_capacity(total_vectors);
-
-    // BATCH GOVERNOR: 2M vectors per batch
-    // 2M * 768 dims * 4 bytes ≈ 6GB VRAM. Safe for RTX 6000.
     let batch_size = 2_000_000;
     let mut processed = 0;
 
-    let params = kmeans::Params::new().expect("Params failed")
+    let params = kmeans::Params::new().expect("params failed")
         .set_n_clusters(num_roots as i32)
         .set_metric(DistanceType::L2Expanded);
 
-    info!("⚙️ [PHASE 2] Starting batch prediction loop (Batch Size: {})", batch_size);
     while processed < total_vectors {
         let end = std::cmp::min(processed + batch_size, total_vectors);
         let current_batch_len = end - processed;
 
-        // Log progress every 10M vectors
         if processed > 0 && processed % 10_000_000 == 0 {
              info!("📊 [PHASE 2] Partitioned {}/{} vectors ({:.1}%) - Elapsed: {:.2?}  ",
                  processed, total_vectors, (processed as f64 / total_vectors as f64) * 100.0, start.elapsed());
         }
 
-        // Slice batch
         let slice_start = processed * vector_dims as usize;
         let slice_end = end * vector_dims as usize;
         let batch_slice = &all_vectors[slice_start..slice_end];
+        let batch_array = Array2::from_shape_vec((current_batch_len, vector_dims as usize), batch_slice.to_vec()).expect("reshape failed");
 
-        let batch_array = Array2::from_shape_vec((current_batch_len, vector_dims as usize), batch_slice.to_vec())
-            .expect("Batch shape mismatch");
-
-        let batch_gpu = ManagedTensor::from(&batch_array).to_device(&res).expect("Batch transfer failed");
+        let batch_gpu = ManagedTensor::from(&batch_array).to_device(&res).expect("xfer failed");
         let mut labels_host = Array1::<i32>::zeros(current_batch_len);
-        let mut labels_gpu = ManagedTensor::from(&labels_host).to_device(&res).expect("Labels alloc failed");
+        let mut labels_gpu = ManagedTensor::from(&labels_host).to_device(&res).expect("alloc failed");
 
-        // Predict
-        kmeans::predict(&res, &params, &batch_gpu, &None, &roots_gpu, &mut labels_gpu, false)
-            .expect("Predict batch failed");
+        kmeans::predict(&res, &params, &batch_gpu, &None, &roots_gpu, &mut labels_gpu, false).expect("predict failed");
 
-        // Copy back
-        labels_gpu.to_host(&res, &mut labels_host).expect("Labels retrieval failed");
+        labels_gpu.to_host(&res, &mut labels_host).expect("retrieval failed");
         final_labels.extend(labels_host.into_iter());
-
         processed += current_batch_len;
     }
 
@@ -462,9 +423,6 @@ pub fn assign_to_roots_gpu(
     final_labels
 }
 
-// PHASE 3: TRAIN LEAVES (Per Bucket)
-
-/// Trains leaf centroids for a single bucket.
 pub fn train_leaves_for_bucket_gpu(
     bucket_vectors: &Vec<f32>,
     vector_dims: u32,
@@ -472,35 +430,27 @@ pub fn train_leaves_for_bucket_gpu(
     iterations: u32,
 ) -> Vec<f32> {
     let num_vecs = bucket_vectors.len() / vector_dims as usize;
-
-    // Safety check for small buckets
     if num_vecs < num_leaves_this_bucket as usize {
-        warning!("⚠️ Bucket too small ({} vectors < {} leaves). Using vectors as centroids.", num_vecs, num_leaves_this_bucket);
-        // Fallback: return vectors as is
+        warning!("⚠️ Bucket too small ({} vectors < {} leaves). Returning raw vectors.", num_vecs, num_leaves_this_bucket);
         return bucket_vectors.clone();
     }
 
     let res = Resources::new().expect("GPU Resource failed");
+    let dataset_array = Array2::from_shape_vec((num_vecs, vector_dims as usize), bucket_vectors.clone()).expect("reshape failed");
+    let dataset = ManagedTensor::from(&dataset_array).to_device(&res).expect("xfer failed");
+    let mut centroids_gpu = ManagedTensor::from(&Array2::<f32>::zeros((num_leaves_this_bucket as usize, vector_dims as usize))).to_device(&res).expect("alloc failed");
 
-    let dataset_array = Array2::from_shape_vec((num_vecs, vector_dims as usize), bucket_vectors.clone())
-        .expect("Bucket shape failed");
-    let dataset = ManagedTensor::from(&dataset_array).to_device(&res).expect("Bucket xfer failed");
-
-    let mut centroids_gpu = ManagedTensor::from(&Array2::<f32>::zeros((num_leaves_this_bucket as usize, vector_dims as usize)))
-        .to_device(&res).expect("Leaf alloc failed");
-
-    let params = kmeans::Params::new().expect("Params failed")
+    let params = kmeans::Params::new().expect("params failed")
         .set_n_clusters(num_leaves_this_bucket as i32)
         .set_max_iter(iterations as i32)
         .set_metric(DistanceType::L2Expanded)
         .set_batch_samples(0)
         .set_batch_centroids(0);
 
-    kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
-        .expect("Leaf fit failed");
+    kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu).expect("fit failed");
 
     let mut centroids_host = Array2::<f32>::zeros((num_leaves_this_bucket as usize, vector_dims as usize));
-    centroids_gpu.to_host(&res, &mut centroids_host).expect("Leaf retrieval failed");
+    centroids_gpu.to_host(&res, &mut centroids_host).expect("retrieval failed");
 
     centroids_host.into_raw_vec()
 }

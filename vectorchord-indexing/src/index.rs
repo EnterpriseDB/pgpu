@@ -1,4 +1,7 @@
-use crate::clustering_gpu_impl;
+use crate::clustering_gpu_impl::{
+    assign_to_roots_gpu, run_clustering_batch, run_clustering_consolidate,
+    train_leaves_for_bucket_gpu, train_roots_gpu,
+};
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
 use crate::vectorchord_index;
@@ -21,6 +24,7 @@ pub fn index(
     spherical_centroids: bool,
     residual_quantization: bool,
 ) {
+    // 1. Validate Inputs & Hardware
     let (num_clusters_top_option, num_clusters_leaf) = match lists.len() {
         1 => (None, lists[0]),
         2 => (Some(lists[0]), lists[1]),
@@ -45,142 +49,195 @@ pub fn index(
 
     let start_time = Instant::now();
 
-    let num_samples = (num_clusters_leaf as u64).saturating_mul(sampling_factor as u64);
-    let num_batches = num_samples.div_ceil(batch_size) as u32;
+    // ========================================================================================
+    // PATH A: TOP-DOWN HIERARCHICAL BUILD (New Logic)
+    // Triggered if `lists` has 2 elements (e.g. [400, 160000])
+    // ========================================================================================
 
-    // the intermediate batch runs need to produce enough output clusters so that the final consolidation run has enough input
-    // we use the same num_samples as configured by the user
-    // Note: typically, you'll want 30-50 data points per cluster. But here, we're just stiching together the pre-trained centroids from the intermediate batches
-    // so a much lower points/clusters ration can be used
-    let num_clusters_per_intermediate_batch: u32 = match num_batches {
-        1 => {
-            info!("clustering properties:\n\t uses_batching: false\n\t lists: {lists:?}");
-            num_clusters_leaf
-        }
-        _ => {
-            let desired_intermediate_batch_clusters = num_clusters_leaf * 4; // * 40;
-            let n = desired_intermediate_batch_clusters / num_batches;
-            info!("clustering properties:\n\t uses_batching: true\n\t num_clusters_per_intermediate_batch: {n}\n\t desired_intermediate_batch_clusters: {desired_intermediate_batch_clusters}\n\t lists: {lists:?}");
-            n
-        }
-    };
-    assert!(num_clusters_leaf > 2, "cluster count must be larger than 2");
-    assert!(
-        num_clusters_per_intermediate_batch > 2,
-        "batch size is too small for clustering"
-    );
-    let mut batcher = VectorReadBatcher::new(
-        qualified_table.clone(),
-        column_name,
-        num_samples,
-        batch_size,
-        num_clusters_per_intermediate_batch as u64,
-    );
+    if let Some(num_roots) = num_clusters_top_option {
+        let num_leaves = num_clusters_leaf;
+        let num_leaves_per_root = num_leaves / num_roots;
 
-    let mut centroids_all: Vec<f32> = Vec::new();
-    let mut weights_all: Vec<f32> = Vec::new();
-    let mut dims: u32 = 0;
+        info!("🏗️ [HIERARCHICAL DETECTED] Starting Top-Down Build (in-memory)");
+        info!("📊 Target: {} Roots | {} Leaves ({} per root)", num_roots, num_leaves, num_leaves_per_root);
 
-    let mut batch_count = 0;
-    while let Some((vecs, batch_dims)) = batcher.next_batch() {
-        batch_count += 1;
-        info!("processing batch ({batch_count}/{num_batches})");
-        dims = batch_dims; // this is not expected to change
-
-        util::print_memory(&vecs, "batch training vectors");
-
-        let (centroids_batch, weights_batch) = run_clustering_batch(
-            vecs,
-            dims,
-            num_clusters_per_intermediate_batch,
-            kmeans_iterations,
-            kmeans_nredo,
-            &distance_operator,
-            spherical_centroids,
+        // 1. Load ALL Data into RAM (as requested)
+        // We use the batcher to drain the table into a single Vec<f32>
+        // NOTE: For 100M vectors @ 768 dims, this requires ~300GB RAM.
+        let num_samples_total = 100_000_000; // Large upper bound to read everything
+        let mut batcher = VectorReadBatcher::new(
+            qualified_table.clone(),
+            column_name.clone(),
+            num_samples_total,
+            batch_size,
+            1, // Unused for simple read
         );
 
-        centroids_all.extend_from_slice(&centroids_batch);
-        weights_all.extend_from_slice(&weights_batch);
-        util::print_memory(&centroids_batch, "centroids from this batch");
-        util::print_memory(&centroids_all, "centroids from all batches");
-        util::print_memory(&weights_all, "weights from all batches");
-    }
-    batcher.end_scan();
-    info!("batches finished in {:.2?}", start_time.elapsed());
+        let mut full_dataset: Vec<f32> = Vec::new();
+        let mut vector_dims = 0;
+        let mut loaded_count = 0;
 
-    let centroids_leaf = if centroids_all.is_empty() {
-        warning!("empty result from kmeans clustering");
-        return;
-    } else if centroids_all.len() == (num_clusters_leaf * dims) as usize {
-        info!("All centroids computed in one batch, skipping re-clusting");
-        centroids_all
-    } else {
-        info!("All centroids computed in multiple batches, starting re-clusting of {} centroids into {num_clusters_leaf} clusters", centroids_all.len()/(dims as usize));
-        run_clustering_consolidate(
-            centroids_all,
-            weights_all,
-            dims,
-            num_clusters_leaf,
-            kmeans_iterations,
-            kmeans_nredo,
-            spherical_centroids,
-        )
-    };
+        info!("📥 Loading dataset into RAM...");
+        while let Some((vecs, dims)) = batcher.next_batch() {
+            if vector_dims == 0 { vector_dims = dims; }
+            loaded_count += vecs.len() / dims as usize;
+            full_dataset.extend(vecs);
 
-    // elements are (centroid, parent_id)
-    // the IDs of the centroids are their vector index
-    let centroids_result: Vec<(Vec<f32>, i32)> = match num_clusters_top_option {
-        None => {
-            // No parent ID if we don't have a top-level list
-            centroids_leaf
-                .chunks(dims as usize)
-                // -1 indicates NULL parent
-                .map(|x| (x.to_vec(), -1))
-                .collect()
+            if loaded_count % 5_000_000 == 0 {
+                info!("... Loaded {} vectors", loaded_count);
+            }
         }
-        Some(num_clusters_top) => {
-            let (centroids_top, parents_leaf) = run_clustering_multilevel(
-                &centroids_leaf,
+        batcher.end_scan();
+        info!("✅ Dataset Loaded: {} vectors. Time: {:.2?}", loaded_count, start_time.elapsed());
+
+        // 2. Phase 1: Train Roots
+        let root_centroids = train_roots_gpu(
+            &full_dataset,
+            vector_dims,
+            num_roots,
+            kmeans_iterations
+        );
+
+        // 3. Phase 2: Partition
+        let assignments = assign_to_roots_gpu(
+            &full_dataset,
+            &root_centroids,
+            vector_dims,
+            num_roots
+        );
+
+        // 4. Phase 3: Train Leaves
+        info!("🚀 [PHASE 3] Scattering vectors & Training Leaves...");
+        let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
+
+        // Scatter
+        for (idx, &label) in assignments.iter().enumerate() {
+            if label >= 0 && (label as usize) < num_roots as usize {
+                let start = idx * vector_dims as usize;
+                let end = start + vector_dims as usize;
+                buckets[label as usize].extend_from_slice(&full_dataset[start..end]);
+            }
+        }
+
+        let mut final_results: Vec<(Vec<f32>, i32)> = Vec::new();
+
+        // Store Roots (Parent = -1)
+        for root_vec in root_centroids.chunks(vector_dims as usize) {
+            final_results.push((root_vec.to_vec(), -1));
+        }
+
+        // Train & Store Leaves (Parent = root_idx)
+        let mut total_leaves_trained = 0;
+        for (root_idx, bucket_vecs) in buckets.iter().enumerate() {
+            let n_vecs = bucket_vecs.len() / vector_dims as usize;
+            if n_vecs == 0 { continue; }
+
+            if root_idx % 20 == 0 {
+                info!("🌿 Root {}/{} | Size: {} | Training Leaves...", root_idx, num_roots, n_vecs);
+            }
+
+            let leaf_centroids_flat = train_leaves_for_bucket_gpu(
+                bucket_vecs,
+                vector_dims,
+                num_leaves_per_root,
+                15
+            );
+
+            for leaf_vec in leaf_centroids_flat.chunks(vector_dims as usize) {
+                final_results.push((leaf_vec.to_vec(), root_idx as i32));
+            }
+            total_leaves_trained += num_leaves_per_root;
+        }
+
+        info!("🏁 [HIERARCHY COMPLETE] Trained {} Leaves. Saving...", total_leaves_trained);
+        centroids_table::store_centroids(final_results, centroid_table_name.clone(), vector_dims);
+
+    // ========================================================================================
+    // PATH B: FLAT / LEGACY BUILD
+    // Triggered if `lists` has 1 element (e.g. [2000])
+    // ========================================================================================
+    } else {
+        info!("🏗️ [FLAT DETECTED] Running Bottom-Up Batch Clustering");
+
+        let num_samples = (num_clusters_leaf as u64).saturating_mul(sampling_factor as u64);
+        let num_batches = num_samples.div_ceil(batch_size) as u32;
+
+        let num_clusters_per_intermediate_batch: u32 = match num_batches {
+            1 => num_clusters_leaf,
+            _ => {
+                let target = num_clusters_leaf * 4;
+                std::cmp::max(target / num_batches, 3) // Ensure at least 3
+            }
+        };
+
+        let mut batcher = VectorReadBatcher::new(
+            qualified_table.clone(),
+            column_name.clone(),
+            num_samples,
+            batch_size,
+            num_clusters_per_intermediate_batch as u64,
+        );
+
+        let mut centroids_all: Vec<f32> = Vec::new();
+        let mut weights_all: Vec<f32> = Vec::new();
+        let mut dims: u32 = 0;
+        let mut batch_count = 0;
+
+        while let Some((vecs, batch_dims)) = batcher.next_batch() {
+            batch_count += 1;
+            info!("processing batch ({batch_count}/{num_batches})");
+            dims = batch_dims;
+
+            util::print_memory(&vecs, "batch training vectors");
+
+            let (centroids_batch, weights_batch) = run_clustering_batch(
+                vecs,
                 dims,
-                num_clusters_top,
+                num_clusters_per_intermediate_batch,
+                kmeans_iterations,
+                kmeans_nredo,
+                &distance_operator,
+                spherical_centroids,
+            );
+
+            centroids_all.extend_from_slice(&centroids_batch);
+            weights_all.extend_from_slice(&weights_batch);
+        }
+        batcher.end_scan();
+
+        // Consolidate Results
+        let centroids_leaf = if centroids_all.is_empty() {
+            warning!("empty result from kmeans clustering");
+            return;
+        } else if centroids_all.len() == (num_clusters_leaf * dims) as usize {
+            centroids_all
+        } else {
+            info!("Consolidating {} centroids into {}...", centroids_all.len() / dims as usize, num_clusters_leaf);
+            run_clustering_consolidate(
+                centroids_all,
+                weights_all,
+                dims,
+                num_clusters_leaf,
                 kmeans_iterations,
                 kmeans_nredo,
                 spherical_centroids,
-            );
-            let centroids_leaf_chunked: Vec<Vec<f32>> = centroids_leaf
-                .chunks(dims as usize)
-                .map(|x| x.to_vec())
-                .collect();
+            )
+        };
 
-            // we'll add the chunked top centroids first and then append the leaf ones
-            let mut centroids_all_chunked: Vec<Vec<f32>> = centroids_top
-                .chunks(dims as usize)
-                .map(|x| x.to_vec())
-                .collect();
-            // init the NULL parents for the top centroids then append the leaf ones
-            let mut parents_all = vec![-1; centroids_all_chunked.len()];
+        // Format for Storage (Parent = -1 for flat)
+        let centroids_result: Vec<(Vec<f32>, i32)> = centroids_leaf
+            .chunks(dims as usize)
+            .map(|x| (x.to_vec(), -1))
+            .collect();
 
-            centroids_all_chunked.extend(centroids_leaf_chunked);
-            parents_all.extend(parents_leaf);
-            assert_eq!(
-                centroids_all_chunked.len(),
-                parents_all.len(),
-                "number of centroids and parents must match"
-            );
+        centroids_table::store_centroids(centroids_result, centroid_table_name.clone(), dims);
+    }
 
-            centroids_all_chunked
-                .into_iter()
-                .zip(parents_all.into_iter())
-                .collect()
-        }
-    };
-
-    centroids_table::store_centroids(centroids_result, centroid_table_name.clone(), dims);
+    // ========================================================================================
+    // CREATE INDEX (Common Step)
+    // ========================================================================================
     if !skip_index_build {
-        info!(
-            "clustering all samples finished in {:.2?}. Calling vectorchord index creation",
-            start_time.elapsed()
-        );
+        info!("💾 Training complete ({:.2?}). Building VectorChord Index...", start_time.elapsed());
         vectorchord_index::create_vectorchord_index(
             table,
             qualified_table,
@@ -189,109 +246,7 @@ pub fn index(
             residual_quantization,
         );
     } else {
-        info!(
-        "clustering all samples finished in {:.2?}. SKIPPING vectorchord index creation; skip_index_build=true is set",
-        start_time.elapsed()
-    );
+        info!("🛑 Skipping index build (skip_index_build=true). Centroids saved.");
     }
 }
-
-// ============================================================================================
-// NEW FUNCTION: Top-Down Hierarchical Index Builder
-// Call this function explicitly when you want to use the new Top-Down path
-// ============================================================================================
-
-pub fn build_hierarchical_index(
-    vectors: Vec<f32>,
-    vector_dims: u32,
-    num_roots: u32,
-    num_leaves: u32,
-    centroid_table_name: String, // Added to allow storage
-) {
-    let total_vectors = vectors.len() / vector_dims as usize;
-    // Calculate leaves per root based on total target
-    let num_leaves_per_root = num_leaves / num_roots;
-
-    info!("🏗️ [HIERARCHICAL BUILD] Starting Top-Down Index Construction");
-    info!("📊 Dataset: {} vectors | Root K: {} | Total Leaves: {} | Leaves/Root: {}",
-          total_vectors, num_roots, num_leaves, num_leaves_per_root);
-
-    let start_total = Instant::now();
-
-    // --- PHASE 1: TRAIN ROOTS ---
-    let root_centroids = clustering_gpu_impl::train_roots_gpu(
-        &vectors,
-        vector_dims,
-        num_roots,
-        20 // iterations
-    );
-
-    // --- PHASE 2: PARTITION ---
-    let assignments = clustering_gpu_impl::assign_to_roots_gpu(
-        &vectors,
-        &root_centroids,
-        vector_dims,
-        num_roots
-    );
-
-    // --- PHASE 3: SCATTER & TRAIN LEAVES ---
-    info!("🚀 [PHASE 3 START] Scattering vectors into {} buckets...", num_roots);
-
-    let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
-
-    // CPU Scatter
-    for (idx, &label) in assignments.iter().enumerate() {
-        if label >= 0 && (label as usize) < num_roots as usize {
-            let start = idx * vector_dims as usize;
-            let end = start + vector_dims as usize;
-            buckets[label as usize].extend_from_slice(&vectors[start..end]);
-        }
-    }
-
-    info!("📦 Buckets prepared. Starting Leaf Training...");
-
-    // Result container: (CentroidVector, ParentID)
-    let mut final_results: Vec<(Vec<f32>, i32)> = Vec::new();
-
-    // 1. Add Roots First (Parent ID = -1)
-    // The index of these roots in `final_results` becomes their implicit ID (0 to num_roots-1)
-    for root_vec in root_centroids.chunks(vector_dims as usize) {
-        final_results.push((root_vec.to_vec(), -1));
-    }
-
-    let mut total_leaves_trained = 0;
-
-    for (root_idx, bucket_vecs) in buckets.iter().enumerate() {
-        let n_vecs = bucket_vecs.len() / vector_dims as usize;
-
-        // Skip empty buckets
-        if n_vecs == 0 { continue; }
-
-        if root_idx % 20 == 0 {
-            info!("🌿 Root {}/{} | Bucket: {} vectors | Training {} leaves",
-                  root_idx, num_roots, n_vecs, num_leaves_per_root);
-        }
-
-        let leaf_centroids_flat = clustering_gpu_impl::train_leaves_for_bucket_gpu(
-            bucket_vecs,
-            vector_dims,
-            num_leaves_per_root,
-            15
-        );
-
-        // 2. Add Leaves (Parent ID = root_idx)
-        // Since we pushed roots first in order 0..N, 'root_idx' correctly points to the parent
-        for leaf_vec in leaf_centroids_flat.chunks(vector_dims as usize) {
-            final_results.push((leaf_vec.to_vec(), root_idx as i32));
-        }
-
-        total_leaves_trained += num_leaves_per_root;
-    }
-
-    info!("🏁 [HIERARCHY COMPLETE] Trained {} Total Leaves across {} Roots. Total Time: {:.2?}",
-          total_leaves_trained, num_roots, start_total.elapsed());
-
-    // --- STORAGE ---
-    info!("💾 Storing {} centroids to table '{}'...", final_results.len(), centroid_table_name);
-    centroids_table::store_centroids(final_results, centroid_table_name, vector_dims);
 }
