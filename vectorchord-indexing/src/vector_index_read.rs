@@ -110,3 +110,56 @@ impl VectorReadBatcher {
 
                     if vectors_loaded >= num_samples {
                         break;
+                    }
+                }
+            }
+
+            // 7. CLEANUP
+            pg_sys::heap_endscan(scan_desc);
+            pg_sys::table_close(rel, pg_sys::AccessShareLock as i32);
+
+            if !snapshot.is_null() {
+                pg_sys::PopActiveSnapshot();
+            }
+        }
+
+        let safe_dims = if detected_dims == 0 { 1 } else { detected_dims };
+        let count_loaded = vecs.len() / (safe_dims as usize);
+
+        if count_loaded == 0 {
+             panic!("FATAL: [Safe Scan] Read 0 vectors. The disk is empty.");
+        }
+
+        info!("✅ [Safe Scan] Success: Loaded {} vectors in {:.2?}", count_loaded, start_time.elapsed());
+
+        VectorReadBatcher {
+            num_samples,
+            num_samples_per_batch,
+            min_samples_per_batch,
+            vectors_read: 0,
+            cached_vectors: vecs,
+            dims: safe_dims,
+        }
+    }
+
+    pub fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
+        if self.cached_vectors.is_empty() || self.vectors_read >= self.num_samples { return None; }
+
+        let mut to_read = self.num_samples_per_batch as usize;
+        let remaining = (self.num_samples - self.vectors_read) as usize;
+        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize {
+            to_read = remaining;
+        }
+
+        let start = (self.vectors_read as usize) * (self.dims as usize);
+        let end = start + (to_read * self.dims as usize);
+
+        if end > self.cached_vectors.len() { return None; }
+
+        let batch = self.cached_vectors[start..end].to_vec();
+        self.vectors_read += to_read as u64;
+        Some((batch, self.dims))
+    }
+
+    pub(crate) fn end_scan(self) {}
+}
