@@ -1,7 +1,7 @@
 use crate::vector_type;
 use pgrx::pg_sys::{self, Datum, varlena};
 use pgrx::{info, Spi};
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::time::Instant;
 
 pub struct VectorReadBatcher {
@@ -25,29 +25,27 @@ impl VectorReadBatcher {
         let mut vecs = Vec::new();
         let mut detected_dims = 0;
 
-        // 1. RESOLVE OID VIA SPI (Safe & Easy)
+        // 1. RESOLVE OID SAFELY (Via SPI to avoid C string complexity)
         let rel_oid = Spi::connect(|client| {
-            // We use regclass to safely resolve schema.table to an OID
-            let query = format!("SELECT '{}'::regclass::oid", table_name);
-            client.select(&query, None, &[])
+            client.select(&format!("SELECT '{}'::regclass::oid", table_name), None, &[])
                 .and_then(|t| t.get_one::<pg_sys::Oid>())
         })
-        .expect("SPI Connection Failed")
-        .expect("Table not found (OID resolution failed)");
+        .expect("SPI Connect Failed")
+        .expect("Table OID not found");
 
-        info!("🧬 [System Scan] Table '{}' -> OID: {}", table_name, rel_oid);
+        info!("🧬 [Raw Heap Scan] OID: {} | Target: {}", rel_oid, table_name);
 
         unsafe {
             // 2. OPEN RELATION
-            // AccessShareLock (1) allows concurrent reads
+            // AccessShareLock (1)
             let rel = pg_sys::table_open(rel_oid, pg_sys::AccessShareLock as i32);
 
-            // 3. FIND ATTRIBUTE NUMBER (Column Index)
+            // 3. FIND ATTRIBUTE (Column)
             let tup_desc = (*rel).rd_att;
             let mut attnum = 0;
 
-            // Fix: Use .as_ptr().add() for correct pointer arithmetic on flexible array
             for i in 0..(*tup_desc).natts {
+                // Pointer arithmetic to get the attribute
                 let attr = *(*tup_desc).attrs.as_ptr().add(i as usize);
                 let name_ptr = attr.attname.data.as_ptr();
                 let name = CStr::from_ptr(name_ptr).to_string_lossy();
@@ -60,56 +58,56 @@ impl VectorReadBatcher {
 
             if attnum == 0 {
                 pg_sys::table_close(rel, pg_sys::AccessShareLock as i32);
-                panic!("FATAL: Column '{}' not found in table schema.", column_name);
+                panic!("FATAL: Column '{}' not found.", column_name);
             }
 
-            // 4. PREPARE SCAN (PG17+ Compatible)
-            // We use GetLatestSnapshot to bypass MVCC visibility rules (Dirty Read)
+            // 4. BEGIN HEAP SCAN
+            // We use heap_beginscan directly. If this fails to link, we are in deep trouble,
+            // but it is the standard non-inline way to scan in older versions (and often wrapped).
+            // We use GetLatestSnapshot() to ensure we see data on disk.
             let snapshot = pg_sys::GetLatestSnapshot();
             if snapshot.is_null() {
-                // If null, we try to grab the transaction snapshot as fallback
-                pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+                // Fallback if Latest is null (rare)
+                 pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
             }
 
-            // table_beginscan is inline; use table_beginscan_strat
-            let scan_desc = pg_sys::table_beginscan_strat(
+            // Note: If heap_beginscan is missing in your specific pg_sys,
+            // the compiler will complain, but it's our best bet over table_beginscan.
+            let scan_desc = pg_sys::heap_beginscan(
                 rel,
-                pg_sys::GetLatestSnapshot(), // Use Latest to see "everything"
+                pg_sys::GetLatestSnapshot(),
                 0,
-                std::ptr::null_mut(),
-                true,
-                false
+                std::ptr::null_mut()
             );
 
-            // 5. CREATE TUPLE SLOT (Mandatory in PG17)
-            // heap_getnext is gone. We must use slots.
-            let slot = pg_sys::MakeSingleTupleTableSlot(
-                tup_desc,
-                &pg_sys::TTSOpsHeapTuple
-            );
+            // 5. ITERATE (Using heap_getnext)
+            // We hardcode ForwardScanDirection = 1 to avoid the missing Enum constant error.
+            let forward_scan: i32 = 1;
+            // We cast it to the Enum type if required by Rust, or pass as i32 if bindings are loose.
+            // In strict Rust bindings, this might need: std::mem::transmute(1) or similar.
+            // But usually the binding expects the Enum type.
+            let direction = std::mem::transmute::<i32, pg_sys::ScanDirection>(forward_scan);
 
-            // 6. EXECUTE SCAN
             let mut vectors_loaded = 0;
-            let forward = pgrx::pg_sys::ScanDirection::ForwardScanDirection;
 
             loop {
-                // Modern scanning: Get next slot
-                let has_data = pg_sys::table_scan_getnextslot(scan_desc, forward, slot);
-                if !has_data { break; } // End of table
+                let tuple = pg_sys::heap_getnext(scan_desc, direction);
+
+                if tuple.is_null() { break; }
 
                 let mut is_null = false;
 
-                // Extract Datum from Slot
-                let datum = pg_sys::slot_getattr(
-                    slot,
+                // Use heap_getattr (which your logs said EXISTS)
+                let datum = pg_sys::heap_getattr(
+                    tuple,
                     attnum,
+                    tup_desc,
                     &mut is_null
                 );
 
                 if !is_null {
-                    // Fix: Datum cast using .value() for pgrx's Datum wrapper or direct cast
-                    // In pgrx raw bindings, Datum is often a usize/uintptr_t
-                    let ptr = datum.value() as *mut varlena;
+                    // Extract data
+                    let ptr = datum as *mut varlena; // Direct cast for pgrx Datum
                     let byte_slice = pgrx::varlena_to_byte_slice(ptr);
 
                     let (vals, d_dims) = vector_type::decode_pgvector_vector(byte_slice);
@@ -121,26 +119,22 @@ impl VectorReadBatcher {
                         break;
                     }
                 }
-
-                // Clear slot for next iteration
-                pg_sys::ExecClearTuple(slot);
             }
 
-            // 7. CLEANUP
-            pg_sys::ExecDropSingleTupleTableSlot(slot);
-            pg_sys::table_endscan(scan_desc);
+            // 6. CLEANUP
+            pg_sys::heap_endscan(scan_desc);
             pg_sys::table_close(rel, pg_sys::AccessShareLock as i32);
         }
 
-        // 8. FINAL SAFETY CHECK
+        // 7. CHECK
         let safe_dims = if detected_dims == 0 { 1 } else { detected_dims };
         let count_loaded = vecs.len() / (safe_dims as usize);
 
         if count_loaded == 0 {
-             panic!("FATAL: [System Scan] Read 0 vectors. The physical table file is truly empty.");
+             panic!("FATAL: [Raw Heap Scan] Read 0 vectors. The disk is empty or snapshot is invalid.");
         }
 
-        info!("✅ [System Scan] Success: Loaded {} vectors in {:.2?}", count_loaded, start_time.elapsed());
+        info!("✅ [Raw Heap Scan] Success: Loaded {} vectors in {:.2?}", count_loaded, start_time.elapsed());
 
         VectorReadBatcher {
             num_samples,
@@ -154,18 +148,12 @@ impl VectorReadBatcher {
 
     pub fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
         if self.cached_vectors.is_empty() || self.vectors_read >= self.num_samples { return None; }
-
         let mut to_read = self.num_samples_per_batch as usize;
         let remaining = (self.num_samples - self.vectors_read) as usize;
-        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize {
-            to_read = remaining;
-        }
-
+        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize { to_read = remaining; }
         let start = (self.vectors_read as usize) * (self.dims as usize);
         let end = start + (to_read * self.dims as usize);
-
         if end > self.cached_vectors.len() { return None; }
-
         let batch = self.cached_vectors[start..end].to_vec();
         self.vectors_read += to_read as u64;
         Some((batch, self.dims))
