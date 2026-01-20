@@ -1,6 +1,7 @@
 use crate::vector_type;
 use pgrx::pg_sys::{self, Datum, varlena};
-use pgrx::{info, Spi, warning};
+use pgrx::info; // info! macro
+use std::ffi::{CStr, CString}; // <--- FIXED IMPORTS
 use std::time::Instant;
 
 pub struct VectorReadBatcher {
@@ -14,138 +15,104 @@ pub struct VectorReadBatcher {
 
 impl VectorReadBatcher {
     pub fn new(
-        raw_table_name: String,
+        table_name: String,
         column_name: String,
         num_samples: u64,
         num_samples_per_batch: u64,
         min_samples_per_batch: u64,
     ) -> Self {
         let start_time = Instant::now();
+        let mut vecs = Vec::new();
+        let mut detected_dims = 0;
 
-        // 1. FORCE "DIRTY READ" VISIBILITY (Crucial for Cold Start)
-        // We use GetLatestSnapshot() to bypass transaction isolation and see
-        // data that exists on disk immediately after DB startup.
         unsafe {
-            pg_sys::SetCurrentStatementStartTimestamp();
-            if !pg_sys::ActiveSnapshotSet() {
-                let snap = pg_sys::GetLatestSnapshot();
-                if snap.is_null() {
-                    // If even Latest is null, we are too early, but we try anyway.
-                    warning!("⚠️ Critical: GetLatestSnapshot() returned NULL. Reading might fail.");
-                } else {
-                    pg_sys::PushActiveSnapshot(snap);
-                }
-            }
-        }
+            // 1. RESOLVE TABLE OID (System Level)
+            // Convert Rust String -> CString -> Postgres Text* -> QualifiedName List
+            let c_name = CString::new(table_name.clone()).expect("Invalid table name");
+            let text_ptr = pg_sys::cstring_to_text(c_name.as_ptr());
+            let raw_name_list = pg_sys::textToQualifiedNameList(text_ptr);
 
-        // 2. STRICT QUOTING (Fixes "public.table" -> "\"public\".\"table\"")
-        let quoted_table = if raw_table_name.contains('.') {
-            raw_table_name.split('.')
-                .map(|part| format!("\"{}\"", part))
-                .collect::<Vec<_>>()
-                .join(".")
-        } else {
-            format!("\"{}\"", raw_table_name)
-        };
+            // Create RangeVar (abstract table reference)
+            let range_var = pg_sys::makeRangeVarFromNameList(raw_name_list);
 
-        // 3. TRY COUNT (But Ignore Failure)
-        let total_rows = Spi::connect(|client| {
-            client.select(&format!("SELECT count(*) FROM {}", quoted_table), None, &[])
-                .and_then(|t| t.get_one::<i64>())
-                .unwrap_or(Some(0))
-                .unwrap_or(0)
-        });
-
-        // 4. CALCULATE OFFSET (Fallback to 0 if count failed)
-        let offset = if total_rows > num_samples as i64 {
-             Spi::connect(|client| {
-                let max_off = total_rows - num_samples as i64;
-                client.select(&format!("SELECT (random() * {})::bigint", max_off), None, &[])
-                    .and_then(|t| t.get_one::<i64>()).unwrap_or(Some(0)).unwrap_or(0)
-            })
-        } else {
-            // This is the fix for "0 rows found": We ignore the count and read anyway.
-            info!("⚠️ Count was 0/Null. Defaulting to OFFSET 0 to force-read data.");
-            0
-        };
-
-        info!("🎯 [VectorChord] Target: {} | Offset: {} | Attempting to read {} vectors", quoted_table, offset, num_samples);
-
-        // 5. EXECUTE BLIND LOAD
-        let (cached_vectors, dims) = Spi::connect(|client| {
-            let mut vecs = Vec::new();
-            let mut detected_dims = 0;
-
-            // Debug Log: Prove we are connected to the right DB
-            let db = client.select("SELECT current_database()", None, &[])
-                .and_then(|t| t.get_one::<String>())
-                .unwrap_or(Some("?".to_string()))
-                .unwrap_or("?".to_string());
-
-            if vecs.is_empty() {
-                info!("🌍 Internal DB Context: [{}]", db);
-            }
-
-            // The Query: Sequential Block Read
-            let query = format!(
-                "SELECT \"{}\" FROM {} OFFSET {} LIMIT {}",
-                column_name, quoted_table, offset, num_samples
+            // Get OID.
+            // args: RangeVar, LockMode (NoLock), missing_ok (false)
+            let rel_oid = pg_sys::RangeVarGetRelid(
+                range_var,
+                pg_sys::NoLock as i32,
+                false
             );
 
-            let table = client.select(&query, None, &[]).expect("Select Failed");
+            info!("🧬 [System Scan] Resolved Table '{}' -> OID: {}", table_name, rel_oid);
 
-            for row in table {
-                let datum = row.get_datum_by_ordinal(1).expect("Col missing").value::<Datum>();
-                if let Ok(Some(d)) = datum {
-                    let byte_slice = unsafe {
-                        pgrx::varlena_to_byte_slice(d.cast_mut_ptr::<varlena>())
-                    };
-                    let (vals, d_dims) = vector_type::decode_pgvector_vector(byte_slice);
-                    if detected_dims == 0 { detected_dims = d_dims; }
-                    vecs.extend(vals);
+            // 2. OPEN RELATION
+            // AccessShareLock lets us read while others read
+            let rel = pg_sys::table_open(rel_oid, pg_sys::AccessShareLock as i32);
+
+            // 3. FIND COLUMN ATTRIBUTE
+            let tup_desc = (*rel).rd_att;
+            let mut attnum = 0;
+
+            // Iterate over table columns (attributes)
+            for i in 0..(*tup_desc).natts {
+                let attr = *(*tup_desc).attrs.add(i as usize);
+                let name_ptr = attr.attname.data.as_ptr();
+                let name = CStr::from_ptr(name_ptr).to_string_lossy(); // <--- Standard CStr usage
+
+                if name == column_name {
+                    attnum = attr.attnum;
+                    break;
                 }
             }
-            Ok::<(Vec<f32>, u32), pgrx::spi::Error>((vecs, detected_dims))
-        }).expect("SPI Load Failed");
 
-        // 6. CLEANUP SNAPSHOT
-        unsafe {
-            if pg_sys::ActiveSnapshotSet() {
-                pg_sys::PopActiveSnapshot();
+            if attnum == 0 {
+                pg_sys::table_close(rel, pg_sys::AccessShareLock as i32);
+                panic!("FATAL: Column '{}' not found in table schema.", column_name);
             }
-        }
 
-        let safe_dims = if dims == 0 { 1 } else { dims };
-        let count_loaded = cached_vectors.len() / (safe_dims as usize);
+            // 4. BEGIN SCAN (Using GetLatestSnapshot for Dirty Read)
+            // We use GetLatestSnapshot() to see the raw disk state
+            let snapshot = pg_sys::GetLatestSnapshot();
 
-        if count_loaded == 0 {
-             pgrx::error!("FATAL: Still read 0 rows. Confirm 'VACUUM ANALYZE' was run and table '{}' is in DB.", quoted_table);
-        }
+            let scan_desc = pg_sys::table_beginscan(
+                rel,
+                snapshot,
+                0,
+                std::ptr::null_mut()
+            );
 
-        info!("✅ [VectorChord] Success: Loaded {} vectors in {:.2?}", count_loaded, start_time.elapsed());
+            // 5. ITERATE HEAP TUPLES
+            let mut vectors_loaded = 0;
+            // Optional: You can implement a counter here to skip N rows for "offset"
+            // let skip_count = 0;
 
-        VectorReadBatcher {
-            num_samples,
-            num_samples_per_batch,
-            min_samples_per_batch,
-            vectors_read: 0,
-            cached_vectors,
-            dims: safe_dims,
-        }
-    }
+            loop {
+                // Get next raw tuple from disk
+                let tuple = pg_sys::heap_getnext(scan_desc, pg_sys::ForwardScanDirection);
 
-    pub fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
-        if self.cached_vectors.is_empty() || self.vectors_read >= self.num_samples { return None; }
-        let mut to_read = self.num_samples_per_batch as usize;
-        let remaining = (self.num_samples - self.vectors_read) as usize;
-        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize { to_read = remaining; }
-        let start = (self.vectors_read as usize) * (self.dims as usize);
-        let end = start + (to_read * self.dims as usize);
-        if end > self.cached_vectors.len() { return None; }
-        let batch = self.cached_vectors[start..end].to_vec();
-        self.vectors_read += to_read as u64;
-        Some((batch, self.dims))
-    }
+                // If tuple is null, we reached the end of the file
+                if tuple.is_null() {
+                    break;
+                }
 
-    pub(crate) fn end_scan(self) {}
-}
+                // Extract the specific column (Datum)
+                let mut is_null = false;
+                let datum = pg_sys::heap_getattr(
+                    tuple,
+                    attnum,
+                    tup_desc,
+                    &mut is_null
+                );
+
+                if !is_null {
+                    // Cast Datum -> varlena* -> Byte Slice
+                    let byte_slice = pgrx::varlena_to_byte_slice(datum as *mut varlena);
+                    let (vals, d_dims) = vector_type::decode_pgvector_vector(byte_slice);
+
+                    if detected_dims == 0 { detected_dims = d_dims; }
+                    vecs.extend(vals);
+                    vectors_loaded += 1;
+
+                    if vectors_loaded >= num_samples {
+                        break;
+                    }
