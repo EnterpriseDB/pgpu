@@ -36,7 +36,7 @@ impl VectorReadBatcher {
         let total_rows: u64 = Spi::connect(|client| {
             let count_query = format!("SELECT COUNT(1) FROM {}", quoted_table);
             let result = client.select(&count_query, None, &[])?;
-            let count: i64 = result.first().get_datum_by_ordinal(1)?.unwrap_or(Datum).into();
+            let count: i64 = result.first().get_datum_by_ordinal(1)?.unwrap_or(0).into();
             Ok::<u64, pgrx::spi::Error>(count as u64)
         }).expect("FATAL: Failed to count rows");
 
@@ -45,7 +45,7 @@ impl VectorReadBatcher {
         }
 
         // Generate a random offset
-        let random_offset: u64 = rand::rng().random_range(0..total_rows.saturating_sub(num_samples));
+        let random_offset: u64 = rand::thread_rng().gen_range(0..total_rows.saturating_sub(num_samples));
 
         info!("🚀 [SQL Load] Reading {} samples from '{}' with random offset {}", num_samples, quoted_table, random_offset);
 
@@ -67,10 +67,9 @@ impl VectorReadBatcher {
                         pgrx::varlena_to_byte_slice(datum.cast_mut_ptr::<pgrx::pg_sys::varlena>())
                     };
 
-                    let (vals, d_dims) = vector_type::decode_pgvector_vector(byte_slice);
-
-                    if internal_dims == 0 { internal_dims = d_dims; }
+                    let (vals, dims) = vector_type::decode_pgvector_vector(byte_slice);
                     internal_vecs.extend(vals);
+                    internal_dims = dims;
                 }
             }
 
@@ -116,7 +115,7 @@ impl VectorReadBatcher {
 
         // Generate a random offset within bounds
         let max_offset = self.num_samples.saturating_sub(samples_to_read);
-        let random_offset = rand::rng().random_range(0..=max_offset);
+        let random_offset = rand::thread_rng().gen_range(0..=max_offset);
 
         info!(
             "({vectors_read}/{num_samples}) Reading next batch of {samples_to_read} vectors with random offset {random_offset}...",
