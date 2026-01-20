@@ -26,9 +26,8 @@ impl VectorReadBatcher {
         let mut detected_dims = 0;
 
         unsafe {
-            // 1. SETUP SNAPSHOT (CRITICAL FIX)
-            // We push the snapshot BEFORE doing anything else.
-            // GetLatestSnapshot() ignores transaction rules and sees disk data directly.
+            // 1. SETUP SNAPSHOT (Dirty Read)
+            // Essential for background workers starting early in the lifecycle.
             let mut snapshot = pg_sys::GetLatestSnapshot();
             if snapshot.is_null() {
                 snapshot = pg_sys::GetTransactionSnapshot();
@@ -37,37 +36,32 @@ impl VectorReadBatcher {
                 pg_sys::PushActiveSnapshot(snapshot);
             }
 
-            // 2. RESOLVE TABLE (Pure C-API, No SPI)
-            // We construct a RangeVar (internal representation of "schema.table")
-            // and ask Postgres to open it.
+            // 2. RESOLVE OID (Using RangeVarGetRelidExtended)
             let c_name = CString::new(table_name.clone()).expect("Invalid table name");
-
-            // makeRangeVarFromNameList expects a List*, which is hard to construct manually.
-            // Instead, we try the string-to-text path which is standard.
             let text_ptr = pg_sys::cstring_to_text(c_name.as_ptr());
             let list_ptr = pg_sys::textToQualifiedNameList(text_ptr);
             let range_var = pg_sys::makeRangeVarFromNameList(list_ptr);
 
-            // table_openrv works like table_open but takes the RangeVar we just made.
-            // If table_openrv is missing, we fall back to finding OID manually.
-            // Based on PG17, RangeVarGetRelid is the safe bet.
-            let rel_oid = pg_sys::RangeVarGetRelid(
+            // PG17 Signature: (relation, lockmode, flags, callback, callback_arg)
+            // flags=0 (Default), callback=None, callback_arg=NULL
+            let rel_oid = pg_sys::RangeVarGetRelidExtended(
                 range_var,
-                pg_sys::NoLock as i32,
-                false // missing_ok? False = Panic if missing
+                pg_sys::AccessShareLock as i32,
+                0,                  // flags (0 = Panic if missing)
+                None,               // callback
+                std::ptr::null_mut()// callback_arg
             );
 
-            info!("🧬 [System Scan] Resolved OID: {}", rel_oid);
+            info!("🧬 [System Scan] Resolved OID: {} for table '{}'", rel_oid, table_name);
 
             // 3. OPEN RELATION
             let rel = pg_sys::table_open(rel_oid, pg_sys::AccessShareLock as i32);
 
-            // 4. FIND COLUMN ATTRIBUTE
+            // 4. FIND ATTRIBUTE
             let tup_desc = (*rel).rd_att;
             let mut attnum = 0;
 
             for i in 0..(*tup_desc).natts {
-                // Pointer arithmetic to iterate C-array
                 let attr = *(*tup_desc).attrs.as_ptr().add(i as usize);
                 let name_ptr = attr.attname.data.as_ptr();
                 let name = CStr::from_ptr(name_ptr).to_string_lossy();
@@ -84,40 +78,38 @@ impl VectorReadBatcher {
             }
 
             // 5. BEGIN HEAP SCAN
-            // Using the 6-arg signature confirmed by grep
+            // 6-Argument signature for PG17
             let scan_desc = pg_sys::heap_beginscan(
                 rel,
                 snapshot,
                 0,
                 std::ptr::null_mut(),
-                std::ptr::null_mut(), // Parallel Scan Desc (NULL)
-                0                     // Flags
+                std::ptr::null_mut(), // ParallelTableScanDesc
+                0                     // flags
             );
 
             // 6. SCAN LOOP
             let mut vectors_loaded = 0;
 
-            // Use the constant found in your grep
+            // Use the ScanDirection module path found in your grep
             let direction = pg_sys::ScanDirection::ForwardScanDirection;
 
             loop {
-                // heap_getnext (Legacy API)
                 let tuple = pg_sys::heap_getnext(scan_desc, direction);
-
                 if tuple.is_null() { break; }
 
                 let mut is_null = false;
 
-                // heap_getattr (Legacy API)
+                // Explicit cast i16 -> i32 for attnum
                 let datum = pg_sys::heap_getattr(
                     tuple,
-                    attnum as i32, // Explicit cast i16 -> i32
+                    attnum as i32,
                     tup_desc,
                     &mut is_null
                 );
 
                 if !is_null {
-                    // FIX: Transmute Datum to usize to bypass struct wrapper
+                    // Transmute Datum wrapper to usize -> pointer
                     let val: usize = std::mem::transmute(datum);
                     let ptr = val as *mut varlena;
 
@@ -147,7 +139,7 @@ impl VectorReadBatcher {
         let count_loaded = vecs.len() / (safe_dims as usize);
 
         if count_loaded == 0 {
-             panic!("FATAL: [System Scan] Read 0 vectors. Disk is empty or visibility failed.");
+             panic!("FATAL: [System Scan] Read 0 vectors. The disk appears empty.");
         }
 
         info!("✅ [System Scan] Success: Loaded {} vectors in {:.2?}", count_loaded, start_time.elapsed());
