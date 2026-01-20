@@ -25,14 +25,12 @@ function main() {
 
   export PATH="${PATH}:$HOME/.local/bin"
   export PATH="${PATH}:$HOME/.cargo/bin"
-  export PATH="${PATH}:/opt/miniconda/bin/"
   export PGRX_HOME="$HOME/.pgrx"
 
   case "$COMMAND" in
   setup)
     install_deps
-    install_miniconda
-    install_nvidia_packages
+    # setup vuVS rust env
     install_rust
     install_cargo_pgrx
     setup_cargo_pgrx_settings
@@ -98,28 +96,6 @@ function install_cargo_pgrx() {
 
 #--------------------------------------
 
-function install_miniconda() {
-  echo "Installing miniconda..."
-
-  wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O miniconda.sh
-  sudo bash miniconda.sh -b -p /opt/miniconda
-  rm miniconda.sh
-
-  conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
-  conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
-  conda init bash
-}
-
-#--------------------------------------
-
-function install_nvidia_packages() {
-  echo "Installing NVIDIA packages..."
-
-  local CUDA_VER=$(echo $GPU_CUDA_TOOLKIT_VER | sed 's/-//g')
-
-  wget https://raw.githubusercontent.com/rapidsai/cuvs/refs/tags/v${CUVS_VER}/conda/environments/rust_cuda-${CUDA_VER}_arch-x86_64.yaml -O env.yaml
-  conda env create --name cuvs_env -f env.yaml
-}
 
 #--------------------------------------
 
@@ -179,8 +155,6 @@ function build_extension() {
 
   load_cargo_pgrx_env
 
-  . "/opt/miniconda/etc/profile.d/conda.sh"
-  conda activate cuvs_env
   cargo pgrx install
 }
 

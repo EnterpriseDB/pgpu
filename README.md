@@ -22,6 +22,27 @@ PGPU just simplifies this process by packaging everything into a single PG exnte
 ![pgpu process flow](docs/images/pgpu_flow.png)
 
 
+## Building and running
+_Note: we have a partial build script at [scripts/setup_build.sh](scripts/setup_build.sh) that sets up pgrx, PG and the extensions but does not set up the NVIDIA/cuVS environment._
+
+Follow these steps to build and run PGPU:
+- Install NVIDIA CUDA Toolkit 13.1 and drivers following instructions from https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html
+- PGPU uses NVIDIA cuVS for GPU accelerated k-means clustering https://github.com/rapidsai/cuvs/tree/main/rust
+    - follow the instructions from https://docs.rapids.ai/api/cuvs/stable/build/#installing-pre-compiled-packages to install pre-compiled cuVS packages
+    - use the environment file for rust and activate the rust environment for CUDA version 13.1
+- You need a postgres instance and pgvector + vectorchord extensions
+    - we recommend installing postgres from the postgres apt repository: https://www.postgresql.org/download/linux/ubuntu/
+    - and install the extensions using "PGXN":
+        - `pip install pgxnclient`
+        - `pgxn install vchord`
+        - `pgxn install vector`
+- install cargo PGRX which is used to build the PG extension: https://github.com/pgcentralfoundation/pgrx?tab=readme-ov-file#getting-started
+    - when running pgrx init, point to the previously installed PG instance; e.g. on redhat: `cargo pgrx init --pg18 /usr/pgsql-18/bin/pg_config`
+- build and run the extension; e.g.:
+    - `cargo pgrx install`
+    - `cargo pgrx run`
+
+
 
 ### Usage examples
 #### Set up test data and run PGPU
@@ -112,36 +133,3 @@ CREATE FUNCTION "create_vector_index_on_gpu"(
 - `residual_quantization`: enable the "residual_quantization" feature on vchord when building the index
   - default: `false`
   - note: this setting does not affect PGPU behavior at all. It is only used to enable the feature on vchord.
-
-
-## Building and running
-See script [scripts/setup_build.sh](scripts/setup_build.sh)
-
-- PGPU uses NVIDIA cuVS for GPU accelerated k-means clustering https://github.com/rapidsai/cuvs/tree/main/rust
-- `vectorchord` (aka. `vchord`) and `pgvector` (aka. `vector`) PG extensions need to be installed
-
-### Docker
-
-You can also use the Docker environment to have a clean environment for testing your changes. The first step is to ensure that the Docker environment has GPUs enabled in the containers, by doing the following:
-
-```bash
-sudo apt-get install -y nvidia-container-toolkit
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-```
-
-**Note:** this is step is only required if you want to test the container using a real GPU, but this is not required to build the extension.
-
-After you need to build the image by running:
-
-```bash
-./scripts/setup_build.sh docker-build
-```
-
-And finally, start the image:
-
-```bash
-./scripts/setup_build.sh docker-start
-```
-
-**Note:** if you want to disable the GPU usage in your container, please export variable DISABLE_GPU_SUPPORT by executing in your terminal: `export DISABLE_GPU_SUPPORT="1"`.
