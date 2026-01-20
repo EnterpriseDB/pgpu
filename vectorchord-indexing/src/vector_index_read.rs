@@ -98,8 +98,8 @@ impl VectorReadBatcher {
 
         // --- UPDATED LOGGING ---
         let end_row = random_offset + samples_to_read;
-        info!("🎲 [Random Exec] Reading Interval: Rows [ {} .. {} ] (Skipping {} rows)",
-              random_offset, end_row, random_offset);
+        debug1!("🎲 [Random Exec] Reading Interval: Rows [ {} .. {} ] (Skipping {} rows)",
+      random_offset, end_row, random_offset);
         // -----------------------
 
         // C. The "Burn" Loop (Seek)
@@ -159,7 +159,7 @@ impl VectorReadBatcher {
 
             self.vectors_read += read_count;
 
-            info!("✅ Batch Loaded: {} vectors in {:.2?} (Random: {})",
+            debug1!("✅ Batch Loaded: {} vectors in {:.2?} (Random: {})",
                 read_count, start_time.elapsed(), self.random_sampling);
 
             if all_vectors.is_empty() { None } else { Some((all_vectors, dims)) }
