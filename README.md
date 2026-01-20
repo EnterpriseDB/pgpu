@@ -22,6 +22,27 @@ PGPU just simplifies this process by packaging everything into a single PG exnte
 ![pgpu process flow](docs/images/pgpu_flow.png)
 
 
+## Building and running
+_Note: we have a partial build script at [scripts/setup_build.sh](scripts/setup_build.sh) that sets up pgrx, PG and the extensions but does not set up the NVIDIA/cuVS environment._
+
+Follow these steps to build and run PGPU:
+- Install NVIDIA CUDA Toolkit 13.1 and drivers following instructions from https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html
+- PGPU uses NVIDIA cuVS for GPU accelerated k-means clustering https://github.com/rapidsai/cuvs/tree/main/rust
+    - follow the instructions from https://docs.rapids.ai/api/cuvs/stable/build/#installing-pre-compiled-packages to install pre-compiled cuVS packages
+    - use the environment file for rust and activate the rust environment for CUDA version 13.1
+- You need a postgres instance and pgvector + vectorchord extensions
+    - we recommend installing postgres from the postgres apt repository: https://www.postgresql.org/download/linux/ubuntu/
+    - and install the extensions using "PGXN":
+        - `pip install pgxnclient`
+        - `pgxn install vchord`
+        - `pgxn install vector`
+- install cargo PGRX which is used to build the PG extension: https://github.com/pgcentralfoundation/pgrx?tab=readme-ov-file#getting-started
+    - when running pgrx init, point to the previously installed PG instance; e.g. on redhat: `cargo pgrx init --pg18 /usr/pgsql-18/bin/pg_config`
+- build and run the extension; e.g.:
+    - `cargo pgrx install`
+    - `cargo pgrx run`
+
+
 
 ### Usage examples
 #### Set up test data and run PGPU
@@ -46,13 +67,13 @@ FROM generate_series(1, 10000) AS g(i)
 
 #### Run PGPU
 ```sql
-SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_10k_vecs', 
-                                       column_name => 'embedding', 
-                                       batch_size => 1000, 
-                                       lists => ARRAY[1000], 
-                                       sampling_factor => 10, 
-                                       kmeans_iterations=>10, 
-                                       kmeans_nredo=>1, 
+SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_10k_vecs',
+                                       column_name => 'embedding',
+                                       batch_size => 1000,
+                                       lists => ARRAY[1000],
+                                       sampling_factor => 10,
+                                       kmeans_iterations=>10,
+                                       kmeans_nredo=>1,
                                        distance_operator=>'ip',
                                        skip_index_build=>true,
                                        spherical_centroids=>true
@@ -100,7 +121,7 @@ CREATE FUNCTION "create_vector_index_on_gpu"(
 - `kmeans_nredo`: how many times to rerun the clustering algorithm
   - default: `1`
   - note: this rarely needs to be changed
-- `distance_operator`: what distance operator to use for clustering 
+- `distance_operator`: what distance operator to use for clustering
   - default: `'ip'`
   - valid values: `'ip'`, `'l2'`, `'cos'`
   - note: the index will be built for this specific distance operator. So it will only be used for queries with the same distance operator. Typically, this is determined by the dataset.
@@ -112,10 +133,3 @@ CREATE FUNCTION "create_vector_index_on_gpu"(
 - `residual_quantization`: enable the "residual_quantization" feature on vchord when building the index
   - default: `false`
   - note: this setting does not affect PGPU behavior at all. It is only used to enable the feature on vchord.
-
-
-## Building and running
-See script [scripts/setup_build.sh](scripts/setup_build.sh)
-
-- PGPU uses NVIDIA cuVS for GPU accelerated k-means clustering https://github.com/rapidsai/cuvs/tree/main/rust
-- `vectorchord` (aka. `vchord`) and `pgvector` (aka. `vector`) PG extensions need to be installed

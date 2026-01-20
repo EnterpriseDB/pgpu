@@ -41,9 +41,9 @@ $$;
 
 -- sampling factor and cluster count guarantee that we execute in batches
 -- NOTE: must use l2 distance to avoid normalizing vectors
-SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_100k_vecs', column_name => 'embedding', batch_size => 10000,
-                                       cluster_count => 100, sampling_factor => 1000, kmeans_iterations=>10,
-                                       kmeans_nredo=>1, distance_operator=> 'l2', skip_index_build=> true);
+SELECT pgpu.create_vector_index_on_gpu(table_name => 'public.test_100k_vecs', column_name => 'embedding', batch_size => 100000,
+                                       lists => ARRAY[1000], sampling_factor => 100, kmeans_iterations=>10,
+                                       kmeans_nredo=>1, distance_operator=> 'l2', skip_index_build=> true, spherical_centroids=>false);
 
 
 -- check with:

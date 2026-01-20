@@ -1,0 +1,11 @@
+# Ignore the rust build artifacts
+target/
+
+# Ignore the docker files
+docker/
+.dockerignore
+
+# Ignore docs
+docs/
+README.md
+LICENSE
