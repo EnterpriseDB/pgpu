@@ -1,8 +1,7 @@
 use crate::vector_type;
 use pgrx::{info, Spi};
-use pgrx::pg_sys::Datum; // Explicit import for Datum
+use rand::Rng; // Ensure `rand` is added to `Cargo.toml`
 use std::time::Instant;
-use rand::Rng;
 
 pub struct VectorReadBatcher {
     num_samples: u64,
@@ -35,8 +34,8 @@ impl VectorReadBatcher {
         // Count total rows in the table
         let total_rows: u64 = Spi::connect(|client| {
             let count_query = format!("SELECT COUNT(1) FROM {}", quoted_table);
-            let result = client.select(&count_query, None, None)?;
-            let count: i64 = result.first().get_datum_by_ordinal(1)?.unwrap_or(0);
+            let result = client.select(&count_query, &[], None)?;
+            let count: i64 = result.first().get_datum_by_ordinal(1)?.unwrap_or(Datum::from(0)).into();
             Ok::<u64, pgrx::spi::Error>(count as u64)
         }).expect("FATAL: Failed to count rows");
 
@@ -59,14 +58,14 @@ impl VectorReadBatcher {
             let mut internal_vecs = Vec::new();
             let mut internal_dims = 0;
 
-            let tup_table = client.select(&query, None, None)?;
+            let tup_table = client.select(&query, &[], None)?;
 
             for row in tup_table {
                 let datum_opt = row.get_datum_by_ordinal(1)?;
 
-                if let Some(datum) = datum_opt {
+                if datum_opt.is_some() {
                     let byte_slice = unsafe {
-                        pgrx::varlena_to_byte_slice(datum.cast_mut_ptr::<pgrx::pg_sys::varlena>())
+                        pgrx::varlena_to_byte_slice(datum_opt.unwrap().cast_mut_ptr::<pgrx::pg_sys::varlena>())
                     };
 
                     let (vals, d_dims) = vector_type::decode_pgvector_vector(byte_slice);
@@ -138,14 +137,14 @@ impl VectorReadBatcher {
             let mut internal_vecs = Vec::new();
             let mut internal_dims = 0;
 
-            let tup_table = client.select(&query, None, None)?;
+            let tup_table = client.select(&query, &[], None)?;
 
             for row in tup_table {
                 let datum_opt = row.get_datum_by_ordinal(1)?;
 
-                if let Some(datum) = datum_opt {
+                if datum_opt.is_some() {
                     let byte_slice = unsafe {
-                        pgrx::varlena_to_byte_slice(datum.cast_mut_ptr::<pgrx::pg_sys::varlena>())
+                        pgrx::varlena_to_byte_slice(datum_opt.unwrap().cast_mut_ptr::<pgrx::pg_sys::varlena>())
                     };
 
                     let (vector_values, vector_dims) = vector_type::decode_pgvector_vector(byte_slice);
