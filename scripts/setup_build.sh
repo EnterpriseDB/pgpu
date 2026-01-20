@@ -96,9 +96,6 @@ function install_cargo_pgrx() {
 
 #--------------------------------------
 
-
-#--------------------------------------
-
 function install_pg_extensions() {
   echo "Installing extra extensions..."
 
