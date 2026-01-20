@@ -324,6 +324,7 @@ pub fn index(
             num_samples,
             batch_size,
             num_clusters_per_intermediate_batch as u64,
+            random_sampling,
         );
 
         let mut centroids_all: Vec<f32> = Vec::new();
@@ -346,7 +347,6 @@ pub fn index(
                 kmeans_nredo,
                 &distance_operator,
                 spherical_centroids,
-                random_sampling,
             );
 
             centroids_all.extend_from_slice(&centroids_batch);
