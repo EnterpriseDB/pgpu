@@ -1,8 +1,17 @@
 use crate::vector_type;
 use pgrx::{info, Spi};
-use pgrx::pg_sys::Datum;
+use pgrx::pg_sys::Datum; // Explicit import for Datum
 use std::time::Instant;
 use rand::Rng;
+
+pub struct VectorReadBatcher {
+    num_samples: u64,
+    num_samples_per_batch: u64,
+    min_samples_per_batch: u64,
+    vectors_read: u64,
+    cached_vectors: Vec<f32>,
+    dims: u32,
+}
 
 impl VectorReadBatcher {
     pub fn new(
@@ -89,5 +98,76 @@ impl VectorReadBatcher {
         };
 
         (batcher, vecs)
+    }
+
+    pub(crate) fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
+        let start_time = Instant::now();
+
+        // Calculate the remaining samples to read
+        let remaining_samples = self.num_samples.saturating_sub(self.vectors_read);
+        if remaining_samples == 0 {
+            return None; // No more samples to read
+        }
+
+        // Determine the batch size
+        let mut samples_to_read = self.num_samples_per_batch.min(remaining_samples);
+        let size_next_batch = remaining_samples.saturating_sub(self.num_samples_per_batch);
+        if size_next_batch < self.min_samples_per_batch {
+            samples_to_read += size_next_batch;
+        }
+
+        // Generate a random offset within bounds
+        let max_offset = self.num_samples.saturating_sub(samples_to_read);
+        let random_offset = rand::thread_rng().gen_range(0..=max_offset);
+
+        info!(
+            "({vectors_read}/{num_samples}) Reading next batch of {samples_to_read} vectors with random offset {random_offset}...",
+            vectors_read = self.vectors_read,
+            num_samples = self.num_samples,
+            samples_to_read = samples_to_read,
+            random_offset = random_offset
+        );
+
+        // Fetch the batch using SQL with LIMIT and OFFSET
+        let query = format!(
+            "SELECT \"{}\" FROM {} LIMIT {} OFFSET {}",
+            self.cached_vectors, self.dims, samples_to_read, random_offset
+        );
+
+        let (all_vectors, dims) = Spi::connect(|client| {
+            let mut internal_vecs = Vec::new();
+            let mut internal_dims = 0;
+
+            let tup_table = client.select(&query, None, None)?;
+
+            for row in tup_table {
+                let datum_opt = row.get_datum_by_ordinal(1)?;
+
+                if let Some(datum) = datum_opt {
+                    let byte_slice = unsafe {
+                        pgrx::varlena_to_byte_slice(datum.cast_mut_ptr::<pgrx::pg_sys::varlena>())
+                    };
+
+                    let (vector_values, vector_dims) = vector_type::decode_pgvector_vector(byte_slice);
+                    internal_vecs.extend_from_slice(&vector_values);
+                    internal_dims = vector_dims;
+                }
+            }
+
+            Ok::<(Vec<f32>, u32), pgrx::spi::Error>((internal_vecs, internal_dims))
+        }).expect("FATAL: SQL Query Failed");
+
+        self.vectors_read += samples_to_read;
+
+        info!(
+            "Read {} vectors in: {:.2?}",
+            all_vectors.len(),
+            start_time.elapsed()
+        );
+
+        match all_vectors.is_empty() {
+            true => None,
+            false => Some((all_vectors, dims)),
+        }
     }
 }
