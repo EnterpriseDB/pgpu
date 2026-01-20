@@ -1,7 +1,7 @@
 use crate::vector_type;
 use pgrx::pg_sys::{self, Datum, varlena};
-use pgrx::info; // info! macro
-use std::ffi::{CStr, CString}; // <--- FIXED IMPORTS
+use pgrx::{info, Spi};
+use std::ffi::CStr;
 use std::time::Instant;
 
 pub struct VectorReadBatcher {
@@ -25,39 +25,32 @@ impl VectorReadBatcher {
         let mut vecs = Vec::new();
         let mut detected_dims = 0;
 
+        // 1. RESOLVE OID VIA SPI (Safe & Easy)
+        let rel_oid = Spi::connect(|client| {
+            // We use regclass to safely resolve schema.table to an OID
+            let query = format!("SELECT '{}'::regclass::oid", table_name);
+            client.select(&query, None, &[])
+                .and_then(|t| t.get_one::<pg_sys::Oid>())
+        })
+        .expect("SPI Connection Failed")
+        .expect("Table not found (OID resolution failed)");
+
+        info!("🧬 [System Scan] Table '{}' -> OID: {}", table_name, rel_oid);
+
         unsafe {
-            // 1. RESOLVE TABLE OID (System Level)
-            // Convert Rust String -> CString -> Postgres Text* -> QualifiedName List
-            let c_name = CString::new(table_name.clone()).expect("Invalid table name");
-            let text_ptr = pg_sys::cstring_to_text(c_name.as_ptr());
-            let raw_name_list = pg_sys::textToQualifiedNameList(text_ptr);
-
-            // Create RangeVar (abstract table reference)
-            let range_var = pg_sys::makeRangeVarFromNameList(raw_name_list);
-
-            // Get OID.
-            // args: RangeVar, LockMode (NoLock), missing_ok (false)
-            let rel_oid = pg_sys::RangeVarGetRelid(
-                range_var,
-                pg_sys::NoLock as i32,
-                false
-            );
-
-            info!("🧬 [System Scan] Resolved Table '{}' -> OID: {}  ", table_name, rel_oid);
-
             // 2. OPEN RELATION
-            // AccessShareLock lets us read while others read
+            // AccessShareLock (1) allows concurrent reads
             let rel = pg_sys::table_open(rel_oid, pg_sys::AccessShareLock as i32);
 
-            // 3. FIND COLUMN ATTRIBUTE
+            // 3. FIND ATTRIBUTE NUMBER (Column Index)
             let tup_desc = (*rel).rd_att;
             let mut attnum = 0;
 
-            // Iterate over table columns (attributes)
+            // Fix: Use .as_ptr().add() for correct pointer arithmetic on flexible array
             for i in 0..(*tup_desc).natts {
-                let attr = *(*tup_desc).attrs.add(i as usize);
+                let attr = *(*tup_desc).attrs.as_ptr().add(i as usize);
                 let name_ptr = attr.attname.data.as_ptr();
-                let name = CStr::from_ptr(name_ptr).to_string_lossy(); // <--- Standard CStr usage
+                let name = CStr::from_ptr(name_ptr).to_string_lossy();
 
                 if name == column_name {
                     attnum = attr.attnum;
@@ -70,45 +63,56 @@ impl VectorReadBatcher {
                 panic!("FATAL: Column '{}' not found in table schema.", column_name);
             }
 
-            // 4. BEGIN SCAN (Using GetLatestSnapshot for Dirty Read)
-            // We use GetLatestSnapshot() to see the raw disk state
+            // 4. PREPARE SCAN (PG17+ Compatible)
+            // We use GetLatestSnapshot to bypass MVCC visibility rules (Dirty Read)
             let snapshot = pg_sys::GetLatestSnapshot();
+            if snapshot.is_null() {
+                // If null, we try to grab the transaction snapshot as fallback
+                pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+            }
 
-            let scan_desc = pg_sys::table_beginscan(
+            // table_beginscan is inline; use table_beginscan_strat
+            let scan_desc = pg_sys::table_beginscan_strat(
                 rel,
-                snapshot,
+                pg_sys::GetLatestSnapshot(), // Use Latest to see "everything"
                 0,
-                std::ptr::null_mut()
+                std::ptr::null_mut(),
+                true,
+                false
             );
 
-            // 5. ITERATE HEAP TUPLES
+            // 5. CREATE TUPLE SLOT (Mandatory in PG17)
+            // heap_getnext is gone. We must use slots.
+            let slot = pg_sys::MakeSingleTupleTableSlot(
+                tup_desc,
+                &pg_sys::TTSOpsHeapTuple
+            );
+
+            // 6. EXECUTE SCAN
             let mut vectors_loaded = 0;
-            // Optional: You can implement a counter here to skip N rows for "offset"
-            // let skip_count = 0;
+            let forward = pgrx::pg_sys::ScanDirection::ForwardScanDirection;
 
             loop {
-                // Get next raw tuple from disk
-                let tuple = pg_sys::heap_getnext(scan_desc, pg_sys::ForwardScanDirection);
+                // Modern scanning: Get next slot
+                let has_data = pg_sys::table_scan_getnextslot(scan_desc, forward, slot);
+                if !has_data { break; } // End of table
 
-                // If tuple is null, we reached the end of the file
-                if tuple.is_null() {
-                    break;
-                }
-
-                // Extract the specific column (Datum)
                 let mut is_null = false;
-                let datum = pg_sys::heap_getattr(
-                    tuple,
+
+                // Extract Datum from Slot
+                let datum = pg_sys::slot_getattr(
+                    slot,
                     attnum,
-                    tup_desc,
                     &mut is_null
                 );
 
                 if !is_null {
-                    // Cast Datum -> varlena* -> Byte Slice
-                    let byte_slice = pgrx::varlena_to_byte_slice(datum as *mut varlena);
-                    let (vals, d_dims) = vector_type::decode_pgvector_vector(byte_slice);
+                    // Fix: Datum cast using .value() for pgrx's Datum wrapper or direct cast
+                    // In pgrx raw bindings, Datum is often a usize/uintptr_t
+                    let ptr = datum.value() as *mut varlena;
+                    let byte_slice = pgrx::varlena_to_byte_slice(ptr);
 
+                    let (vals, d_dims) = vector_type::decode_pgvector_vector(byte_slice);
                     if detected_dims == 0 { detected_dims = d_dims; }
                     vecs.extend(vals);
                     vectors_loaded += 1;
@@ -117,19 +121,23 @@ impl VectorReadBatcher {
                         break;
                     }
                 }
+
+                // Clear slot for next iteration
+                pg_sys::ExecClearTuple(slot);
             }
 
-            // 6. CLEANUP RESOURCES
-            pg_sys::heap_endscan(scan_desc);
+            // 7. CLEANUP
+            pg_sys::ExecDropSingleTupleTableSlot(slot);
+            pg_sys::table_endscan(scan_desc);
             pg_sys::table_close(rel, pg_sys::AccessShareLock as i32);
         }
 
-        // 7. FINAL VALIDATION
+        // 8. FINAL SAFETY CHECK
         let safe_dims = if detected_dims == 0 { 1 } else { detected_dims };
         let count_loaded = vecs.len() / (safe_dims as usize);
 
         if count_loaded == 0 {
-             panic!("FATAL: [System Scan] Read 0 vectors. The physical table file appears empty or unreadable.");
+             panic!("FATAL: [System Scan] Read 0 vectors. The physical table file is truly empty.");
         }
 
         info!("✅ [System Scan] Success: Loaded {} vectors in {:.2?}", count_loaded, start_time.elapsed());
