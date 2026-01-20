@@ -132,10 +132,14 @@ pub fn index(
         let mut best_assignments: Vec<i32> = Vec::new();
         let mut lowest_max_bucket: usize = usize::MAX;
 
+        let mut best_train_duration = std::time::Duration::new(0, 0);
+        let mut best_part_duration = std::time::Duration::new(0, 0);
+
         for attempt in 1..=num_attempts {
             let attempt_start = Instant::now();
 
             // 1. Train candidate roots on GPU
+            let t_train_start = Instant::now();
             let candidate_roots = train_roots_gpu(
                 &training_dataset,
                 vector_dims,
@@ -143,14 +147,17 @@ pub fn index(
                 100, // iterations
                 1    // single redo (loop handles the rest)
             );
+            let d_train = t_train_start.elapsed();
 
             // 2. PARTITION: Find assignments to evaluate this attempt
+            let t_part_start = Instant::now();
             let candidate_assignments = assign_to_roots_gpu(
                 &training_dataset,
                 &candidate_roots,
                 vector_dims,
                 num_roots
             );
+            let d_part = t_part_start.elapsed();
 
             // 3. ANALYZE: Count bucket sizes
             let mut counts = vec![0usize; num_roots as usize];
@@ -161,28 +168,25 @@ pub fn index(
             }
 
             let current_max = *counts.iter().max().unwrap_or(&usize::MAX);
-            info!("  ↳ Attempt {}: Max Bucket = {} (Time: {:.2?})  ", attempt, current_max, attempt_start.elapsed());
+            // Log with Split Times
+            info!("  ↳ Attempt {}: Max Bucket = {} (Train: {:.2?}, Part: {:.2?}, Total: {:.2?})",
+                attempt, current_max, d_train, d_part, attempt_start.elapsed());
 
             // 4. UPDATE: If this is the best distribution we've seen, save it
             if current_max < lowest_max_bucket {
                 lowest_max_bucket = current_max;
                 best_roots = candidate_roots;
                 best_assignments = candidate_assignments;
+                best_train_duration = d_train;
+                best_part_duration = d_part;
             }
         }
 
         // Move the best results into the final variables
         let root_centroids = best_roots;
         let assignments = best_assignments;
-        let d_p1 = t_p1_start.elapsed();
-        info!("✅ Phase 1 Done. Selected Roots with Max Bucket: {}  ", lowest_max_bucket);
-
-        // ========================================================================================
-        // PHASE 2: PARTITION (Placeholder)
-        // ========================================================================================
-        // Assignments were already computed during the winning attempt of Phase 1
-        let d_p2 = std::time::Duration::from_secs(0);
-        info!("🔮 [PHASE 2] Reusing best assignments from Phase 1. Skipped 95s redundant call.");
+        let d_p1_total_wall = t_p1_start.elapsed();
+        info!("✅ Phase 1 Done. Best Attempt: Train {:.2?} / Part {:.2?}", best_train_duration, best_part_duration);
 
 
         // --- PHASE 3: SCATTER & RESIDUAL TRAINING ---
@@ -221,7 +225,11 @@ pub fn index(
         let mut min_bucket = usize::MAX;
         let mut max_bucket = 0;
 
-        let leaves_per_vector_ratio = num_leaves as f64 / loaded_count as f64;
+        let leaves_per_vector_ratio = if loaded_count > 0 {
+            num_leaves as f64 / loaded_count as f64
+        } else {
+            0.0
+        };
 
         for (i, bucket_residuals) in buckets.iter().enumerate() {
             let n_vecs = bucket_residuals.len() / vector_dims as usize;
@@ -272,9 +280,10 @@ pub fn index(
         info!(
             "\n⏱️  [TIMING SUMMARY]\n\
             \t• 📥 Data Loading:     {:.2?}  \n\
-            \t• 🏗️ Phase 1 (Roots):  {:.2?}  \n\
-            \t• 🔮 Phase 2 (Part.):  {:.2?}  \n\
-            \t• 🌿 Phase 3 (Leaves): {:.2?}  \n\
+            \t• 🏗️ Root Training:    {:.2?} (Winning Attempt)\n\
+            \t• 🔮 Partitioning:     {:.2?} (Winning Attempt)\n\
+            \t• 🔄 Total QC Overhead:{:.2?} (Retries + Logic)\n\
+            \t• 🌿 Leaf Training:    {:.2?}  \n\
             \t• 💾 Storage:          {:.2?}  \n\
             \t-----------------------------\n\
             \t📊 [SKEW & QUALITY REPORT]\n\
@@ -283,8 +292,13 @@ pub fn index(
             \t• Leaves Trained:      {}\n\
             \t• Leaves Dropped:      {}\n\
             \t-----------------------------\n\
-            \t👉 TOTAL TIME:         {:.2?}  ",
-            d_load, d_p1, d_p2, d_p3, d_store,
+            \t👉 TOTAL WALL TIME:    {:.2?}  ",
+            d_load,
+            best_train_duration,
+            best_part_duration,
+            d_p1_total_wall.saturating_sub(best_train_duration + best_part_duration), // How much time was wasted on retries
+            d_p3,
+            d_store,
             min_bucket, max_bucket, total_leaves_trained, missing_leaves,
             global_start.elapsed()
         );
