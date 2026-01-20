@@ -1,6 +1,6 @@
 use crate::vector_type;
 use pgrx::pg_sys::{self, Datum, varlena};
-use pgrx::{info, Spi, warning};
+use pgrx::{info, Spi};
 use std::time::Instant;
 
 pub struct VectorReadBatcher {
@@ -14,7 +14,7 @@ pub struct VectorReadBatcher {
 
 impl VectorReadBatcher {
     pub fn new(
-        table_name: String,
+        raw_table_name: String,
         column_name: String,
         num_samples: u64,
         num_samples_per_batch: u64,
@@ -22,45 +22,64 @@ impl VectorReadBatcher {
     ) -> Self {
         let start_time = Instant::now();
 
-        // --- THE SNAPSHOT SYNC ---
-        // We ensure the internal SPI can see the 100M rows even if the catalog is stale.
+        // 1. FORCE VISIBILITY (The "Dirty Read" Fix)
+        // We use GetLatestSnapshot() instead of GetTransactionSnapshot() to bypass
+        // stale transaction contexts.
         unsafe {
+            pg_sys::SetCurrentStatementStartTimestamp();
             if !pg_sys::ActiveSnapshotSet() {
-                pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+                let snap = pg_sys::GetLatestSnapshot();
+                if !snap.is_null() {
+                    pg_sys::PushActiveSnapshot(snap);
+                } else {
+                    info!("⚠️ Warning: Could not acquire LatestSnapshot.");
+                }
             }
         }
 
-        // 1. GET TOTAL ROWS (The Jump Range)
-        let total: i64 = Spi::connect(|client| {
-            client.select(&format!("SELECT count(*) FROM {}", table_name), None, &[])
+        // 2. STRICT QUOTING: Handle "public.table" -> "public"."table"
+        let quoted_table = if raw_table_name.contains('.') {
+            raw_table_name.split('.')
+                .map(|part| format!("\"{}\"", part))
+                .collect::<Vec<_>>()
+                .join(".")
+        } else {
+            format!("\"{}\"", raw_table_name)
+        };
+
+        // 3. VECTORCHORD: Count -> Offset -> Block Read
+        let (total_rows, offset) = Spi::connect(|client| {
+            // A. Get Count
+            let count = client.select(&format!("SELECT count(*) FROM {}", quoted_table), None, &[])
                 .and_then(|t| t.get_one::<i64>())
                 .unwrap_or(Some(0))
-                .unwrap_or(0)
-        });
+                .unwrap_or(0);
 
-        // 2. CALCULATE JUMP OFFSET
-        let offset: i64 = if total > num_samples as i64 {
-            Spi::connect(|client| {
-                let max_off = total - num_samples as i64;
+            // B. Calculate Random Offset
+            let off = if count > num_samples as i64 {
+                let max_off = count - num_samples as i64;
                 client.select(&format!("SELECT (random() * {})::bigint", max_off), None, &[])
                     .and_then(|t| t.get_one::<i64>())
                     .unwrap_or(Some(0))
                     .unwrap_or(0)
-            })
-        } else {
-            0
-        };
+            } else {
+                0
+            };
 
-        info!("🎯 [VectorChord] Found {} rows. Jumping to offset: {}", total, offset);
+            Ok::<(i64, i64), pgrx::spi::Error>((count, off))
+        }).expect("SPI Setup Failed");
 
-        // 3. CONTINUOUS BLOCK READ
+        info!("🎯 [VectorChord] Target: {} | Found: {} rows | Offset: {}", quoted_table, total_rows, offset);
+
+        // 4. LOAD DATA BLOCK
         let (cached_vectors, dims) = Spi::connect(|client| {
             let mut vecs = Vec::new();
             let mut detected_dims = 0;
 
+            // We force a sequential scan of the block using OFFSET/LIMIT
             let query = format!(
                 "SELECT \"{}\" FROM {} OFFSET {} LIMIT {}",
-                column_name, table_name, offset, num_samples
+                column_name, quoted_table, offset, num_samples
             );
 
             let table = client.select(&query, None, &[]).expect("Block Read Failed");
@@ -77,19 +96,24 @@ impl VectorReadBatcher {
                 }
             }
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((vecs, detected_dims))
-        }).expect("SPI Connection Error");
+        }).expect("SPI Load Failed");
 
-        // 4. CLEANUP
+        // 5. CLEANUP SNAPSHOT
         unsafe {
             if pg_sys::ActiveSnapshotSet() {
                 pg_sys::PopActiveSnapshot();
             }
         }
 
+        // 6. VALIDATION (Prevent Divide-by-Zero)
         let safe_dims = if dims == 0 { 1 } else { dims };
-        let count_loaded = (cached_vectors.len() / (safe_dims as usize)) as u64;
+        let count_loaded = cached_vectors.len() / (safe_dims as usize);
 
-        info!("✅ [VectorChord] Data Block Loaded: {} vectors in {:.2?}", count_loaded, start_time.elapsed());
+        if count_loaded == 0 {
+             pgrx::error!("FATAL: Still read 0 rows from {}. Check permissions or database connection.", quoted_table);
+        }
+
+        info!("✅ [VectorChord] Loaded {} vectors in {:.2?}", count_loaded, start_time.elapsed());
 
         VectorReadBatcher {
             num_samples,
@@ -102,16 +126,10 @@ impl VectorReadBatcher {
     }
 
     pub fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
-        if self.cached_vectors.is_empty() || self.vectors_read >= self.num_samples {
-            return None;
-        }
-
+        if self.cached_vectors.is_empty() || self.vectors_read >= self.num_samples { return None; }
         let mut to_read = self.num_samples_per_batch as usize;
         let remaining = (self.num_samples - self.vectors_read) as usize;
-
-        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize {
-            to_read = remaining;
-        }
+        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize { to_read = remaining; }
 
         let start = (self.vectors_read as usize) * (self.dims as usize);
         let end = start + (to_read * self.dims as usize);
@@ -120,7 +138,6 @@ impl VectorReadBatcher {
 
         let batch = self.cached_vectors[start..end].to_vec();
         self.vectors_read += to_read as u64;
-
         Some((batch, self.dims))
     }
 
