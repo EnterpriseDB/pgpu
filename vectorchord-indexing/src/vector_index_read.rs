@@ -49,12 +49,6 @@ impl VectorReadBatcher {
 
         vbr.initialize();
 
-        // Optional: Log the random plan if enabled
-        if vbr.random_sampling {
-            vbr.random_batch_sampling();
-        }
-
-
         let table_size = (vbr).num_tuples();
         assert!(num_samples <= table_size as u64, "The table has fewer records ({table_size}) than the desired number of samples ({num_samples}) based on cluster_count*sampling_factor. Unable to continue");
         let rem = num_samples % num_samples_per_batch;
@@ -240,28 +234,5 @@ impl VectorReadBatcher {
     pub(crate) fn end_scan(self) {
         let scan = self.table_scan.expect("systable scan not initialized");
         unsafe { pg_sys::systable_endscan(scan); }
-    }
-
-    fn random_batch_sampling(&mut self) {
-        let total_rows = self.num_tuples();
-        let total_needed = self.num_samples;
-        let batch_size = self.num_samples_per_batch;
-        let num_batches = (total_needed + batch_size - 1) / batch_size;
-
-        info!("📊 [Random Batch Sampling] Plan: Batches={}  ", num_batches);
-
-        for i in 0..num_batches {
-            let samples_so_far = i * batch_size;
-            let remaining = total_needed.saturating_sub(samples_so_far);
-            let this_batch_size = std::cmp::min(batch_size, remaining);
-            if this_batch_size == 0 { break; }
-
-            let max_start_index = total_rows - this_batch_size;
-            let random_offset = Spi::get_one::<i64>(&format!("SELECT (random() * {})::bigint", max_start_index))
-                .ok().flatten().unwrap_or(0);
-
-            info!("   Batch #{}: Needs {} | Random range ~ [ {} .. {} ]",
-                i + 1, this_batch_size, random_offset, random_offset as u64 + this_batch_size);
-        }
     }
 }
