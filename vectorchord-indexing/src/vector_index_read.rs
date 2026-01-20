@@ -3,6 +3,8 @@ use pgrx::pg_sys::{format_type_be, SysScanDesc};
 use pgrx::{debug1, heap_getattr_raw, info, pg_sys, warning, PgRelation, Spi};
 use std::ffi::CStr;
 use std::time::Instant;
+use std::num::NonZero; // Explicit import for cleaner code
+
 
 pub struct VectorReadBatcher {
     table_name: String,
@@ -128,7 +130,7 @@ impl VectorReadBatcher {
             let scan = self.table_scan.expect("scan not initialized");
             let pg_rel = self.pg_rel.clone().expect("rel not initialized");
             let tup_desc = pg_rel.tuple_desc();
-            let col_num_nonzero = std::num::NonZero::new(self.col_num.unwrap() as i32).unwrap();
+            let col_num_nonzero = NonZero::new(self.col_num.unwrap()).expect("column number cannot be zero");
 
             let mut all_vectors: Vec<f32> = Vec::new();
             let mut dims: u32 = 0;
@@ -191,20 +193,22 @@ impl VectorReadBatcher {
         let pg_rel = PgRelation::open_with_name_and_share_lock(&self.table_name)
             .expect("unable to open table");
 
-        let tup_desc = pg_rel.tuple_desc();
-        let mut col_num_found: Option<i32> = None;
-        for attr in tup_desc.iter().filter(|a| !a.attisdropped) {
-            let col_name = pgrx::name_data_to_str(&attr.attname);
-            unsafe {
-                if col_name == self.column_name {
-                     let type_name = CStr::from_ptr(format_type_be(attr.atttypid)).to_str().unwrap();
-                     if type_name != "vector" { pgrx::error!("column type is not vector"); }
-                     col_num_found = Some(attr.attnum.into());
+        {
+            let tup_desc = pg_rel.tuple_desc();
+            let mut col_num_found: Option<i32> = None;
+            for attr in tup_desc.iter().filter(|a| !a.attisdropped) {
+                let col_name = pgrx::name_data_to_str(&attr.attname);
+                unsafe {
+                    if col_name == self.column_name {
+                         let type_name = CStr::from_ptr(format_type_be(attr.atttypid)).to_str().unwrap();
+                         if type_name != "vector" { pgrx::error!("column type is not vector"); }
+                         col_num_found = Some(attr.attnum.into());
+                    }
                 }
             }
+            let col_num = col_num_found.expect("column not found");
+            self.col_num = Some(col_num as usize);
         }
-        let col_num = col_num_found.expect("column not found");
-        self.col_num = Some(col_num as usize);
 
         let scan = unsafe {
             pg_sys::systable_beginscan(
