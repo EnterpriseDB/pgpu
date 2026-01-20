@@ -50,16 +50,15 @@ pub fn index(
     let global_start = Instant::now();
 
     // ========================================================================================
-    // PATH A: TOP-DOWN HIERARCHICAL BUILD (New Logic)
+    // PATH A: TOP-DOWN HIERARCHICAL BUILD
     // Triggered if `lists` has 2 elements (e.g. [400, 160000])
     // ========================================================================================
 
     if let Some(num_roots) = num_clusters_top_option {
         let num_leaves = num_clusters_leaf;
-        let num_leaves_per_root = num_leaves / num_roots; // 160k/400=400
+        let num_leaves_per_root = num_leaves / num_roots;
 
         // 1. Calculate Sample Size based on Sampling Factor
-        // Target Clusters×Sampling Factor=Required Samples = eg. 160k*256= 40,960,000
         let num_samples_to_read = (num_leaves as u64).saturating_mul(sampling_factor as u64);
 
         info!("🏗️ [HIERARCHICAL DETECTED] Starting Top-Down Build");
@@ -91,8 +90,6 @@ pub fn index(
             random_sampling,
         );
 
-        // Allocating with a heuristic (768 dims) to prevent immediate re-allocations.
-        // If dims are larger (e.g. 1536), it will grow automatically.
         let mut training_dataset: Vec<f32> = Vec::with_capacity((num_samples_to_read as usize) * 768);
         let mut vector_dims = 0;
         let mut loaded_count = 0;
@@ -102,13 +99,13 @@ pub fn index(
         while let Some((vecs, dims)) = batcher.next_batch() {
             if vector_dims == 0 {
                 vector_dims = dims;
-                let total_bytes = (num_samples_to_read as u64) * (dims as u64) * 4; // 4 bytes per f32
-                let gb_usage = total_bytes as f64 / 1_073_741_824.0; // / 1024^3
+                let total_bytes = (num_samples_to_read as u64) * (dims as u64) * 4;
+                let gb_usage = total_bytes as f64 / 1_073_741_824.0;
 
                 info!("📝 Detected Vector Dims: {}  ", dims);
                 info!("💾 Estimated RAM Requirement for Training Data: {:.2} GB", gb_usage);
 
-                if gb_usage > 64.0 { // Optional Warning threshold
+                if gb_usage > 64.0 {
                     warning!("⚠️ High RAM usage detected! Ensure your server has at least {:.0} GB free.", gb_usage * 1.2);
                 }
             }
@@ -124,9 +121,16 @@ pub fn index(
         let d_load = t_load_start.elapsed();
         info!("✅ Training Dataset Loaded: {} vectors. Time: {:.2?}", loaded_count, d_load);
 
-        // NORMALIZE IF SPHERICAL
+
+        // ========================================================================================
+        // PRE-PROCESSING: Data Normalization
+        // ========================================================================================
+        let mut d_pre_proc = std::time::Duration::new(0, 0);
         if spherical_centroids {
+            let t_pre_start = Instant::now();
             info!("📐 [Spherical Mode] Normalizing {} training vectors...", loaded_count);
+
+            // Normalize in place
             for chunk in training_dataset.chunks_mut(vector_dims as usize) {
                 let mut norm_sq = 0.0;
                 for x in chunk.iter() { norm_sq += x * x; }
@@ -135,6 +139,8 @@ pub fn index(
                     for x in chunk.iter_mut() { *x /= norm; }
                 }
             }
+            d_pre_proc = t_pre_start.elapsed();
+            info!("   ↳ Pre-processing complete in {:.2?}", d_pre_proc);
         }
 
         // ========================================================================================
@@ -144,7 +150,6 @@ pub fn index(
         let num_attempts = kmeans_nredo;
         info!("🏗️ [PHASE 1] Starting Manual Quality-Control (Attempts: {}) ", num_attempts);
 
-        // Initialize trackers OUTSIDE the loop scope
         let mut best_roots: Vec<f32> = Vec::new();
         let mut best_assignments: Vec<i32> = Vec::new();
         let mut lowest_max_bucket: usize = usize::MAX;
@@ -185,11 +190,10 @@ pub fn index(
             }
 
             let current_max = *counts.iter().max().unwrap_or(&usize::MAX);
-            // Log with Split Times
+
             info!("  ↳ Attempt {}: Max Bucket = {} (Train: {:.2?}, Part: {:.2?}, Total: {:.2?})",
                 attempt, current_max, d_train, d_part, attempt_start.elapsed());
 
-            // 4. UPDATE: If this is the best distribution we've seen, save it
             if current_max < lowest_max_bucket {
                 lowest_max_bucket = current_max;
                 best_roots = candidate_roots;
@@ -199,12 +203,18 @@ pub fn index(
             }
         }
 
-        // Move the best results into the final variables
+        let d_p1_total_wall = t_p1_start.elapsed();
+        info!("✅ Phase 1 Done. Best Attempt: Train {:.2?} / Part {:.2?}", best_train_duration, best_part_duration);
+
+        // ========================================================================================
+        // POST-PROCESSING: Centroid Normalization
+        // ========================================================================================
         let mut root_centroids = best_roots;
         let assignments = best_assignments;
+        let mut d_post_proc = std::time::Duration::new(0, 0);
 
-        // RE-NORMALIZE ROOTS
         if spherical_centroids {
+            let t_post_start = Instant::now();
              for chunk in root_centroids.chunks_mut(vector_dims as usize) {
                 let mut norm_sq = 0.0;
                 for x in chunk.iter() { norm_sq += x * x; }
@@ -213,19 +223,17 @@ pub fn index(
                     for x in chunk.iter_mut() { *x /= norm; }
                 }
             }
+            d_post_proc = t_post_start.elapsed();
         }
 
-        let d_p1_total_wall = t_p1_start.elapsed();
-        info!("✅ Phase 1 Done. Best Attempt: Train {:.2?} / Part {:.2?}", best_train_duration, best_part_duration);
-
-
-        // --- PHASE 3: SCATTER & RESIDUAL TRAINING ---
+        // ========================================================================================
+        // PHASE 3: SCATTER & RESIDUAL TRAINING
+        // ========================================================================================
         let t_p3_start = Instant::now();
-        info!("🚀 [PHASE 3] Training Leaves on RESIDUALS (Matching CPU Logic)");
+        info!("🚀 [PHASE 3] Training Leaves on Residuals"); // subtract the root centroid first (Vector - Root) and cluster the difference ()residual)
 
         let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
 
-        // [RESIDUAL CHANGE]: Store residuals in buckets instead of raw vectors
         for (idx, &label) in assignments.iter().enumerate() {
             if label >= 0 && (label as usize) < num_roots as usize {
                 let start = idx * vector_dims as usize;
@@ -235,7 +243,6 @@ pub fn index(
                 let root_vec = &root_centroids[root_start..root_start + vector_dims as usize];
                 let raw_vec = &training_dataset[start..end];
 
-                // Compute: Vector - RootCentroid
                 for j in 0..vector_dims as usize {
                     buckets[label as usize].push(raw_vec[j] - root_vec[j]);
                 }
@@ -244,12 +251,12 @@ pub fn index(
 
         let mut final_results: Vec<(Vec<f32>, i32)> = Vec::new();
 
-        // 1. Store Roots (ID 0..399, Parent -1)
+        // 1. Store Roots
         for root_vec in root_centroids.chunks(vector_dims as usize) {
             final_results.push((root_vec.to_vec(), -1));
         }
 
-        // 2. Train on Residuals & Convert back to Absolute
+        // 2. Train Leaves
         let mut total_leaves_trained = 0;
         let mut missing_leaves = 0;
         let mut min_bucket = usize::MAX;
@@ -276,34 +283,31 @@ pub fn index(
             let mut target_leaves = raw_target.round() as u32;
             target_leaves = target_leaves.clamp(1, n_vecs as u32);
 
-            // Train on the residuals
             let leaf_residuals = train_leaves_for_bucket_gpu(
                 bucket_residuals,
                 vector_dims,
                 target_leaves,
                 15
             );
-            // [RESIDUAL CHANGE]: Add Root back to Residual to store absolute position
+
             let root_start = i * vector_dims as usize;
             let root_vec = &root_centroids[root_start..root_start + vector_dims as usize];
 
             for leaf_res_chunk in leaf_residuals.chunks(vector_dims as usize) {
                 let mut absolute_leaf = vec![0.0f32; vector_dims as usize];
 
-                // 1. Reconstruct: Absolute = Root + Residual
+                // A. Reconstruct
                 for j in 0..vector_dims as usize {
                     absolute_leaf[j] = root_vec[j] + leaf_res_chunk[j];
                 }
 
-                // 2. Normalize if spherical
+                // B. Normalize (Spherical Only)
                 if spherical_centroids {
                     let mut norm_sq = 0.0;
                     for x in absolute_leaf.iter() {
                         norm_sq += x * x;
                     }
                     let norm = norm_sq.sqrt();
-
-                    // Safety check against zero vectors (unlikely but good practice)
                     if norm > 1e-12 {
                         for x in absolute_leaf.iter_mut() {
                             *x /= norm;
@@ -328,11 +332,14 @@ pub fn index(
         info!(
             "\n⏱️  [TIMING SUMMARY]\n\
             \t• 📥 Data Loading:     {:.2?}  \n\
-            \t• 🏗️ Root Training:    {:.2?} (Winning Attempt)\n\
-            \t• 🔮 Partitioning:     {:.2?} (Winning Attempt)\n\
-            \t• 🔄 Total QC Overhead:{:.2?} (Retries + Logic)\n\
-            \t• 🌿 Leaf Training:    {:.2?}  \n\
-            \t• 💾 Storage:          {:.2?}  \n\
+            \t• 📐 Pre-Processing:   {:.2?} (Data Normalization)\n\
+            \t• 🏗️ Phase 1 (Total):  {:.2?}  \n\
+            \t   ↳ Best Train:       {:.2?}  \n\
+            \t   ↳ Best Part:        {:.2?}  \n\
+            \t   ↳ QC Overhead:      {:.2?} (Retries/Logic)\n\
+            \t• 🔧 Post-Processing:  {:.2?} (Centroid Norm)\n\
+            \t• 🌿 Phase 3 (Leaves): {:.2?} (Inc. Leaf Norm)\n\
+            \t• 💾 Storage:          {:.2?} (Centroids Store) \n\
             \t-----------------------------\n\
             \t📊 [SKEW & QUALITY REPORT]\n\
             \t• Min Bucket Size:     {}\n\
@@ -340,11 +347,14 @@ pub fn index(
             \t• Leaves Trained:      {}\n\
             \t• Leaves Dropped:      {}\n\
             \t-----------------------------\n\
-            \t👉 TOTAL WALL TIME:    {:.2?}  ",
+            \t👉 TOTAL CLUSTERING TIME:    {:.2?}  ",
             d_load,
+            d_pre_proc,
+            d_p1_total_wall,
             best_train_duration,
             best_part_duration,
-            d_p1_total_wall.saturating_sub(best_train_duration + best_part_duration), // How much time was wasted on retries
+            d_p1_total_wall.saturating_sub(best_train_duration + best_part_duration),
+            d_post_proc,
             d_p3,
             d_store,
             min_bucket, max_bucket, total_leaves_trained, missing_leaves,
@@ -353,7 +363,6 @@ pub fn index(
 
     // ========================================================================================
     // PATH B: FLAT / LEGACY BUILD
-    // Triggered if `lists` has 1 element (e.g. [2000])
     // ========================================================================================
     } else {
         info!("🏗️ [FLAT DETECTED] Running Bottom-Up Batch Clustering");
@@ -365,7 +374,7 @@ pub fn index(
             1 => num_clusters_leaf,
             _ => {
                 let target = num_clusters_leaf * 4;
-                std::cmp::max(target / num_batches, 3) // Ensure at least 3
+                std::cmp::max(target / num_batches, 3)
             }
         };
 
@@ -405,7 +414,6 @@ pub fn index(
         }
         batcher.end_scan();
 
-        // Consolidate Results
         let centroids_leaf = if centroids_all.is_empty() {
             warning!("empty result from kmeans clustering");
             return;
@@ -424,7 +432,6 @@ pub fn index(
             )
         };
 
-        // Format for Storage (Parent = -1 for flat)
         let centroids_result: Vec<(Vec<f32>, i32)> = centroids_leaf
             .chunks(dims as usize)
             .map(|x| (x.to_vec(), -1))
@@ -433,9 +440,6 @@ pub fn index(
         centroids_table::store_centroids(centroids_result, centroid_table_name.clone(), dims);
     }
 
-    // ========================================================================================
-    // CREATE INDEX (Common Step)
-    // ========================================================================================
     if !skip_index_build {
         info!("💾 Training complete ({:.2?}). Building VectorChord Index...", global_start.elapsed());
         vectorchord_index::create_vectorchord_index(

@@ -1,10 +1,9 @@
 use crate::vector_type;
 use pgrx::pg_sys::{format_type_be, SysScanDesc};
-use pgrx::{debug1, heap_getattr_raw, info, pg_sys, warning, PgRelation, Spi};
+use pgrx::{debug1, heap_getattr_raw, pg_sys, warning, PgRelation, Spi};
 use std::ffi::CStr;
 use std::time::Instant;
-use std::num::NonZero; // Explicit import for cleaner code
-
+use std::num::NonZero;
 
 pub struct VectorReadBatcher {
     table_name: String,
@@ -29,7 +28,6 @@ impl VectorReadBatcher {
         min_samples_per_batch: u64,
         random_sampling: bool,
     ) -> Self {
-
         let mut vbr = VectorReadBatcher {
             table_name,
             column_name,
@@ -48,12 +46,13 @@ impl VectorReadBatcher {
 
         let table_size = (vbr).num_tuples();
         assert!(num_samples <= table_size as u64, "The table has fewer records ({table_size}) than the desired number of samples ({num_samples}) based on cluster_count*sampling_factor. Unable to continue");
+
         let rem = num_samples % num_samples_per_batch;
         if rem != 0 && rem < min_samples_per_batch {
             warning!("batch size {num_samples_per_batch} will lead to a remainder of {rem} samples in the last batch; which is too small for clustering. The last batch will be enlarged to {0} to contain this remainder", vbr.num_samples_per_batch + rem)
         }
+
         // TODO: calculate this from a new input "max memory GB"
-        //info!("vector batch read properties:\n\t num_samples: {num_samples}\n\t num_samples_per_batch: {num_samples_per_batch}\n\t num_batches: {nb}\n\t table_size: {table_size}", nb=vbr.num_batches(), num_samples=vbr.num_samples, num_samples_per_batch=vbr.num_samples_per_batch, table_size=table_size);
         vbr
     }
 
@@ -83,26 +82,25 @@ impl VectorReadBatcher {
     }
 
     // -------------------------------------------------------------------------
-    // 2. THE NEW RANDOM STRATEGY (Self-Contained)
+    // Random Sampling Strategy - Read batches from random offsets
     // -------------------------------------------------------------------------
+
     fn next_batch_random(&mut self, samples_to_read: u64) -> Option<(Vec<f32>, u32)> {
-        // A. Reset scan to the start
+        // 1. Reset scan to the start
         self.restart_scan();
 
-        // B. Calculate Random Jump
+        // 2. Calculate Random Jump
         let total_rows = self.num_tuples();
         let max_start = total_rows.saturating_sub(samples_to_read);
 
         let random_offset = Spi::get_one::<i64>(&format!("SELECT (random() * {})::bigint", max_start))
             .ok().flatten().unwrap_or(0) as u64;
 
-        // --- UPDATED LOGGING ---
         let end_row = random_offset + samples_to_read;
         debug1!("🎲 [Random Exec] Reading Interval: Rows [ {} .. {} ] (Skipping {} rows)",
-      random_offset, end_row, random_offset);
-        // -----------------------
+              random_offset, end_row, random_offset);
 
-        // C. The "Burn" Loop (Seek)
+        // 3. The "Burn" Loop (Seek to random offset)
         unsafe {
             let scan = self.table_scan.expect("scan not active");
             for _ in 0..random_offset {
@@ -111,13 +109,14 @@ impl VectorReadBatcher {
             }
         }
 
-        // D. Hand off to the standard reader to get the actual data
+        // 4. Hand off to the standard reader to get the actual data
         self.read_and_decode_rows(samples_to_read)
     }
 
     // -------------------------------------------------------------------------
-    // 3. THE SHARED DECODER (Extracted from your original code)
+    // Row Decoding & Sequential Reading - Picks up from current scan position and executes a sequential read
     // -------------------------------------------------------------------------
+
     fn read_and_decode_rows(&mut self, count: u64) -> Option<(Vec<f32>, u32)> {
         let start_time = Instant::now();
 
@@ -140,7 +139,7 @@ impl VectorReadBatcher {
                 let datum = heap_getattr_raw(tuple, col_num_nonzero, tup_desc.as_ptr())
                     .expect("unable to get datum");
 
-                // 3. Detoast & Decode (Your original logic)
+                // 3. Detoast & Decode
                 let raw_ptr = datum.cast_mut_ptr();
                 let detoasted_ptr = pg_sys::pg_detoast_datum(raw_ptr);
 
@@ -167,7 +166,7 @@ impl VectorReadBatcher {
     }
 
     // -------------------------------------------------------------------------
-    // HELPERS
+    // Helpers
     // -------------------------------------------------------------------------
 
     fn restart_scan(&mut self) {
