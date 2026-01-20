@@ -27,11 +27,8 @@ impl VectorReadBatcher {
         num_samples: u64,
         num_samples_per_batch: u64,
         min_samples_per_batch: u64,
+        random_sampling: bool,
     ) -> Self {
-        // --- 🧪 TEST CONFIGURATION ---
-        // Change this to 'false' to revert to sequential scanning
-        let use_random_sampling = true;
-        // -----------------------------
 
         let mut vbr = VectorReadBatcher {
             table_name,
@@ -44,7 +41,7 @@ impl VectorReadBatcher {
             table_scan: None,
             pg_rel: None,
             col_num: None,
-            random_sampling: use_random_sampling,
+            random_sampling,
         };
 
         vbr.initialize();

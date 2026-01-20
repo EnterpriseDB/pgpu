@@ -23,6 +23,7 @@ pub fn index(
     skip_index_build: bool,
     spherical_centroids: bool,
     residual_quantization: bool,
+    random_sampling: bool,
 ) {
     // 1. Validate Inputs & Hardware
     let (num_clusters_top_option, num_clusters_leaf) = match lists.len() {
@@ -72,24 +73,38 @@ pub fn index(
            \t• KMeans N-Redo:        {} (Best of N runs)",
            num_clusters_leaf, sampling_factor, batch_size, kmeans_iterations, kmeans_nredo);
 
-        // 2. Load Samples into RAM
-        // We use the batcher to read exactly 'num_samples_to_read'
         let t_load_start = Instant::now();
         let mut batcher = VectorReadBatcher::new(
             qualified_table.clone(),
             column_name.clone(),
             num_samples_to_read,
             batch_size,
-            1, // Unused for simple read
+            1,
+            random_sampling,
         );
 
+        // Allocating with a heuristic (768 dims) to prevent immediate re-allocations.
+        // If dims are larger (e.g. 1536), it will grow automatically.
         let mut training_dataset: Vec<f32> = Vec::with_capacity((num_samples_to_read as usize) * 768);
         let mut vector_dims = 0;
         let mut loaded_count = 0;
 
         info!("📥 Loading training samples into RAM...");
+
         while let Some((vecs, dims)) = batcher.next_batch() {
-            if vector_dims == 0 { vector_dims = dims; }
+            if vector_dims == 0 {
+                vector_dims = dims;
+                let total_bytes = (num_samples_to_read as u64) * (dims as u64) * 4; // 4 bytes per f32
+                let gb_usage = total_bytes as f64 / 1_073_741_824.0; // / 1024^3
+
+                info!("📝 Detected Vector Dims: {}  ", dims);
+                info!("💾 Estimated RAM Requirement for Training Data: {:.2} GB", gb_usage);
+
+                if gb_usage > 64.0 { // Optional Warning threshold
+                    warning!("⚠️ High RAM usage detected! Ensure your server has at least {:.0} GB free.", gb_usage * 1.2);
+                }
+            }
+
             loaded_count += vecs.len() / dims as usize;
             training_dataset.extend(vecs);
 
@@ -101,24 +116,6 @@ pub fn index(
         let d_load = t_load_start.elapsed();
         info!("✅ Training Dataset Loaded: {} vectors. Time: {:.2?}", loaded_count, d_load);
 
-        // --- PHASE 0: SUPER ROOT (Global Mean) --- Not needed
-        // Level 0: The single center of the entire dataset.
-        /*let t_p0_start = Instant::now();
-        info!("🌍 [PHASE 0] Calculating Super Root (Global Mean)...");
-        let mut super_root = vec![0.0f32; vector_dims as usize];
-        for chunk in training_dataset.chunks(vector_dims as usize) {
-            for (i, val) in chunk.iter().enumerate() {
-                super_root[i] += val;
-            }
-        }
-
-
-        let total_vecs_f32 = loaded_count as f32;
-        for val in super_root.iter_mut() {
-            *val /= total_vecs_f32;
-        }
-        let d_p0 = t_p0_start.elapsed();
-        */
 
         // ========================================================================================
         // PHASE 1: MANUAL QUALITY-CONTROLLED ROOTS
@@ -349,6 +346,7 @@ pub fn index(
                 kmeans_nredo,
                 &distance_operator,
                 spherical_centroids,
+                random_sampling,
             );
 
             centroids_all.extend_from_slice(&centroids_batch);
