@@ -26,8 +26,8 @@ impl VectorReadBatcher {
         let mut detected_dims = 0;
 
         unsafe {
-            // 1. SETUP SNAPSHOT
-            // Crucial for visibility in background workers
+            // 1. VISIBILITY SETUP
+            // Force latest snapshot to see "Cold Start" data
             let mut snapshot = pg_sys::GetLatestSnapshot();
             if snapshot.is_null() {
                 snapshot = pg_sys::GetTransactionSnapshot();
@@ -36,8 +36,11 @@ impl VectorReadBatcher {
                 pg_sys::PushActiveSnapshot(snapshot);
             }
 
-            // 2. RESOLVE TABLE OID
+            // 2. RESOLVE OID & ATTNUM
             let c_table = CString::new(table_name.clone()).expect("Invalid table name");
+            let c_col = CString::new(column_name.clone()).expect("Invalid column name");
+
+            // Resolve OID
             let text_ptr = pg_sys::cstring_to_text(c_table.as_ptr());
             let list_ptr = pg_sys::textToQualifiedNameList(text_ptr);
             let range_var = pg_sys::makeRangeVarFromNameList(list_ptr);
@@ -45,26 +48,21 @@ impl VectorReadBatcher {
             let rel_oid = pg_sys::RangeVarGetRelidExtended(
                 range_var,
                 pg_sys::AccessShareLock as i32,
-                0,
-                None,
-                std::ptr::null_mut()
+                0, None, std::ptr::null_mut()
             );
 
-            // 3. RESOLVE ATTRIBUTE NUMBER (Column ID)
-            let c_col = CString::new(column_name.clone()).expect("Invalid column name");
+            // Resolve AttNum
             let attnum = pg_sys::get_attnum(rel_oid, c_col.as_ptr());
-
             if attnum <= 0 {
-                panic!("FATAL: Column '{}' not found in table '{}' (Attnum: {}).", column_name, table_name, attnum);
+                panic!("FATAL: Column '{}' not found (Attnum: {}).", column_name, attnum);
             }
 
             info!("🧬 [Safe Scan] OID: {} | AttNum: {}", rel_oid, attnum);
 
-            // 4. OPEN RELATION
+            // 3. OPEN RELATION & START SCAN
             let rel = pg_sys::table_open(rel_oid, pg_sys::AccessShareLock as i32);
             let tup_desc = (*rel).rd_att;
 
-            // 5. BEGIN HEAP SCAN
             let scan_desc = pg_sys::heap_beginscan(
                 rel,
                 snapshot,
@@ -74,7 +72,7 @@ impl VectorReadBatcher {
                 0
             );
 
-            // 6. SCAN LOOP
+            // 4. SCAN LOOP
             let mut vectors_loaded = 0;
             let direction = pg_sys::ScanDirection::ForwardScanDirection;
 
@@ -91,22 +89,39 @@ impl VectorReadBatcher {
                 );
 
                 if !is_null {
-                    // --- FIX 1: Transmute Datum Wrapper to Primitive ---
-                    // pgrx Datum is a struct wrapping a usize/pointer. We unwrap it.
-                    let val: usize = std::mem::transmute(datum);
-                    let raw_ptr = val as *mut varlena;
+                    // --- SAFETY STEP 1: EXTRACT POINTER ---
+                    // Transmute the opaque Datum struct to a raw address (usize)
+                    let raw_addr: usize = std::mem::transmute(datum);
+                    let raw_ptr = raw_addr as *mut varlena;
 
-                    // --- FIX 2: Detoast to prevent Segfaults ---
-                    // pg_detoast_datum ensures the data is in memory and decompressed.
+                    // --- SAFETY STEP 2: DETOAST ---
+                    // pg_detoast_datum unpacks compressed/external data into RAM.
+                    // This returns a pointer to a valid, readable varlena struct.
                     let safe_ptr = pg_sys::pg_detoast_datum(raw_ptr);
 
-                    // Decode
+                    // --- SAFETY STEP 3: DECODE ---
                     let byte_slice = pgrx::varlena_to_byte_slice(safe_ptr);
+
+                    // Sanity check size for the first vector to catch corrupt data early
+                    if vectors_loaded == 0 {
+                        // verify header size just in case
+                         let len = byte_slice.len();
+                         if len < 4 {
+                             panic!("FATAL: Vector data too short ({} bytes)", len);
+                         }
+                    }
+
                     let (vals, d_dims) = vector_type::decode_pgvector_vector(byte_slice);
 
                     if detected_dims == 0 { detected_dims = d_dims; }
                     vecs.extend(vals);
                     vectors_loaded += 1;
+
+                    // --- SAFETY STEP 4: FREE MEMORY ---
+                    // If detoast allocated a new copy, we must free it to prevent leaks/crashes
+                    if safe_ptr != raw_ptr {
+                        pg_sys::pfree(safe_ptr as *mut std::ffi::c_void);
+                    }
 
                     if vectors_loaded >= num_samples {
                         break;
@@ -114,7 +129,7 @@ impl VectorReadBatcher {
                 }
             }
 
-            // 7. CLEANUP
+            // 5. CLEANUP
             pg_sys::heap_endscan(scan_desc);
             pg_sys::table_close(rel, pg_sys::AccessShareLock as i32);
 
@@ -144,18 +159,12 @@ impl VectorReadBatcher {
 
     pub fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
         if self.cached_vectors.is_empty() || self.vectors_read >= self.num_samples { return None; }
-
         let mut to_read = self.num_samples_per_batch as usize;
         let remaining = (self.num_samples - self.vectors_read) as usize;
-        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize {
-            to_read = remaining;
-        }
-
+        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize { to_read = remaining; }
         let start = (self.vectors_read as usize) * (self.dims as usize);
         let end = start + (to_read * self.dims as usize);
-
         if end > self.cached_vectors.len() { return None; }
-
         let batch = self.cached_vectors[start..end].to_vec();
         self.vectors_read += to_read as u64;
         Some((batch, self.dims))
