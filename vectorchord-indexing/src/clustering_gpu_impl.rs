@@ -343,10 +343,11 @@ pub fn train_roots_gpu(
     iterations: u32,
     n_redo: u32,
 ) -> Vec<f32> {
-    let total_count = full_vectors.len() / vector_dims as usize;
+    // 1. Define Total Vectors (Fixes 'cannot find value total_vectors')
+    let total_vectors = full_vectors.len() / vector_dims as usize;
     let train_limit = 1_000_000;
 
-    // 1. Determine Sample Size and Stride
+    // 2. Calculate Stride
     let num_train = std::cmp::min(total_vectors, train_limit);
     let stride = if total_vectors > train_limit {
         total_vectors / train_limit
@@ -357,37 +358,37 @@ pub fn train_roots_gpu(
     info!("🚀 [PHASE 1 START] Training {} Roots on {} sampled vectors (Subsampled from {} with stride {} )",
           num_roots, num_train, total_vectors, stride);
 
-    // 2. Create the Strided Training Set
-    // We cannot just slice; we must copy specific vectors into a new buffer.
-    // This ensures we pick from Batch 1, Batch 2 ... Batch N evenly.
-
     let start = Instant::now();
     let res = Resources::new().expect("GPU Resource failed");
 
+    // 3. Create Training Buffer
+    let mut train_data: Vec<f32> = Vec::with_capacity(num_train * vector_dims as usize);
+
+    // 4. Strided Copy Loop
     for i in 0..num_train {
-        // Calculate index in the source array
         let src_idx = (i * stride) * vector_dims as usize;
 
-        // Safety check to prevent out-of-bounds (rare rounding edge cases)
+        // Safety check
         if src_idx + vector_dims as usize > full_vectors.len() {
             break;
         }
 
-        // Copy this specific vector
         let vector_slice = &full_vectors[src_idx..src_idx + vector_dims as usize];
         train_data.extend_from_slice(vector_slice);
     }
 
-    // Update num_train in case we stopped early due to bounds
     let actual_train_count = train_data.len() / vector_dims as usize;
 
+    // 5. Create Array
     let train_array = Array2::from_shape_vec(
         (actual_train_count, vector_dims as usize),
         train_data
-    ).expect("reshape failed")
+    ).expect("reshape failed");
 
     let dataset = ManagedTensor::from(&train_array).to_device(&res).expect("xfer failed");
-    let mut centroids_gpu = ManagedTensor::from(&Array2::<f32>::zeros((num_roots as usize, vector_dims as usize))).to_device(&res).expect("alloc failed");
+    let mut centroids_gpu = ManagedTensor::from(
+        &Array2::<f32>::zeros((num_roots as usize, vector_dims as usize))
+    ).to_device(&res).expect("alloc failed");
 
     let params = kmeans::Params::new().expect("params failed")
         .set_n_clusters(num_roots as i32)
