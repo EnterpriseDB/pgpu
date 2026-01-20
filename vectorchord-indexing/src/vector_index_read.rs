@@ -60,7 +60,7 @@ impl VectorReadBatcher {
             warning!("batch size {num_samples_per_batch} will lead to a remainder of {rem} samples in the last batch; which is too small for clustering. The last batch will be enlarged to {0} to contain this remainder", vbr.num_samples_per_batch + rem)
         }
         // TODO: calculate this from a new input "max memory GB"
-        info!("vector batch read properties:\n\t num_samples: {num_samples}\n\t num_samples_per_batch: {num_samples_per_batch}\n\t num_batches: {nb}\n\t table_size: {table_size}", nb=vbr.num_batches(), num_samples=vbr.num_samples, num_samples_per_batch=vbr.num_samples_per_batch, table_size=table_size);
+        //info!("vector batch read properties:\n\t num_samples: {num_samples}\n\t num_samples_per_batch: {num_samples_per_batch}\n\t num_batches: {nb}\n\t table_size: {table_size}", nb=vbr.num_batches(), num_samples=vbr.num_samples, num_samples_per_batch=vbr.num_samples_per_batch, table_size=table_size);
         vbr
     }
 
