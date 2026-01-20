@@ -55,9 +55,10 @@ pub fn index(
 
     if let Some(num_roots) = num_clusters_top_option {
         let num_leaves = num_clusters_leaf;
-        let num_leaves_per_root = num_leaves / num_roots;
+        let num_leaves_per_root = num_leaves / num_roots; // 160k/400=400
 
         // 1. Calculate Sample Size based on Sampling Factor
+        // Target Clusters×Sampling Factor=Required Samples = eg. 160k*256= 40,960,000
         let num_samples_to_read = (num_leaves as u64).saturating_mul(sampling_factor as u64);
 
         info!("🏗️ [HIERARCHICAL DETECTED] Starting Top-Down Build");

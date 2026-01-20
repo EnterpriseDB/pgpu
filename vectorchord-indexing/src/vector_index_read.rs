@@ -41,6 +41,12 @@ impl VectorReadBatcher {
 
         // --- NEW: Run the dry run here ---
         vbr.dry_run_random_offset();
+        // Target Clusters×Sampling Factor=Required Samples = 160k *256= 40,960,000
+        //qualified_table.clone(),
+        //    column_name.clone(),
+        //    num_samples_to_read,
+        //    batch_size, 5M
+        //    1,
         // ---------------------------------
 
         let table_size = (vbr).num_tuples();
@@ -281,37 +287,65 @@ impl VectorReadBatcher {
         Some((matrix_flat, dims as u32))
     }*/
 
-    /// DRY RUN: Calculates and logs the random offset strategy without executing it.
+
+    /// Strategy:
+    /// 1. Instead of one continuous scan, we treat each batch as an independent read.
+    /// 2. For Batch X, we calculate a random offset `O` such that `O + BatchSize <= TotalRows`.
+    /// 3. This ensures we sample the table uniformly across the entire disk.
     fn dry_run_random_offset(&mut self) {
-        // 1. Get counts
-        // We call num_tuples() to ensure the cache is populated
         let total_rows = self.num_tuples();
-        let needed_rows = self.num_samples;
+        let total_needed = self.num_samples;
+        let batch_size = self.num_samples_per_batch;
 
-        info!("📊 [Offset Dry Run] Table Status: Total Rows = {}, Samples Needed = {}  ", total_rows, needed_rows);
+        // Calculate how many batches we will run
+        // (Integer math equivalent of ceil division)
+        let num_batches = (total_needed + batch_size - 1) / batch_size;
 
-        // 2. Logic check
-        if total_rows <= needed_rows {
-            pgrx::warning!("⚠️ [Offset Dry Run] Table is too small for offsetting. (Total {} <= Needed {})", total_rows, needed_rows);
+        info!("📊 [Offset Dry Run] Strategy: Multi-Seek Sampling");
+        info!("   • Total Table Rows: {}", total_rows);
+        info!("   • Target Samples:   {}", total_needed);
+        info!("   • Batch Size:       {}", batch_size);
+        info!("   • Total Batches:    {}", num_batches);
+
+        if total_rows < batch_size {
+            pgrx::warning!("⚠️ Table is smaller than a single batch! ({} < {}). Cannot offset.", total_rows, batch_size);
             return;
         }
 
-        // 3. Calculate max possible offset
-        let max_offset = total_rows - needed_rows;
+        info!("🎲 [Offset Dry Run] Generated Plan:");
 
-        // 4. Generate Random Number
-        // We execute a quick SQL command to get a safe random number from Postgres
-        let random_start = Spi::get_one::<i64>(&format!("SELECT (random() * {})::bigint", max_offset))
-            .ok()
-            .flatten()
-            .unwrap_or(0);
+        for i in 0..num_batches {
+            // 1. Determine size for THIS batch (Last batch might be smaller)
+            let samples_so_far = i * batch_size;
+            let remaining = total_needed.saturating_sub(samples_so_far);
+            let this_batch_size = std::cmp::min(batch_size, remaining);
 
-        // 5. Log the Plan
-        info!(
-            "🎲 [Offset Dry Run] PLAN: Start Index: row #{}, Read Length: {} rows, End Index: row #{}  ",
-            random_start,
-            needed_rows,
-            random_start as u64 + needed_rows
-        );
+            if this_batch_size == 0 { break; }
+
+            // 2. Calculate Max Valid Offset
+            // We can start anywhere, as long as (Start + Size) <= TotalRows
+            // This ensures we never try to read past the end of the table.
+            let max_start_index = total_rows - this_batch_size;
+
+            // 3. Generate Random Offset via Postgres
+            // We ask Postgres for a random number in range [0, max_start_index]
+            let random_offset = Spi::get_one::<i64>(&format!("SELECT (random() * {})::bigint", max_start_index))
+                .ok()
+                .flatten()
+                .unwrap_or(0) as u64;
+
+            // 4. Log the Interval
+            let end_index = random_offset + this_batch_size;
+
+            info!(
+                "   Batch #{:<3} | Needs: {:<8} | 🎲 Random Interval: Rows [ {:<9} .. {:<9} ]",
+                i + 1,
+                this_batch_size,
+                random_offset,
+                end_index
+            );
+        }
+
+        info!("✅ [Offset Dry Run] Plan generated successfully.");
     }
 }
