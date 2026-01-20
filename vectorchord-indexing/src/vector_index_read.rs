@@ -22,8 +22,23 @@ impl VectorReadBatcher {
     ) -> Self {
         let start_time = Instant::now();
 
-        // 1. STRICT QUOTING (Fixes case sensitivity/schema issues)
-        // Transforms "public.table" -> "\"public\".\"table\""
+        // 1. FORCE "DIRTY READ" VISIBILITY (Crucial for Cold Start)
+        // We use GetLatestSnapshot() to bypass transaction isolation and see
+        // data that exists on disk immediately after DB startup.
+        unsafe {
+            pg_sys::SetCurrentStatementStartTimestamp();
+            if !pg_sys::ActiveSnapshotSet() {
+                let snap = pg_sys::GetLatestSnapshot();
+                if snap.is_null() {
+                    // If even Latest is null, we are too early, but we try anyway.
+                    warning!("⚠️ Critical: GetLatestSnapshot() returned NULL. Reading might fail.");
+                } else {
+                    pg_sys::PushActiveSnapshot(snap);
+                }
+            }
+        }
+
+        // 2. STRICT QUOTING (Fixes "public.table" -> "\"public\".\"table\"")
         let quoted_table = if raw_table_name.contains('.') {
             raw_table_name.split('.')
                 .map(|part| format!("\"{}\"", part))
@@ -33,39 +48,15 @@ impl VectorReadBatcher {
             format!("\"{}\"", raw_table_name)
         };
 
-        // 2. FORCE SNAPSHOT (The "Dirty Read" workaround)
-        unsafe {
-            pg_sys::SetCurrentStatementStartTimestamp();
-            if !pg_sys::ActiveSnapshotSet() {
-                // Try Transaction Snapshot first, fallback to Latest
-                let snap = pg_sys::GetTransactionSnapshot();
-                if !snap.is_null() {
-                    pg_sys::PushActiveSnapshot(snap);
-                } else {
-                    pg_sys::PushActiveSnapshot(pg_sys::GetLatestSnapshot());
-                }
-            }
-        }
-
-        // 3. ENV CHECK & BLIND COUNT
-        let (db_name, total_rows) = Spi::connect(|client| {
-            let db = client.select("SELECT current_database()", None, &[])
-                .and_then(|t| t.get_one::<String>())
-                .unwrap_or(Some("?".to_string()))
-                .unwrap_or("?".to_string());
-
-            // Try to count, but don't panic if 0
-            let cnt = client.select(&format!("SELECT count(*) FROM {}", quoted_table), None, &[])
+        // 3. TRY COUNT (But Ignore Failure)
+        let total_rows = Spi::connect(|client| {
+            client.select(&format!("SELECT count(*) FROM {}", quoted_table), None, &[])
                 .and_then(|t| t.get_one::<i64>())
                 .unwrap_or(Some(0))
-                .unwrap_or(0);
+                .unwrap_or(0)
+        });
 
-            Ok::<(String, i64), pgrx::spi::Error>((db, cnt))
-        }).expect("SPI Connect Failed");
-
-        info!("🌍 Internal DB: [{}] | Catalog Count: {}", db_name, total_rows);
-
-        // 4. OFFSET CALCULATION (Fallback to 0 if count failed)
+        // 4. CALCULATE OFFSET (Fallback to 0 if count failed)
         let offset = if total_rows > num_samples as i64 {
              Spi::connect(|client| {
                 let max_off = total_rows - num_samples as i64;
@@ -73,24 +64,35 @@ impl VectorReadBatcher {
                     .and_then(|t| t.get_one::<i64>()).unwrap_or(Some(0)).unwrap_or(0)
             })
         } else {
-            warning!("⚠️ Count returned 0 or -1. Defaulting to OFFSET 0 (Blind Read).");
+            // This is the fix for "0 rows found": We ignore the count and read anyway.
+            info!("⚠️ Count was 0/Null. Defaulting to OFFSET 0 to force-read data.");
             0
         };
 
-        // 5. VECTORCHORD LOAD (Blind Attempt)
-        // We try to read even if the count said 0.
+        info!("🎯 [VectorChord] Target: {} | Offset: {} | Attempting to read {} vectors", quoted_table, offset, num_samples);
+
+        // 5. EXECUTE BLIND LOAD
         let (cached_vectors, dims) = Spi::connect(|client| {
             let mut vecs = Vec::new();
             let mut detected_dims = 0;
 
+            // Debug Log: Prove we are connected to the right DB
+            let db = client.select("SELECT current_database()", None, &[])
+                .and_then(|t| t.get_one::<String>())
+                .unwrap_or(Some("?".to_string()))
+                .unwrap_or("?".to_string());
+
+            if vecs.is_empty() {
+                info!("🌍 Internal DB Context: [{}]", db);
+            }
+
+            // The Query: Sequential Block Read
             let query = format!(
                 "SELECT \"{}\" FROM {} OFFSET {} LIMIT {}",
                 column_name, quoted_table, offset, num_samples
             );
 
-            info!("🚀 Executing Blind Load: {}", query);
-
-            let table = client.select(&query, None, &[]).expect("Read Failed");
+            let table = client.select(&query, None, &[]).expect("Select Failed");
 
             for row in table {
                 let datum = row.get_datum_by_ordinal(1).expect("Col missing").value::<Datum>();
@@ -106,7 +108,7 @@ impl VectorReadBatcher {
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((vecs, detected_dims))
         }).expect("SPI Load Failed");
 
-        // 6. CLEANUP
+        // 6. CLEANUP SNAPSHOT
         unsafe {
             if pg_sys::ActiveSnapshotSet() {
                 pg_sys::PopActiveSnapshot();
@@ -117,10 +119,10 @@ impl VectorReadBatcher {
         let count_loaded = cached_vectors.len() / (safe_dims as usize);
 
         if count_loaded == 0 {
-             pgrx::error!("FATAL: Read 0 vectors. Confirm 'VACUUM ANALYZE' was run and table '{}' is in DB '{}'.", quoted_table, db_name);
+             pgrx::error!("FATAL: Still read 0 rows. Confirm 'VACUUM ANALYZE' was run and table '{}' is in DB.", quoted_table);
         }
 
-        info!("✅ [VectorChord] Success: Loaded {} vectors.", count_loaded);
+        info!("✅ [VectorChord] Success: Loaded {} vectors in {:.2?}", count_loaded, start_time.elapsed());
 
         VectorReadBatcher {
             num_samples,
