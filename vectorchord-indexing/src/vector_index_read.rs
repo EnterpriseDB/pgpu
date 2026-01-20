@@ -1,6 +1,6 @@
 use crate::vector_type;
 use pgrx::pg_sys::{self, varlena};
-use pgrx::info;
+use pgrx::{info, Spi};
 use std::ffi::{CStr, CString};
 use std::time::Instant;
 
@@ -26,8 +26,8 @@ impl VectorReadBatcher {
         let mut detected_dims = 0;
 
         unsafe {
-            // 1. SETUP SNAPSHOT (Dirty Read)
-            // Essential for background workers starting early in the lifecycle.
+            // 1. SETUP SNAPSHOT (CRITICAL)
+            // We force a snapshot immediately to ensure visibility for catalog lookups
             let mut snapshot = pg_sys::GetLatestSnapshot();
             if snapshot.is_null() {
                 snapshot = pg_sys::GetTransactionSnapshot();
@@ -36,62 +36,47 @@ impl VectorReadBatcher {
                 pg_sys::PushActiveSnapshot(snapshot);
             }
 
-            // 2. RESOLVE OID (Using RangeVarGetRelidExtended)
-            let c_name = CString::new(table_name.clone()).expect("Invalid table name");
-            let text_ptr = pg_sys::cstring_to_text(c_name.as_ptr());
+            // 2. RESOLVE OID & ATTNUM (Safer Approach)
+            // We use standard C functions to look these up instead of manual looping
+            let c_table = CString::new(table_name.clone()).unwrap();
+            let c_col = CString::new(column_name.clone()).unwrap();
+
+            // Resolve Table OID
+            let text_ptr = pg_sys::cstring_to_text(c_table.as_ptr());
             let list_ptr = pg_sys::textToQualifiedNameList(text_ptr);
             let range_var = pg_sys::makeRangeVarFromNameList(list_ptr);
-
-            // PG17 Signature: (relation, lockmode, flags, callback, callback_arg)
-            // flags=0 (Default), callback=None, callback_arg=NULL
             let rel_oid = pg_sys::RangeVarGetRelidExtended(
                 range_var,
                 pg_sys::AccessShareLock as i32,
-                0,                  // flags (0 = Panic if missing)
-                None,               // callback
-                std::ptr::null_mut()// callback_arg
+                0, None, std::ptr::null_mut()
             );
 
-            info!("🧬 [System Scan] Resolved OID: {} for table '{}'", rel_oid, table_name);
+            // Resolve Column Number (Attnum)
+            // get_attnum is a standard PG helper (oid, char*) -> i16
+            let attnum = pg_sys::get_attnum(rel_oid, c_col.as_ptr());
+
+            if attnum <= 0 {
+                panic!("FATAL: Column '{}' not found (Attnum: {}).", column_name, attnum);
+            }
+
+            info!("🧬 [Safe Scan] OID: {} | AttNum: {}", rel_oid, attnum);
 
             // 3. OPEN RELATION
             let rel = pg_sys::table_open(rel_oid, pg_sys::AccessShareLock as i32);
-
-            // 4. FIND ATTRIBUTE
             let tup_desc = (*rel).rd_att;
-            let mut attnum = 0;
 
-            for i in 0..(*tup_desc).natts {
-                let attr = *(*tup_desc).attrs.as_ptr().add(i as usize);
-                let name_ptr = attr.attname.data.as_ptr();
-                let name = CStr::from_ptr(name_ptr).to_string_lossy();
-
-                if name == column_name {
-                    attnum = attr.attnum;
-                    break;
-                }
-            }
-
-            if attnum == 0 {
-                pg_sys::table_close(rel, pg_sys::AccessShareLock as i32);
-                panic!("FATAL: Column '{}' not found in table schema.", column_name);
-            }
-
-            // 5. BEGIN HEAP SCAN
-            // 6-Argument signature for PG17
+            // 4. BEGIN HEAP SCAN
             let scan_desc = pg_sys::heap_beginscan(
                 rel,
                 snapshot,
                 0,
                 std::ptr::null_mut(),
-                std::ptr::null_mut(), // ParallelTableScanDesc
-                0                     // flags
+                std::ptr::null_mut(),
+                0
             );
 
-            // 6. SCAN LOOP
+            // 5. SCAN LOOP
             let mut vectors_loaded = 0;
-
-            // Use the ScanDirection module path found in your grep
             let direction = pg_sys::ScanDirection::ForwardScanDirection;
 
             loop {
@@ -99,8 +84,6 @@ impl VectorReadBatcher {
                 if tuple.is_null() { break; }
 
                 let mut is_null = false;
-
-                // Explicit cast i16 -> i32 for attnum
                 let datum = pg_sys::heap_getattr(
                     tuple,
                     attnum as i32,
@@ -109,12 +92,24 @@ impl VectorReadBatcher {
                 );
 
                 if !is_null {
-                    // Transmute Datum wrapper to usize -> pointer
-                    let val: usize = std::mem::transmute(datum);
-                    let ptr = val as *mut varlena;
+                    // --- THE SEGFAULT FIX: DETOASTING ---
+                    // 1. Cast datum (usize) to raw pointer
+                    let raw_ptr = datum as *mut varlena;
 
-                    let byte_slice = pgrx::varlena_to_byte_slice(ptr);
+                    // 2. Detoast! (Unpack compressed/external data)
+                    // This moves data to local memory if needed.
+                    // pg_detoast_datum returns a pointer to the safe, raw struct.
+                    let safe_ptr = pg_sys::pg_detoast_datum(raw_ptr);
+
+                    // 3. Now it is safe to read length/bytes
+                    let byte_slice = pgrx::varlena_to_byte_slice(safe_ptr);
                     let (vals, d_dims) = vector_type::decode_pgvector_vector(byte_slice);
+
+                    // 4. Free the detoasted copy if it was allocated
+                    // (If safe_ptr != raw_ptr, Postgres allocated memory we should free,
+                    // but usually in short-lived contexts, palloc frees it at end of txn.
+                    // For safety in a big loop, strictly we might want pfree, but
+                    // relying on MemoryContext reset is standard for batch jobs).
 
                     if detected_dims == 0 { detected_dims = d_dims; }
                     vecs.extend(vals);
@@ -126,7 +121,7 @@ impl VectorReadBatcher {
                 }
             }
 
-            // 7. CLEANUP
+            // 6. CLEANUP
             pg_sys::heap_endscan(scan_desc);
             pg_sys::table_close(rel, pg_sys::AccessShareLock as i32);
 
@@ -139,10 +134,10 @@ impl VectorReadBatcher {
         let count_loaded = vecs.len() / (safe_dims as usize);
 
         if count_loaded == 0 {
-             panic!("FATAL: [System Scan] Read 0 vectors. The disk appears empty.");
+             panic!("FATAL: [Safe Scan] Read 0 vectors.");
         }
 
-        info!("✅ [System Scan] Success: Loaded {} vectors in {:.2?}", count_loaded, start_time.elapsed());
+        info!("✅ [Safe Scan] Success: Loaded {} vectors in {:.2?}", count_loaded, start_time.elapsed());
 
         VectorReadBatcher {
             num_samples,
