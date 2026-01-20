@@ -1,6 +1,6 @@
 use crate::vector_type;
-use pgrx::pg_sys::{self, Datum};
-use pgrx::{info, Spi, warning, error, pg_sys::varlena};
+use pgrx::pg_sys::{self, Datum, varlena};
+use pgrx::{info, Spi, warning};
 use std::time::Instant;
 
 pub struct VectorReadBatcher {
@@ -22,60 +22,53 @@ impl VectorReadBatcher {
     ) -> Self {
         let start_time = Instant::now();
 
-        // 1. RESOLVE OID & CHECK VISIBILITY
-        // We use the internal regclass logic to see if Postgres even knows what this is.
-        let (total, table_oid) = Spi::connect(|client| {
-            // Force a snapshot update - critical for background workers
-            unsafe { pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot()); }
+        // --- STEP 1: INITIALIZE SNAPSHOT ---
+        // This solves the 'Database=[?]' and 'Count=0' issues by forcing
+        // the background worker to see committed data.
+        unsafe {
+            if pg_sys::IsTransactionState() {
+                pg_sys::PushActiveSnapshot(pg_sys::GetTransactionSnapshot());
+            }
+        }
 
-            let oid_res = client.select(&format!("SELECT '{}'::regclass::oid", full_table_name), None, &[])
-                .and_then(|t| t.get_one::<pg_sys::Oid>());
+        // --- STEP 2: GET COUNT & RECTIFY OID ---
+        let total: i64 = Spi::connect(|client| {
+            // Check current context for the log
+            let db: String = client.select("SELECT current_database()", None, &[])
+                .and_then(|t| t.get_one()).unwrap_or(Some("unknown".into())).unwrap();
 
-            let oid = match oid_res {
-                Ok(Some(id)) => id,
-                _ => {
-                    error!("FATAL: Table [{}] not found in database. Check the name/quotes.", full_table_name);
-                    return Ok((0i64, 0));
-                }
-            };
-
-            // Get the count using the OID directly (bypassing schema-resolution issues)
-            let count = client.select(&format!("SELECT reltuples::bigint FROM pg_class WHERE oid = {}", oid), None, &[])
+            // Direct count on the provided table name
+            let count = client.select(&format!("SELECT count(*) FROM {}", full_table_name), None, &[])
                 .and_then(|t| t.get_one::<i64>())
                 .unwrap_or(Some(0))
                 .unwrap_or(0);
 
-            Ok::<(i64, pg_sys::Oid), pgrx::spi::Error>((count, oid))
+            info!("🌍 [SPI SESSION] DB: {} | Table: {} | Count: {}", db, full_table_name, count);
+            Ok::<i64, pgrx::spi::Error>(count)
         }).expect("SPI Connection Fail");
 
-        info!("🧬 Forensic: OID {} | Found {} rows in catalog", table_oid, total);
-
-        // 2. THE NUCLEAR COUNT (If catalog is -1 or 0)
-        let actual_total = if total <= 0 {
-            warning!("Catalog says 0. Forcing a sequential row count scan...");
+        // --- STEP 3: CALCULATE VECTORCHORD OFFSET ---
+        let offset: i64 = if total > num_samples as i64 {
             Spi::connect(|client| {
-                client.select(&format!("SELECT count(*) FROM {}", full_table_name), None, &[])
+                let max_off = total - num_samples as i64;
+                client.select(&format!("SELECT (random() * {})::bigint", max_off), None, &[])
                     .and_then(|t| t.get_one::<i64>())
                     .unwrap_or(Some(0))
                     .unwrap_or(0)
             })
         } else {
-            total
+            0
         };
 
-        if actual_total == 0 {
-            error!("❌ ABSOLUTE ZERO: Even a direct count returned 0 rows for {}. Data is uncommitted or in a different database.", full_table_name);
-        }
-
-        // 3. LOAD DATA (Explicit Column and Table quoting)
+        // --- STEP 4: LOAD BLOCK DATA ---
         let (cached_vectors, dims) = Spi::connect(|client| {
             let mut vecs = Vec::new();
             let mut detected_dims = 0;
 
-            // We use the OID for the table to be 100% sure we hit the same object
+            // VectorChord: Read a continuous block starting from a random offset
             let query = format!(
-                "SELECT \"{}\" FROM {} LIMIT {}",
-                column_name, full_table_name, num_samples
+                "SELECT \"{}\" FROM {} OFFSET {} LIMIT {}",
+                column_name, full_table_name, offset, num_samples
             );
 
             let table = client.select(&query, None, &[]).expect("Load failed");
@@ -91,15 +84,24 @@ impl VectorReadBatcher {
                     vecs.extend(vals);
                 }
             }
-
-            // Cleanup snapshot
-            unsafe { pg_sys::PopActiveSnapshot(); }
-
             Ok::<(Vec<f32>, u32), pgrx::spi::Error>((vecs, detected_dims))
         }).expect("SPI Final Load Fail");
 
+        // --- STEP 5: CLEANUP SNAPSHOT ---
+        unsafe {
+            if pg_sys::ActiveSnapshotSet() {
+                pg_sys::PopActiveSnapshot();
+            }
+        }
+
         let safe_dims = if dims == 0 { 1 } else { dims };
-        info!("✅ Load Done: {} vectors loaded.", cached_vectors.len() / (safe_dims as usize));
+        let count_loaded = (cached_vectors.len() as u64) / (safe_dims as u64);
+
+        if count_loaded == 0 {
+            warning!("❗ Warning: 0 vectors loaded. Row count was {}, Offset was {}.", total, offset);
+        } else {
+            info!("✅ VectorChord Load Success: {} vectors in {:.2?}", count_loaded, start_time.elapsed());
+        }
 
         VectorReadBatcher {
             num_samples,
@@ -112,13 +114,22 @@ impl VectorReadBatcher {
     }
 
     pub fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
-        if self.cached_vectors.is_empty() || self.vectors_read >= self.num_samples { return None; }
+        if self.cached_vectors.is_empty() || self.vectors_read >= self.num_samples {
+            return None;
+        }
+
         let mut to_read = self.num_samples_per_batch as usize;
         let remaining = (self.num_samples - self.vectors_read) as usize;
-        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize { to_read = remaining; }
+
+        if remaining < (self.num_samples_per_batch + self.min_samples_per_batch) as usize {
+            to_read = remaining;
+        }
+
         let start = (self.vectors_read as usize) * (self.dims as usize);
         let end = start + (to_read * self.dims as usize);
+
         if end > self.cached_vectors.len() { return None; }
+
         let batch = self.cached_vectors[start..end].to_vec();
         self.vectors_read += to_read as u64;
         Some((batch, self.dims))
