@@ -1,4 +1,3 @@
-use crate::vector_type;
 use pgrx::pg_sys;
 use pgrx::{info, Spi};
 use std::time::Instant;
@@ -15,7 +14,7 @@ pub struct VectorReadBatcher {
 impl VectorReadBatcher {
     pub fn new(
         table_name: String,
-        _column_name: String, // Unused for this sanity check
+        _column_name: String, // Unused for count(*)
         num_samples: u64,
         num_samples_per_batch: u64,
         min_samples_per_batch: u64,
@@ -23,12 +22,10 @@ impl VectorReadBatcher {
         let start_time = Instant::now();
 
         // 1. DIAGNOSTICS: Check Transaction State
-        // SPI requires an active transaction. If this is false, we found the root cause.
         let is_txn = unsafe { pg_sys::IsTransactionState() };
         info!("🔍 [Sanity Check] Is Transaction Active? {}", is_txn);
 
         // 2. SNAPSHOT: Ensure we can see data
-        // Even in standard envs, background workers sometimes need this push.
         unsafe {
             let snap = pg_sys::GetTransactionSnapshot();
             if !snap.is_null() {
@@ -36,11 +33,12 @@ impl VectorReadBatcher {
             }
         }
 
-        // 3. EXECUTE SIMPLE SQL
+        // 3. EXECUTE SIMPLE SQL (Fixed Syntax)
         // We use Spi::connect manually to catch the exact error if it fails.
         let result = Spi::connect(|client| {
-            // A. Check simple connectivity
-            let db_name = client.select("SELECT current_database()", None, None)
+            // A. Check connectivity
+            // Fix: Pass &[] instead of None for arguments
+            let db_name = client.select("SELECT current_database()", None, &[])
                 .map(|t| t.get_one::<String>().unwrap_or(Some("?".to_string())))
                 .unwrap_or(Some("ERROR".to_string()));
 
@@ -52,7 +50,8 @@ impl VectorReadBatcher {
 
             info!("🚀 [Sanity Check] Running: {}", query);
 
-            let count = client.select(&query, None, None)
+            // Fix: Pass &[] for arguments
+            let count = client.select(&query, None, &[])
                 .and_then(|t| t.get_one::<i64>());
 
             Ok::<Option<i64>, pgrx::spi::Error>(count.ok().flatten())
@@ -71,11 +70,17 @@ impl VectorReadBatcher {
             Ok(Some(c)) => {
                 info!("✅ [Sanity Check] Success! Count: {}", c);
                 if c == 0 {
-                    info!("⚠️ Table exists but is empty (or rows are invisible).");
+                    // If count is 0, the table is empty or invisible to this transaction.
+                    // This confirms the "Cold Start" theory.
+                    panic!("FATAL: Table exists but count(1) returned 0. Visibility issue confirmed.");
                 }
             },
             Ok(None) => info!("⚠️ [Sanity Check] Query ran but returned NULL."),
-            Err(e) => info!("❌ [Sanity Check] SPI Failed: {:?}", e), // This prints the real error
+            Err(e) => {
+                // If this prints, we know exactly why SPI is failing (e.g. "Relation does not exist")
+                info!("❌ [Sanity Check] SPI Failed with Error: {:?}", e);
+                panic!("FATAL: SPI Connection Failed. See logs above.");
+            }
         }
 
         // Return dummy to prevent crash, allowing you to read logs
