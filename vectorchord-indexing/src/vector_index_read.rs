@@ -47,15 +47,11 @@ impl VectorReadBatcher {
 
         vbr.initialize();
 
-        // --- NEW: Run the dry run here ---
-        vbr.dry_run_random_offset();
-        // Target Clusters×Sampling Factor=Required Samples = 160k *256= 40,960,000
-        //qualified_table.clone(),
-        //    column_name.clone(),
-        //    num_samples_to_read,
-        //    batch_size, 5M
-        //    1,
-        // ---------------------------------
+        // Optional: Log the random plan if enabled
+        if vbr.random_sampling {
+            vbr.random_batch_sampling();
+        }
+
 
         let table_size = (vbr).num_tuples();
         assert!(num_samples <= table_size as u64, "The table has fewer records ({table_size}) than the desired number of samples ({num_samples}) based on cluster_count*sampling_factor. Unable to continue");
