@@ -15,6 +15,7 @@ pub struct VectorReadBatcher {
     table_scan: Option<SysScanDesc>,
     pg_rel: Option<PgRelation>,
     col_num: Option<usize>,
+    random_sampling: bool,
 }
 
 impl VectorReadBatcher {
@@ -25,6 +26,11 @@ impl VectorReadBatcher {
         num_samples_per_batch: u64,
         min_samples_per_batch: u64,
     ) -> Self {
+        // --- 🧪 TEST CONFIGURATION ---
+        // Change this to 'false' to revert to sequential scanning
+        let use_random_sampling = true;
+        // -----------------------------
+
         let mut vbr = VectorReadBatcher {
             table_name,
             column_name,
@@ -36,7 +42,9 @@ impl VectorReadBatcher {
             table_scan: None,
             pg_rel: None,
             col_num: None,
+            random_sampling: use_random_sampling,
         };
+
         vbr.initialize();
 
         // --- NEW: Run the dry run here ---
@@ -60,135 +68,164 @@ impl VectorReadBatcher {
         vbr
     }
 
-    pub fn num_batches(&self) -> u32 {
-        self.num_samples.div_ceil(self.num_samples_per_batch) as u32
+    pub(crate) fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
+        // Stop if we are done
+        if self.vectors_read >= self.num_samples {
+            return None;
+        }
+
+        // Calculate needed samples
+        let mut samples_to_read = self.num_samples_per_batch;
+        let size_next_batch = self.num_samples
+            .saturating_sub(self.vectors_read)
+            .saturating_sub(self.num_samples_per_batch);
+
+        if size_next_batch < self.min_samples_per_batch {
+            samples_to_read += size_next_batch;
+        }
+
+        // Dispatch based on strategy
+        if self.random_sampling {
+            self.next_batch_random(samples_to_read)
+        } else {
+            // SEQUENTIAL: Just read from current position
+            self.read_and_decode_rows(samples_to_read)
+        }
     }
 
-    // original SQL/SPI based implementation. Unused because of memory "leak": https://github.com/pgcentralfoundation/pgrx/issues/2211
-    // left-in for reference
-    /*    pub(crate) fn get_batch_cursor(&mut self) -> Option<(Vec<f32>, u32)> {
-        debug1!("(SPI/SQL Cursor) Reading a batch of {vectors_per_batch} vectors (total vectors to read: {vectors_total}) from {table_name}.{column_name}...",
-        vectors_total = self.vectors_total,
-        vectors_per_batch = self.vectors_per_batch,
-        table_name = self.table_name,
-        column_name = self.column_name,);
+    // -------------------------------------------------------------------------
+    // 2. THE NEW RANDOM STRATEGY (Self-Contained)
+    // -------------------------------------------------------------------------
+    fn next_batch_random(&mut self, samples_to_read: u64) -> Option<(Vec<f32>, u32)> {
+        // A. Reset scan to the start
+        self.restart_scan();
 
+        // B. Calculate Random Jump
+        let total_rows = self.num_tuples();
+        let max_start = total_rows.saturating_sub(samples_to_read);
+
+        let random_offset = Spi::get_one::<i64>(&format!("SELECT (random() * {})::bigint", max_start))
+            .ok().flatten().unwrap_or(0) as u64;
+
+        debug1!("🎲 [Random] Skipping {} rows...", random_offset);
+
+        // C. The "Burn" Loop (Seek)
+        unsafe {
+            let scan = self.table_scan.expect("scan not active");
+            for _ in 0..random_offset {
+                let tuple = pg_sys::systable_getnext(scan);
+                if tuple.is_null() { break; }
+            }
+        }
+
+        // D. Hand off to the standard reader to get the actual data
+        self.read_and_decode_rows(samples_to_read)
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. THE SHARED DECODER (Extracted from your original code)
+    // -------------------------------------------------------------------------
+    fn read_and_decode_rows(&mut self, count: u64) -> Option<(Vec<f32>, u32)> {
         let start_time = Instant::now();
 
-        // Open the cursor on the first use. We will reference it by name
-        if self.cursor_name.is_none() {
-            // TODO: use pgvector libs to get access to the native vector type and remove casting
-            let source_table_query = &format!(
-                "SELECT {column_name}::float4[] AS raw_embedding FROM {table_name} LIMIT {vectors_total}",
-                column_name = self.column_name,
-                vectors_total = self.vectors_total,
-                table_name = self.table_name,
-            );
-            let cursor_name = Spi::connect_mut(|client| {
-                let cursor = client.open_cursor(source_table_query, &[]);
-                Ok::<_, spi::Error>(cursor.detach_into_name())
-            })
-            .expect("error opening cursor");
-            self.cursor_name = Some(cursor_name);
-        }
+        unsafe {
+            let scan = self.table_scan.expect("scan not initialized");
+            let pg_rel = self.pg_rel.clone().expect("rel not initialized");
+            let tup_desc = pg_rel.tuple_desc();
+            let col_num_nonzero = std::num::NonZero::new(self.col_num.unwrap() as i32).unwrap();
 
-        // get one batch from the cursor
-        let vecs = Spi::connect_mut(|client| {
-            let mut cursor = client
-                .find_cursor(self.cursor_name.as_ref().unwrap())
-                .expect("unable to find cursor");
+            let mut all_vectors: Vec<f32> = Vec::new();
+            let mut dims: u32 = 0;
+            let mut read_count = 0;
 
-            let res = cursor
-                .fetch(self.vectors_per_batch as c_long)
-                .expect("unable to fetch vectors")
-                .map(|row| Ok::<Vec<f32>, SpiError>(row["raw_embedding"].value()?.unwrap()))
-                .collect::<Result<Vec<_>, SpiError>>()
-                .expect("error reading vectors from table");
+            for _ in 0..count {
+                // 1. Get Tuple
+                let tuple = pg_sys::systable_getnext(scan);
+                if tuple.is_null() { break; }
 
-            // The cursor needs to be detached explicitly if we want to use it again. Otherwise, it will be dropped
-            // once this function returns
-            if !res.is_empty() {
-                self.cursor_name = Some(cursor.detach_into_name());
+                // 2. Get Datum
+                let datum = heap_getattr_raw(tuple, col_num_nonzero, tup_desc.as_ptr())
+                    .expect("unable to get datum");
+
+                // 3. Detoast & Decode (Your original logic)
+                let raw_ptr = datum.cast_mut_ptr();
+                let detoasted_ptr = pg_sys::pg_detoast_datum(raw_ptr);
+
+                let byte_slice = pgrx::varlena_to_byte_slice(detoasted_ptr);
+                let (vector_values, vector_dims) = vector_type::decode_pgvector_vector(byte_slice);
+
+                if dims == 0 { dims = vector_dims; }
+                all_vectors.extend_from_slice(&vector_values);
+                read_count += 1;
+
+                // 4. Cleanup
+                if detoasted_ptr != raw_ptr {
+                    pg_sys::pfree(detoasted_ptr as *mut std::ffi::c_void);
+                }
             }
-            res
-        });
 
-        let dims = match vecs.first() {
-            Some(vector) => vector.len(),
-            None => 0,
-        };
+            self.vectors_read += read_count;
 
-        info!(
-            "Read {} vectors in: {:.2?}",
-            vecs.len(),
-            start_time.elapsed()
-        );
-        match vecs.is_empty() {
-            true => None,
-            false => Some((vecs.into_iter().flatten().collect(), dims as u32)),
+            info!("✅ Batch Loaded: {} vectors in {:.2?} (Random: {})",
+                read_count, start_time.elapsed(), self.random_sampling);
+
+            if all_vectors.is_empty() { None } else { Some((all_vectors, dims)) }
         }
-    }*/
+    }
+
+    // -------------------------------------------------------------------------
+    // HELPERS
+    // -------------------------------------------------------------------------
+
+    fn restart_scan(&mut self) {
+        unsafe {
+            if let Some(scan) = self.table_scan {
+                pg_sys::systable_endscan(scan);
+            }
+            let pg_rel = self.pg_rel.as_ref().expect("PgRelation not open");
+            let scan = pg_sys::systable_beginscan(
+                pg_rel.as_ptr(), pg_sys::InvalidOid, false,
+                pg_sys::GetTransactionSnapshot(), 0, std::ptr::null_mut(),
+            );
+            self.table_scan = Some(scan);
+        }
+    }
 
     fn initialize(&mut self) {
         let pg_rel = PgRelation::open_with_name_and_share_lock(&self.table_name)
             .expect("unable to open table");
-        if !pg_rel.is_table() {
-            pgrx::error!(
-                "table {} is not a table; only regular tables are supported",
-                self.table_name
-            );
-        }
 
-        // look for the column number
         let tup_desc = pg_rel.tuple_desc();
         let mut col_num_found: Option<i32> = None;
         for attr in tup_desc.iter().filter(|a| !a.attisdropped) {
             let col_name = pgrx::name_data_to_str(&attr.attname);
             unsafe {
                 if col_name == self.column_name {
-                    let type_name = CStr::from_ptr(format_type_be(attr.atttypid))
-                        .to_str()
-                        .expect("invalid type name");
-                    if type_name != "vector" {
-                        pgrx::error!("column \"{}\" type is not \"vector\". Only pgvector/vector types are supported", self.column_name);
-                    }
-                    col_num_found = Some(attr.attnum.into());
+                     let type_name = CStr::from_ptr(format_type_be(attr.atttypid)).to_str().unwrap();
+                     if type_name != "vector" { pgrx::error!("column type is not vector"); }
+                     col_num_found = Some(attr.attnum.into());
                 }
             }
         }
-        let col_num = col_num_found.unwrap_or_else(|| {
-            pgrx::error!(
-                "column {} not found in table {}",
-                self.column_name,
-                self.table_name
-            )
-        });
+        let col_num = col_num_found.expect("column not found");
         self.col_num = Some(col_num as usize);
 
-        // initialize a simple sequential table scan; "systable_beginscan" is just called "systable" for historical reasons
-        // very common to use this wrapper on user tables
         let scan = unsafe {
             pg_sys::systable_beginscan(
-                pg_rel.as_ptr(),
-                pg_sys::InvalidOid,               // no index
-                false,                            // no idex use
-                pg_sys::GetTransactionSnapshot(), // we need to use our snapshot to not violate MVCC
-                0,                                // number of scan keys
-                std::ptr::null_mut(),             // no key; no filter needed
+                pg_rel.as_ptr(), pg_sys::InvalidOid, false,
+                pg_sys::GetTransactionSnapshot(), 0, std::ptr::null_mut(),
             )
         };
         self.table_scan = Some(scan);
-        self.pg_rel = Some(pg_rel.clone());
+        self.pg_rel = Some(pg_rel);
         debug1!("systable scan initialized");
     }
 
     pub(crate) fn num_tuples(&mut self) -> u64 {
         match self.num_tuples_in_table {
             None => {
-                let tuples: i64 =
-                    Spi::get_one(format!("SELECT COUNT(1) FROM {}", self.table_name).as_str())
-                        .unwrap()
-                        .unwrap();
+                let tuples: i64 = Spi::get_one(format!("SELECT COUNT(1) FROM {}", self.table_name).as_str())
+                        .unwrap().unwrap();
                 self.num_tuples_in_table = Some(tuples as u64);
                 tuples as u64
             }
@@ -198,154 +235,29 @@ impl VectorReadBatcher {
 
     pub(crate) fn end_scan(self) {
         let scan = self.table_scan.expect("systable scan not initialized");
-        unsafe {
-            pg_sys::systable_endscan(scan);
-        }
+        unsafe { pg_sys::systable_endscan(scan); }
     }
 
-    pub(crate) fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
-        // take the remainder into this batch if it would be too small for clustering
-        let mut samples_to_read = self.num_samples_per_batch;
-        let size_next_batch = self
-            .num_samples
-            .saturating_sub(self.vectors_read)
-            .saturating_sub(self.num_samples_per_batch);
-        if size_next_batch < self.min_samples_per_batch {
-            samples_to_read += size_next_batch;
-        }
-        debug1!("({vectors_read}/{num_samples}) Reading next batch of {num_samples_per_batch} from {table_name}.{column_name}...",
-            num_samples = self.num_samples,
-            vectors_read = self.vectors_read,
-            num_samples_per_batch = samples_to_read,
-            table_name = self.table_name,
-            column_name = self.column_name
-        );
-        let start_time = Instant::now();
-        unsafe {
-            assert!(
-                self.table_scan.is_some(),
-                "systable scan not initialized; call start_scan() first"
-            );
-
-            let scan = self.table_scan.expect("systable scan not initialized");
-            let pg_rel = self
-                .pg_rel
-                .clone()
-                .expect("tuple descriptor not initialized");
-            let tup_desc = pg_rel.tuple_desc();
-            let col_num = self.col_num.expect("column number not initialized");
-            let col_num_nonzero = std::num::NonZero::new(col_num).unwrap();
-
-            let mut all_vectors: Vec<f32> = Vec::new();
-            let mut dims: u32 = 0;
-            for _i in 0..samples_to_read {
-                if self.vectors_read >= self.num_samples {
-                    break;
-                }
-                self.vectors_read += 1;
-                let tuple = pg_sys::systable_getnext(scan);
-                if tuple.is_null() {
-                    break;
-                }
-                //debug3!("({i}) got a tuple");
-
-                let datum = heap_getattr_raw(tuple, col_num_nonzero, tup_desc.as_ptr())
-                    .expect("unable to get datum");
-                //debug3!("({i}) got a datum: {:?}", datum);
-
-                let raw_ptr = datum.cast_mut_ptr();
-                let detoasted_ptr = pg_sys::pg_detoast_datum(raw_ptr);
-
-                let byte_slice = pgrx::varlena_to_byte_slice(detoasted_ptr);
-                //debug5!("({i}) got bytes: {:?}", byte_slice);
-
-                let (vector_values, vector_dims) = vector_type::decode_pgvector_vector(byte_slice);
-                all_vectors.extend_from_slice(&vector_values);
-                dims = vector_dims;
-                //debug5!("({i}) got the vector: {:?}", vector_values);
-
-                if detoasted_ptr != raw_ptr {
-                    pg_sys::pfree(detoasted_ptr as *mut std::ffi::c_void);
-                }
-            }
-
-            debug1!("Read vectors in: {:.2?}", start_time.elapsed());
-            match all_vectors.is_empty() {
-                true => None,
-                false => Some((all_vectors, dims)),
-            }
-        }
-    }
-
-    /*    pub fn get_batch_test(&self) -> Option<(Vec<f32>, u32)> {
-        let dims = 2000;
-        let inner_vec: Vec<f32> = std::iter::repeat(0.01234).take(dims).collect();
-        let matrix: Vec<Vec<f32>> = std::iter::repeat(inner_vec.clone())
-            .take(self.vectors_per_batch as usize)
-            .collect();
-        let matrix_flat: Vec<f32> = matrix.into_iter().flatten().collect();
-        Some((matrix_flat, dims as u32))
-    }*/
-
-
-    /// Strategy:
-    /// 1. Instead of one continuous scan, we treat each batch as an independent read.
-    /// 2. For Batch X, we calculate a random offset `O` such that `O + BatchSize <= TotalRows`.
-    /// 3. This ensures we sample the table uniformly across the entire disk.
-    fn dry_run_random_offset(&mut self) {
+    fn random_batch_sampling(&mut self) {
         let total_rows = self.num_tuples();
         let total_needed = self.num_samples;
         let batch_size = self.num_samples_per_batch;
-
-        // Calculate how many batches we will run
-        // (Integer math equivalent of ceil division)
         let num_batches = (total_needed + batch_size - 1) / batch_size;
 
-        info!("📊 [Offset Dry Run] Strategy: Multi-Seek Sampling");
-        info!("   • Total Table Rows: {}", total_rows);
-        info!("   • Target Samples:   {}", total_needed);
-        info!("   • Batch Size:       {}", batch_size);
-        info!("   • Total Batches:    {}", num_batches);
-
-        if total_rows < batch_size {
-            pgrx::warning!("⚠️ Table is smaller than a single batch! ({} < {}). Cannot offset.", total_rows, batch_size);
-            return;
-        }
-
-        info!("🎲 [Offset Dry Run] Generated Plan:");
+        info!("📊 [Random Batch Sampling] Plan: Batches={}  ", num_batches);
 
         for i in 0..num_batches {
-            // 1. Determine size for THIS batch (Last batch might be smaller)
             let samples_so_far = i * batch_size;
             let remaining = total_needed.saturating_sub(samples_so_far);
             let this_batch_size = std::cmp::min(batch_size, remaining);
-
             if this_batch_size == 0 { break; }
 
-            // 2. Calculate Max Valid Offset
-            // We can start anywhere, as long as (Start + Size) <= TotalRows
-            // This ensures we never try to read past the end of the table.
             let max_start_index = total_rows - this_batch_size;
-
-            // 3. Generate Random Offset via Postgres
-            // We ask Postgres for a random number in range [0, max_start_index]
             let random_offset = Spi::get_one::<i64>(&format!("SELECT (random() * {})::bigint", max_start_index))
-                .ok()
-                .flatten()
-                .unwrap_or(0) as u64;
+                .ok().flatten().unwrap_or(0);
 
-            // 4. Log the Interval
-            let end_index = random_offset + this_batch_size;
-
-            info!(
-                "   Batch #{:<3} | Needs: {:<8} | 🎲 Random Interval: Rows [ {:<9} .. {:<9} ]",
-                i + 1,
-                this_batch_size,
-                random_offset,
-                end_index
-            );
+            info!("   Batch #{}: Needs {} | Random range ~ [ {} .. {} ]",
+                i + 1, this_batch_size, random_offset, random_offset as u64 + this_batch_size);
         }
-
-        info!("✅ [Offset Dry Run] Plan generated successfully.");
     }
 }
