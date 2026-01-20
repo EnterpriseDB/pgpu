@@ -116,6 +116,18 @@ pub fn index(
         let d_load = t_load_start.elapsed();
         info!("✅ Training Dataset Loaded: {} vectors. Time: {:.2?}", loaded_count, d_load);
 
+        // NORMALIZE IF SPHERICAL
+        if spherical_centroids {
+            info!("📐 [Spherical Mode] Normalizing {} training vectors...", loaded_count);
+            for chunk in training_dataset.chunks_mut(vector_dims as usize) {
+                let mut norm_sq = 0.0;
+                for x in chunk.iter() { norm_sq += x * x; }
+                let norm = norm_sq.sqrt();
+                if norm > 1e-6 {
+                    for x in chunk.iter_mut() { *x /= norm; }
+                }
+            }
+        }
 
         // ========================================================================================
         // PHASE 1: MANUAL QUALITY-CONTROLLED ROOTS
@@ -180,8 +192,21 @@ pub fn index(
         }
 
         // Move the best results into the final variables
-        let root_centroids = best_roots;
+        let mut root_centroids = best_roots;
         let assignments = best_assignments;
+
+        // RE-NORMALIZE ROOTS
+        if spherical_centroids {
+             for chunk in root_centroids.chunks_mut(vector_dims as usize) {
+                let mut norm_sq = 0.0;
+                for x in chunk.iter() { norm_sq += x * x; }
+                let norm = norm_sq.sqrt();
+                if norm > 1e-6 {
+                    for x in chunk.iter_mut() { *x /= norm; }
+                }
+            }
+        }
+
         let d_p1_total_wall = t_p1_start.elapsed();
         info!("✅ Phase 1 Done. Best Attempt: Train {:.2?} / Part {:.2?}", best_train_duration, best_part_duration);
 
@@ -250,16 +275,34 @@ pub fn index(
                 target_leaves,
                 15
             );
-
             // [RESIDUAL CHANGE]: Add Root back to Residual to store absolute position
             let root_start = i * vector_dims as usize;
             let root_vec = &root_centroids[root_start..root_start + vector_dims as usize];
 
             for leaf_res_chunk in leaf_residuals.chunks(vector_dims as usize) {
                 let mut absolute_leaf = vec![0.0f32; vector_dims as usize];
+
+                // 1. Reconstruct: Absolute = Root + Residual
                 for j in 0..vector_dims as usize {
                     absolute_leaf[j] = root_vec[j] + leaf_res_chunk[j];
                 }
+
+                // 2. Normalize if spherical
+                if spherical_centroids {
+                    let mut norm_sq = 0.0;
+                    for x in absolute_leaf.iter() {
+                        norm_sq += x * x;
+                    }
+                    let norm = norm_sq.sqrt();
+
+                    // Safety check against zero vectors (unlikely but good practice)
+                    if norm > 1e-12 {
+                        for x in absolute_leaf.iter_mut() {
+                            *x /= norm;
+                        }
+                    }
+                }
+
                 final_results.push((absolute_leaf, parent_id));
             }
             total_leaves_trained += leaf_residuals.len() / vector_dims as usize;
