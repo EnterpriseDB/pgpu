@@ -105,7 +105,11 @@ impl VectorReadBatcher {
         let random_offset = Spi::get_one::<i64>(&format!("SELECT (random() * {})::bigint", max_start))
             .ok().flatten().unwrap_or(0) as u64;
 
-        debug1!("🎲 [Random] Skipping {} rows...", random_offset);
+        // --- UPDATED LOGGING ---
+        let end_row = random_offset + samples_to_read;
+        info!("🎲 [Random Exec] Reading Interval: Rows [ {} .. {} ] (Skipping {} rows)",
+              random_offset, end_row, random_offset);
+        // -----------------------
 
         // C. The "Burn" Loop (Seek)
         unsafe {
