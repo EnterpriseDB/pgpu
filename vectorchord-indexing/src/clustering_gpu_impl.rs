@@ -25,10 +25,7 @@ pub fn run_clustering_batch(
     let res = Resources::new().expect("GPU Resource creation failed");
 
     // Shape is (rows, cols). Rows is determined by the length of the vector input divided by dimensions.
-    let vectors_array =
-        Array2::from_shape_vec((num_vectors, vector_dims as usize), vectors.to_vec())
-            .expect("shaping vectors failed");
-
+    let vectors_array  = Array2::from_shape_vec((num_vectors, vector_dims as usize),vectors).expect("shaping vectors failed");
     let dataset = ManagedTensor::from(&vectors_array)
         .to_device(&res)
         .expect("vectors->tensor transformation failed");
@@ -141,11 +138,10 @@ pub fn run_clustering_consolidate(
     let res = Resources::new().expect("GPU Resource creation failed");
 
     let vectors_array =
-        Array2::from_shape_vec((num_vectors, vector_dims as usize), vectors.to_vec())
-            .expect("shaping vectors failed");
+        Array2::from_shape_vec((num_vectors, vector_dims as usize), vectors).expect("shaping vectors failed");
 
     let weights_array =
-        Array1::from_shape_vec(num_vectors, weights.to_vec()).expect("shaping vectors failed");
+        Array1::from_shape_vec(num_vectors, weights).expect("shaping vectors failed");
 
     let weights = ManagedTensor::from(&weights_array)
         .to_device(&res)
