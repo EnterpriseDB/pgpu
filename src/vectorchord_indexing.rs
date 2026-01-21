@@ -14,6 +14,7 @@ pub fn create_vector_index_on_gpu(
     skip_index_build: default!(bool, false),
     spherical_centroids: default!(bool, false),
     residual_quantization: default!(bool, false),
+    random_sampling: default!(bool, true),
 ) {
     let auto_lists: Vec<u32> = match lists {
         None => {
@@ -45,5 +46,6 @@ pub fn create_vector_index_on_gpu(
         skip_index_build,
         spherical_centroids,
         residual_quantization,
+        random_sampling,
     );
 }

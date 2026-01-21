@@ -17,13 +17,18 @@ pub fn create_vectorchord_index(
     Spi::run(&format!("DROP INDEX IF EXISTS {index_name};"))
         .expect("error deleting old centroids table");
 
-    Spi::run(&format!(
+    let create_sql = format!(
         "CREATE INDEX {index_name} ON {schema_table} USING vchordrq (embedding {index_metric_type}) WITH (options = $$
 residual_quantization = {residual_quantization}
 build.pin = 2
 [build.external]
 table = '{centroids_table_name}'
 $$);"
-    ))
-    .expect("error creating vectorchord index");
+    );
+
+    info!("📢 [SQL EXECUTION] Calling VectorChord Indexer with the following command:\n{}", create_sql);
+    info!("-----------------------------------------------------------------------");
+
+    Spi::run(&create_sql)
+        .expect("error creating vectorchord index");
 }
