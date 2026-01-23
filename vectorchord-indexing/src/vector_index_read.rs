@@ -32,7 +32,6 @@ impl VectorReadBatcher {
         let target_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
 
         // 2. Get Physical Size (Robust, No ANALYZE needed)
-        // We use pg_relation_size to get the exact on-disk byte count.
         let table_bytes: i64 = Spi::get_one(&format!(
             "SELECT pg_relation_size('{}'::regclass)",
             qualified_table_name
@@ -41,13 +40,11 @@ impl VectorReadBatcher {
         let total_blocks = (table_bytes / 8192).max(1) as u64;
 
         // 3. Estimate Density (Vectors per Block)
-        // Vectors are usually TOASTed (stored externally).
-        // A conservative 100 rows/block ensures we queue enough blocks to hit the target.
         let est_vectors_per_block = 100;
 
         let blocks_needed = (target_samples / est_vectors_per_block) + 1;
 
-        // Safety Buffer: Read 20% extra blocks to handle empty pages/dead rows
+        // Safety Buffer: Read 20% extra blocks
         let blocks_to_queue = (blocks_needed as f64 * 1.2) as u64;
         let blocks_to_queue = blocks_to_queue.clamp(1, total_blocks);
 
@@ -58,18 +55,14 @@ impl VectorReadBatcher {
         // 4. Generate Random Block List (Manual Shuffle)
         let mut all_blocks: Vec<u64> = (0..total_blocks).collect();
 
-        // --- Dependency-Free Random Shuffle (Xorshift) ---
-        // Seed with current time
         let mut seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos() as u64;
 
-        // Simple Fisher-Yates shuffle
         let len = all_blocks.len();
         if len > 1 {
             for i in (1..len).rev() {
-                // Xorshift algorithm to generate next random number
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
@@ -79,9 +72,7 @@ impl VectorReadBatcher {
                 all_blocks.swap(i, j);
             }
         }
-        // --------------------------------------------------
 
-        // Keep only the random subset we need
         let blocks_to_read = all_blocks.into_iter().take(blocks_to_queue as usize).collect();
 
         VectorReadBatcher {
@@ -91,7 +82,7 @@ impl VectorReadBatcher {
             vectors_read: 0,
             blocks_to_read,
             current_block_idx: 0,
-            blocks_per_query: 50, // Read 50 blocks per SQL call for efficiency
+            blocks_per_query: 50,
             active: true,
         }
     }
@@ -115,28 +106,19 @@ impl VectorReadBatcher {
         self.current_block_idx = end_idx;
 
         // 2. Build the Direct Block Access Query (TID Scan)
-        // We use a Common Table Expression (CTE) with VALUES to force Postgres
-        // to join specifically on the block numbers we want.
-        // Logic: ctid >= (block, 0) AND ctid < (block+1, 0)
-
-        let block_list_str: String = batch_blocks.iter()
-            .map(|b| b.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        // Note: We format the list as "(1), (4), (9)..." for the VALUES clause
         let values_list = batch_blocks.iter()
             .map(|b| format!("({})", b))
             .collect::<Vec<_>>()
             .join(",");
 
+        // FIX: Added parenthesis concat for valid TID syntax: '(' || blk || ',0)'
         let query = format!(
             "WITH target_blocks(blk) AS (VALUES {}) \
              SELECT t.{} \
              FROM {} t \
              JOIN target_blocks b \
-             ON t.ctid >= (b.blk::text || ',0')::tid \
-             AND t.ctid < ((b.blk + 1)::text || ',0')::tid",
+             ON t.ctid >= ('(' || b.blk::text || ',0)')::tid \
+             AND t.ctid < ('(' || (b.blk + 1)::text || ',0)')::tid",
              values_list,
              self.column_name,
              self.qualified_table_name
@@ -178,8 +160,6 @@ impl VectorReadBatcher {
 
         debug1!("✅ Scanned {} blocks -> {} vectors ({:.2?})", batch_blocks.len(), read_count, _start_time.elapsed());
 
-        // If a batch of blocks was empty (e.g. vacuumed pages), we return empty vectors.
-        // The caller loop in index.rs will just call next_batch() again immediately.
         Some((all_vectors, dims))
     }
 
