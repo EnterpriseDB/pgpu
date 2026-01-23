@@ -1,5 +1,5 @@
 use crate::vector_type;
-use pgrx::{debug1, info, warning, Spi};
+use pgrx::{debug1, info, Spi}; // Removed unused 'warning'
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::Instant;
 
@@ -34,8 +34,7 @@ impl VectorReadBatcher {
         let total_blocks = (table_bytes / 8192).max(1) as u64;
 
         // 3. Exact Density Calculation
-        // We need to know if the vector is TOASTed (stored externally) or Inline.
-        // We fetch type info safely using Spi::connect.
+        // Use Spi::connect to safely inspect the column definition
         let (dims, vec_byte_size) = Spi::connect(|client| {
             let sql = format!(
                 "SELECT a.atttypmod \
@@ -44,28 +43,31 @@ impl VectorReadBatcher {
                 qualified_table_name, column_name
             );
 
-            let mut dims = 0;
-            if let Ok(table) = client.select(&sql, None, None) {
-                if let Some(row) = table.first() {
-                    if let Ok(Some(d)) = row.get_datum_by_ordinal(1) {
-                         // atttypmod for vector is usually the dimension
-                         let val: i32 = unsafe { d.value::<i32>().unwrap_or(-1) };
-                         if val > 0 { dims = val as u64; }
+            let mut found_dims = 0;
+            // FIX: Pass &[] for arguments, not None
+            if let Ok(table) = client.select(&sql, None, &[]) {
+                // FIX: Use iterator to get first row safely
+                for row in table {
+                    if let Ok(entry) = row.get_datum_by_ordinal(1) {
+                         // FIX: Safe unwrapping of Result<Option<i32>>
+                         if let Ok(Some(val)) = entry.value::<i32>() {
+                             if val > 0 { found_dims = val as u64; }
+                         }
                     }
+                    break; // We only need the first result
                 }
             }
-            (dims, dims * 4)
+            (found_dims, found_dims * 4)
         });
 
         // Postgres Constants
         const BLOCK_SIZE: u64 = 8192;
         const PAGE_HEADER: u64 = 24;
-        const TUPLE_HEADER: u64 = 24; // HeapTupleHeader
+        const TUPLE_HEADER: u64 = 24;
         const LINE_POINTER: u64 = 4;
         const TOAST_PTR_SIZE: u64 = 18;
 
-        // 768d vector (3KB) > 2KB threshold -> TOASTed.
-        // If 0 dims (unknown), assume TOASTed for safety.
+        // If unknown (0 dims), assume TOASTed for safety.
         let is_toasted = vec_byte_size > 2000 || vec_byte_size == 0;
 
         let data_size = if is_toasted { TOAST_PTR_SIZE } else { vec_byte_size };
@@ -78,7 +80,7 @@ impl VectorReadBatcher {
 
         info!("🔍 [SAMPLER] Calculated Density: {} rows/block", density);
 
-        // 4. Plan the Read (Add 10% buffer for fragmentation)
+        // 4. Plan the Read (Add 10% buffer)
         let blocks_needed = (target_samples / density) + 1;
         let blocks_to_queue = ((blocks_needed as f64 * 1.1) as u64).clamp(1, total_blocks);
 
@@ -117,14 +119,13 @@ impl VectorReadBatcher {
         let batch_blocks = &self.blocks_to_read[self.current_block_idx..end_idx];
         self.current_block_idx = end_idx;
 
-        // 2. Format for VALUES clause: (1), (2), (3)
+        // 2. Format for VALUES clause
         let values_list = batch_blocks.iter()
             .map(|b| format!("({})", b))
             .collect::<Vec<_>>()
             .join(",");
 
         // 3. TID Scan Query
-        // The fix: We must explicitly format the TID string as '(blk,0)' with parentheses.
         let query = format!(
             "WITH target_blocks(blk) AS (VALUES {}) \
              SELECT t.{} \
@@ -142,7 +143,8 @@ impl VectorReadBatcher {
             let mut dims: u32 = 0;
             let mut count = 0;
 
-            if let Ok(table) = client.select(&query, None, None) {
+            // FIX: Pass &[] for arguments
+            if let Ok(table) = client.select(&query, None, &[]) {
                 for row in table {
                     if let Ok(entry) = row.get_datum_by_ordinal(1) {
                         if let Ok(Some(datum)) = entry.value::<pgrx::pg_sys::Datum>() {
