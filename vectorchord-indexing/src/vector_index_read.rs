@@ -88,21 +88,27 @@ impl VectorReadBatcher {
             let mut dims: u32 = 0;
             let mut count = 0;
 
-            if let Ok(table) = client.select(&fetch_sql, None, None) {
+            if let Ok(table) = client.select(&fetch_sql, None, &[]) {
                 for row in table {
-                    if let Ok(Some(datum)) = row.get_datum_by_ordinal(1) {
-                        unsafe {
-                            let raw_ptr = datum.cast_mut_ptr();
-                            let detoasted_ptr = pgrx::pg_sys::pg_detoast_datum(raw_ptr);
-                            let byte_slice = pgrx::varlena_to_byte_slice(detoasted_ptr);
-                            let (vec_vals, vec_dims) = vector_type::decode_pgvector_vector(byte_slice);
+                    // ERROR 2 FIX: Correctly unpack the SpiHeapTupleDataEntry
+                    // get_datum_by_ordinal returns Result<Entry>, not Result<Option<Datum>>
+                    if let Ok(entry) = row.get_datum_by_ordinal(1) {
+                        // Check if the entry has a value (is not null)
+                        if let Some(datum) = entry.value() {
+                            unsafe {
+                                let raw_ptr = datum.cast_mut_ptr();
+                                let detoasted_ptr = pgrx::pg_sys::pg_detoast_datum(raw_ptr);
 
-                            if dims == 0 { dims = vec_dims; }
-                            vectors.extend_from_slice(&vec_vals);
-                            count += 1;
+                                let byte_slice = pgrx::varlena_to_byte_slice(detoasted_ptr);
+                                let (vec_vals, vec_dims) = vector_type::decode_pgvector_vector(byte_slice);
 
-                            if detoasted_ptr != raw_ptr {
-                                pgrx::pg_sys::pfree(detoasted_ptr as *mut std::ffi::c_void);
+                                if dims == 0 { dims = vec_dims; }
+                                vectors.extend_from_slice(&vec_vals);
+                                count += 1;
+
+                                if detoasted_ptr != raw_ptr {
+                                    pgrx::pg_sys::pfree(detoasted_ptr as *mut std::ffi::c_void);
+                                }
                             }
                         }
                     }
