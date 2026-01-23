@@ -57,13 +57,12 @@ pub fn index(
     if let Some(num_roots) = num_clusters_top_option {
         let num_leaves = num_clusters_leaf;
         let num_leaves_per_root = num_leaves / num_roots;
+        let num_samples_target = (num_leaves as u64).saturating_mul(sampling_factor as u64);
 
-        // 1. Calculate Sample Size based on Sampling Factor
-        let num_samples_to_read = (num_leaves as u64).saturating_mul(sampling_factor as u64);
 
         info!("🏗️ [HIERARCHICAL DETECTED] Starting Top-Down Build");
         info!("📊 Target: {} Roots | {} Leaves ({} per root)", num_roots, num_leaves, num_leaves_per_root);
-        info!("📉 Sampling: Factor={} -> Reading {} vectors for training", sampling_factor, num_samples_to_read);
+        info!("📉 Sampling: Factor={} -> Reading {} vectors for training", sampling_factor, num_samples_target);
 
         info!("⚙️ Clustering Configuration:\n\
            \t• Target Lists (Leaf):  {}\n\
@@ -86,7 +85,7 @@ pub fn index(
         );
 
 
-        let mut training_dataset: Vec<f32> = Vec::with_capacity((num_samples_to_read as usize) * 768);
+        let mut training_dataset: Vec<f32> = Vec::with_capacity((num_samples_target as usize) * 768);
         let mut vector_dims = 0;
         let mut loaded_count = 0;
 
@@ -97,7 +96,7 @@ pub fn index(
         while let Some((vecs, dims)) = batcher.next_batch() {
             if vector_dims == 0 {
                 vector_dims = dims;
-                let total_bytes = (num_samples_to_read as u64) * (dims as u64) * 4;
+                let total_bytes = (num_samples_target as u64) * (dims as u64) * 4;
                 let gb_usage = total_bytes as f64 / 1_073_741_824.0;
 
                 info!("📝 Detected Vector Dims: {}  ", dims);
@@ -120,7 +119,7 @@ pub fn index(
             // ------------------------------------------
 
             if loaded_count % 5_000_000 == 0 {
-                info!("... Loaded {}/{} samples", loaded_count, num_samples_to_read);
+                info!("... Loaded {}/{} samples", loaded_count, num_samples_target);
             }
         }
         batcher.end_scan();

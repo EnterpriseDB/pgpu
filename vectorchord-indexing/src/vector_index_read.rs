@@ -1,7 +1,6 @@
 use crate::vector_type;
-use pgrx::{debug1, info, Spi};
+use pgrx::{info, Spi}; // Removed unused 'debug1', 'warning'
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::time::Instant;
 
 pub struct VectorReadBatcher {
     qualified_table_name: String,
@@ -43,6 +42,7 @@ impl VectorReadBatcher {
             );
 
             let mut found_dims = 0;
+            // Use empty slice for args
             if let Ok(table) = client.select(&sql, None, &[]) {
                 for row in table {
                     if let Ok(entry) = row.get_datum_by_ordinal(1) {
@@ -82,9 +82,6 @@ impl VectorReadBatcher {
         // 5. Generate Random Block List
         let blocks_to_read = generate_shuffled_blocks(total_blocks, blocks_to_queue);
 
-        // OPTIMIZATION:
-        // Use 500 blocks per query (~100MB - 200MB per batch depending on density).
-        // This is safe for Postgres SPI and drastically reduces query overhead.
         VectorReadBatcher {
             qualified_table_name,
             column_name,
@@ -92,7 +89,7 @@ impl VectorReadBatcher {
             vectors_read: 0,
             blocks_to_read,
             current_block_idx: 0,
-            blocks_per_query: 500, // <--- 10x Speedup here
+            blocks_per_query: 500, // Optimized batch size
             active: true,
         }
     }
@@ -107,21 +104,18 @@ impl VectorReadBatcher {
             return None;
         }
 
-        let _start_time = Instant::now();
-
         // 1. Get batch of block IDs
         let end_idx = (self.current_block_idx + self.blocks_per_query).min(self.blocks_to_read.len());
         let batch_blocks = &self.blocks_to_read[self.current_block_idx..end_idx];
         self.current_block_idx = end_idx;
 
-        // 2. Format for ARRAY construction (Faster than VALUES for large lists)
+        // 2. Format for ARRAY construction
         let block_array_str = batch_blocks.iter()
             .map(|b| b.to_string())
             .collect::<Vec<_>>()
             .join(",");
 
-        // 3. TID Scan Query (Optimized)
-        // logic: JOIN UNNEST(ARRAY[...]) ...
+        // 3. TID Scan Query (Optimized UNNEST)
         let query = format!(
             "SELECT t.{} \
              FROM {} t \
@@ -134,7 +128,8 @@ impl VectorReadBatcher {
         );
 
         let (all_vectors, dims, read_count) = Spi::connect(|client| {
-            let mut vectors: Vec<f32> = Vec::with_capacity(batch_blocks.len() * 150 * 768); // Pre-allocate
+            // Pre-allocate to avoid reallocations
+            let mut vectors: Vec<f32> = Vec::with_capacity(batch_blocks.len() * 150 * 768);
             let mut dims: u32 = 0;
             let mut count = 0;
 
@@ -164,10 +159,6 @@ impl VectorReadBatcher {
         });
 
         self.vectors_read += read_count as u64;
-
-        // Log progress every ~500 blocks so we know it's moving
-        // debug1!("✅ Scanned {} blocks -> {} vectors ({:.2?})", batch_blocks.len(), read_count, _start_time.elapsed());
-
         Some((all_vectors, dims))
     }
 
@@ -180,13 +171,11 @@ impl VectorReadBatcher {
 fn generate_shuffled_blocks(total_blocks: u64, limit: u64) -> Vec<u64> {
     let mut all_blocks: Vec<u64> = (0..total_blocks).collect();
 
-    // Seed with time (Xorshift)
     let mut seed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
 
-    // Fisher-Yates
     let len = all_blocks.len();
     if len > 1 {
         for i in (1..len).rev() {
