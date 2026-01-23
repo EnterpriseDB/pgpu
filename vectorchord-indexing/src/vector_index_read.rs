@@ -1,22 +1,15 @@
 use crate::vector_type;
-use pgrx::{debug1, info, warning, pg_sys, Spi}; // Added pg_sys
+use pgrx::{info, Spi};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::ptr;
 
 pub struct VectorReadBatcher {
-    // We hold the Relation pointer open (Unsafe C Pointer)
-    relation: pg_sys::Relation,
-
+    qualified_table_name: String,
+    column_name: String,
     target_samples: u64,
     vectors_read: u64,
-
     blocks_to_read: Vec<u64>,
     current_block_idx: usize,
-
-    // The exact column index (1-based) for the vector data
-    vector_att_num: i16,
-
-    prefetch_distance: usize,
+    blocks_per_query: usize,
     active: bool,
 }
 
@@ -26,175 +19,160 @@ impl VectorReadBatcher {
         column_name: String,
         num_clusters: u32,
         sampling_factor: u32,
-        _batch_size: u64,
+        _requested_batch_size: u64,
     ) -> Self {
-        // 1. SAFE SETUP: Use SQL to get Metadata (Robustness)
-        let (rel_oid_res, total_blocks_res, att_num_res) = Spi::connect(|client| {
-            // A. Resolve Table OID
-            let oid: i64 = client.select(&format!("SELECT '{}'::regclass::oid", qualified_table_name), None, &[])
-                .unwrap().first().get_datum_by_ordinal(1).unwrap().unwrap();
-
-            // B. Get Physical Block Count
-            let bytes: i64 = client.select(&format!("SELECT pg_relation_size({})", oid), None, &[])
-                .unwrap().first().get_datum_by_ordinal(1).unwrap().unwrap();
-
-            // C. Get Attribute Number (1-based index of column)
-            let att: i16 = client.select(&format!(
-                    "SELECT attnum FROM pg_attribute WHERE attrelid = {} AND attname = '{}'",
-                    oid, column_name), None, &[])
-                .expect("Column lookup failed").first().get_datum_by_ordinal(1).unwrap().unwrap();
-
-            (oid as u32, (bytes / 8192).max(1) as u64, att)
-        });
-
+        // 1. Calculate Target
         let target_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
 
-        info!("🔍 [FAST-SCAN] Opening Table OID: {}. Column '{}' is Attribute #{}.", rel_oid_res, column_name, att_num_res);
+        // 2. Metadata & Setup (Fixed Datum Types)
+        let (total_blocks, dims) = Spi::connect(|client| {
+            // A. Enable Bitmap Prefetching (Critical for Speed)
+            let _ = client.select("SET LOCAL effective_io_concurrency = 100", None, None);
 
-        unsafe {
-            // 2. UNSAFE OPEN: Open relation directly in C
-            // AccessShareLock is the correct lock for reading (blocks DROP but allows Writes)
-            let relation = pg_sys::table_open(rel_oid_res, pg_sys::AccessShareLock as i32);
+            // B. Get Table Size (in Bytes)
+            let size_query = format!("SELECT pg_relation_size('{}'::regclass)", qualified_table_name);
+            let table_bytes: i64 = match client.select(&size_query, None, None) {
+                Ok(table) => {
+                    if let Some(row) = table.first().table {
+                         row.get_datum_by_ordinal(1).unwrap().value::<i64>().unwrap().unwrap_or(0)
+                    } else { 0 }
+                },
+                Err(_) => 0,
+            };
 
-            // 3. Plan the Read
-            // Density estimate: 150 rows/block
-            let blocks_needed = (target_samples / 150) + 1;
-            let blocks_to_queue = (blocks_needed as f64 * 1.1) as u64;
-            let blocks_to_queue = blocks_to_queue.clamp(1, total_blocks_res);
+            // C. Get Column Dimensions
+            let dim_query = format!(
+                "SELECT a.atttypmod \
+                 FROM pg_attribute a \
+                 WHERE a.attrelid = '{}'::regclass AND a.attname = '{}'",
+                qualified_table_name, column_name
+            );
 
-            info!("🔍 [FAST-SCAN] Plan: Scanning {} / {} blocks ({:.2}%)",
-                blocks_to_queue, total_blocks_res, (blocks_to_queue as f64 / total_blocks_res as f64) * 100.0);
-
-            let blocks_to_read = generate_shuffled_blocks(total_blocks_res, blocks_to_queue);
-
-            // Log first 5 blocks for sanity check
-            if !blocks_to_read.is_empty() {
-                let sample: Vec<String> = blocks_to_read.iter().take(5).map(|x| x.to_string()).collect();
-                info!("🔍 [DEBUG] First 5 Blocks: {:?}", sample);
+            let mut found_dims = 0;
+            if let Ok(table) = client.select(&dim_query, None, None) {
+                if let Some(row) = table.first().table {
+                    if let Ok(Some(val)) = row.get_datum_by_ordinal(1).unwrap().value::<i32>() {
+                        if val > 0 { found_dims = val as u64; }
+                    }
+                }
             }
 
-            VectorReadBatcher {
-                relation,
-                target_samples,
-                vectors_read: 0,
-                blocks_to_read,
-                current_block_idx: 0,
-                vector_att_num: att_num_res,
-                prefetch_distance: 20,
-                active: true,
-            }
+            ((table_bytes / 8192).max(1) as u64, found_dims)
+        });
+
+        // 3. Density Calc
+        // Constants
+        const BLOCK_SIZE: u64 = 8192;
+        const PAGE_HEADER: u64 = 24;
+        const TUPLE_HEADER: u64 = 24;
+        const LINE_POINTER: u64 = 4;
+        const TOAST_PTR_SIZE: u64 = 18;
+
+        let vec_byte_size = dims * 4;
+        let is_toasted = vec_byte_size > 2000 || vec_byte_size == 0;
+        let data_size = if is_toasted { TOAST_PTR_SIZE } else { vec_byte_size };
+        let row_footprint = TUPLE_HEADER + data_size + LINE_POINTER;
+        let density = (BLOCK_SIZE - PAGE_HEADER) / row_footprint;
+
+        info!("🔍 [SAMPLER] Table Blocks: {}. Mode: {}. Density: {} rows/blk",
+            total_blocks, if is_toasted { "TOAST" } else { "INLINE" }, density);
+
+        // 4. Plan the Read
+        let blocks_needed = (target_samples / density) + 1;
+        let blocks_to_queue = ((blocks_needed as f64 * 1.1) as u64).clamp(1, total_blocks);
+
+        info!("🔍 [SAMPLER] Target: {} vectors. Plan: Read {} blocks ({:.2}%)",
+            target_samples, blocks_to_queue, (blocks_to_queue as f64 / total_blocks as f64) * 100.0);
+
+        // 5. Generate Random Block List
+        let blocks_to_read = generate_shuffled_blocks(total_blocks, blocks_to_queue);
+
+        VectorReadBatcher {
+            qualified_table_name,
+            column_name,
+            target_samples,
+            vectors_read: 0,
+            blocks_to_read,
+            current_block_idx: 0,
+            // 5000 blocks = ~100MB-200MB per batch.
+            // This is large enough to make SQL parsing overhead negligible.
+            blocks_per_query: 5000,
+            active: true,
         }
     }
 
     pub(crate) fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
         if !self.active || self.vectors_read >= self.target_samples {
-            if self.active { self.end_scan(); }
             return None;
         }
         if self.current_block_idx >= self.blocks_to_read.len() {
-             info!("⚠️ [FAST-SCAN] Exhausted queued blocks.");
-             self.end_scan();
+             info!("⚠️ [SAMPLER] Exhausted queued blocks.");
+             self.active = false;
              return None;
         }
 
-        unsafe {
-            let mut vectors: Vec<f32> = Vec::with_capacity(100_000 * 768);
+        // 1. Get batch of block IDs
+        let end_idx = (self.current_block_idx + self.blocks_per_query).min(self.blocks_to_read.len());
+        let batch_blocks = &self.blocks_to_read[self.current_block_idx..end_idx];
+        self.current_block_idx = end_idx;
+
+        // 2. Format for ARRAY construction
+        let block_array_str = batch_blocks.iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // 3. Optimized Query
+        // JOIN UNNEST(ARRAY) is effectively a Bitmap Scan on TID ranges.
+        // With effective_io_concurrency=100, Postgres will prefetch these pages.
+        let query = format!(
+            "SELECT t.{} \
+             FROM {} t \
+             JOIN UNNEST(ARRAY[{}]) AS blk_id \
+             ON t.ctid >= ('(' || blk_id::text || ',0)')::tid \
+             AND t.ctid < ('(' || (blk_id + 1)::text || ',0)')::tid",
+             self.column_name,
+             self.qualified_table_name,
+             block_array_str
+        );
+
+        let (all_vectors, dims, read_count) = Spi::connect(|client| {
+            // Pre-allocate to avoid reallocations
+            let mut vectors: Vec<f32> = Vec::with_capacity(batch_blocks.len() * 150 * 768);
             let mut dims: u32 = 0;
-            let mut vectors_in_batch = 0;
+            let mut count = 0;
 
-            // Process up to 500 blocks per call
-            let batch_limit_blocks = 500;
-            let mut blocks_processed = 0;
+            if let Ok(table) = client.select(&query, None, None) {
+                for row in table {
+                    if let Ok(entry) = row.get_datum_by_ordinal(1) {
+                        if let Ok(Some(datum)) = entry.value::<pgrx::pg_sys::Datum>() {
+                            unsafe {
+                                let raw_ptr = datum.cast_mut_ptr();
+                                let detoasted_ptr = pgrx::pg_sys::pg_detoast_datum(raw_ptr);
+                                let byte_slice = pgrx::varlena_to_byte_slice(detoasted_ptr);
+                                let (vec_vals, vec_dims) = vector_type::decode_pgvector_vector(byte_slice);
 
-            debug1!("🚀 [DEBUG] Starting batch. Current Block Idx: {}", self.current_block_idx);
+                                if dims == 0 { dims = vec_dims; }
+                                vectors.extend_from_slice(&vec_vals);
+                                count += 1;
 
-            while blocks_processed < batch_limit_blocks && self.current_block_idx < self.blocks_to_read.len() {
-
-                // --- PREFETCHING (Async I/O) ---
-                let prefetch_idx = self.current_block_idx + self.prefetch_distance;
-                if prefetch_idx < self.blocks_to_read.len() {
-                    let blk_prefetch = self.blocks_to_read[prefetch_idx] as u32;
-                    // Check if PrefetchBuffer exists in your binding (Standard PG >= 9.x)
-                    // If this fails to compile, comment it out.
-                    pg_sys::PrefetchBuffer(self.relation, 0, blk_prefetch);
-                }
-
-                let blk_num = self.blocks_to_read[self.current_block_idx] as u32;
-                self.current_block_idx += 1;
-                blocks_processed += 1;
-
-                // 1. Read Buffer (Load Page)
-                let buffer = pg_sys::ReadBuffer(self.relation, blk_num);
-
-                // 2. Lock Buffer (Share)
-                pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
-
-                // 3. Get Page
-                let page = pg_sys::BufferGetPage(buffer);
-                let max_off = pg_sys::PageGetMaxOffsetNumber(page);
-
-                // 4. Iterate Items
-                for off in 1..=max_off {
-                    let item_id = pg_sys::PageGetItemId(page, off);
-
-                    // ItemIdIsUsed checks if the line pointer is not empty/dead
-                    if pg_sys::ItemIdIsUsed(item_id) {
-                        let item = pg_sys::PageGetItem(page, item_id);
-
-                        // Access Tuple Descriptor from Relation
-                        let tup_desc = (*self.relation).rd_att;
-
-                        let mut is_null = false;
-
-                        // getattr is a Postgres C function that handles tuple offset math
-                        // It uses the TupleDesc to know where column N starts
-                        let datum = pg_sys::getattr(
-                            item, // pointer to tuple data
-                            self.vector_att_num.into(),
-                            tup_desc,
-                            &mut is_null
-                        );
-
-                        if !is_null {
-                            // Decode directly from raw pointer
-                            let raw_ptr = datum as *mut pg_sys::varlena;
-                            let detoasted_ptr = pg_sys::pg_detoast_datum(raw_ptr);
-                            let byte_slice = pgrx::varlena_to_byte_slice(detoasted_ptr);
-
-                            let (vec_vals, vec_dims) = vector_type::decode_pgvector_vector(byte_slice);
-
-                            if dims == 0 { dims = vec_dims; }
-                            vectors.extend_from_slice(&vec_vals);
-                            vectors_in_batch += 1;
-
-                            // Memory cleanup for TOAST
-                            if detoasted_ptr != raw_ptr {
-                                pg_sys::pfree(detoasted_ptr as *mut std::ffi::c_void);
+                                if detoasted_ptr != raw_ptr {
+                                    pgrx::pg_sys::pfree(detoasted_ptr as *mut std::ffi::c_void);
+                                }
                             }
                         }
                     }
                 }
-
-                // 5. Release Buffer
-                pg_sys::UnlockReleaseBuffer(buffer);
             }
+            (vectors, dims, count)
+        });
 
-            self.vectors_read += vectors_in_batch;
-            // debug1!("✅ Batch Done. Processed {} blocks. Vectors read: {}", blocks_processed, vectors_in_batch);
-
-            Some((vectors, dims))
-        }
+        self.vectors_read += read_count as u64;
+        Some((all_vectors, dims))
     }
 
     pub(crate) fn end_scan(&mut self) {
-        if self.active {
-            unsafe {
-                // Release the table lock
-                pg_sys::table_close(self.relation, pg_sys::AccessShareLock as i32);
-            }
-            self.active = false;
-            info!("🔒 [FAST-SCAN] Relation closed.");
-        }
+        self.active = false;
     }
 }
 
