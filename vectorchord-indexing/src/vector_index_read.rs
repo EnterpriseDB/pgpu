@@ -14,7 +14,7 @@ const VECTORS_PER_BATCH: u64 = 50000;
 // =============================================================================
 
 /// Reimplementation of table_scan_sample_next_block from tableam.h
-/// Calls our TSM callback to get the next block, then calls the tableam to read it
+/// The tableam's scan_sample_next_block will call our TSM callback internally
 #[inline]
 unsafe fn table_scan_sample_next_block(
     scan: pg_sys::TableScanDesc,
@@ -22,25 +22,8 @@ unsafe fn table_scan_sample_next_block(
 ) -> bool {
     let scan_ref = &*scan;
 
-    // Cast to HeapScanDesc to access heap-specific fields
-    let heap_scan = scan as *const pg_sys::HeapScanDescData;
-    let rs_nblocks = (*heap_scan).rs_nblocks;
-
-    if rs_nblocks == 0 {
-        return false;
-    }
-
-    // Get the TSM routine and call NextSampleBlock
-    let tsm = (*scanstate).tsmroutine as *const TsmRoutine;
-
-    if let Some(next_block_fn) = (*tsm).NextSampleBlock {
-        let blockno = next_block_fn(scanstate, rs_nblocks);
-        if blockno == pg_sys::InvalidBlockNumber {
-            return false;
-        }
-    }
-
-    // Call the tableam's scan_sample_next_block
+    // Call the tableam's scan_sample_next_block directly
+    // It will call our TSM NextSampleBlock callback internally
     let relation = scan_ref.rs_rd;
     let tableam = (*relation).rd_tableam;
 
@@ -52,6 +35,7 @@ unsafe fn table_scan_sample_next_block(
 }
 
 /// Reimplementation of table_scan_sample_next_tuple from tableam.h
+/// The tableam's scan_sample_next_tuple will call our TSM callback internally
 #[inline]
 unsafe fn table_scan_sample_next_tuple(
     scan: pg_sys::TableScanDesc,
@@ -60,24 +44,8 @@ unsafe fn table_scan_sample_next_tuple(
 ) -> bool {
     let scan_ref = &*scan;
 
-    // Cast to HeapScanDesc to access heap-specific fields
-    let heap_scan = scan as *const pg_sys::HeapScanDescData;
-
-    // Get the TSM routine and call NextSampleTuple
-    let tsm = (*scanstate).tsmroutine as *const TsmRoutine;
-
-    if let Some(next_tuple_fn) = (*tsm).NextSampleTuple {
-        // Get max offset from scan - for heap this is stored after reading the block
-        let blockno = (*heap_scan).rs_cblock;
-        let maxoffset = (*heap_scan).rs_ntuples as OffsetNumber;
-
-        let tupoffset = next_tuple_fn(scanstate, blockno, maxoffset);
-        if tupoffset == pg_sys::InvalidOffsetNumber {
-            return false;
-        }
-    }
-
-    // Call the tableam's scan_sample_next_tuple
+    // Call the tableam's scan_sample_next_tuple directly
+    // It will call our TSM NextSampleTuple callback internally
     let relation = scan_ref.rs_rd;
     let tableam = (*relation).rd_tableam;
 
