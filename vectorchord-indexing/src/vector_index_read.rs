@@ -19,34 +19,47 @@ impl VectorReadBatcher {
         sampling_factor: u32,
         batch_size: u64,
     ) -> Self {
-        // Fix: Use SystemTime for a unique cursor suffix instead of missing pg_sys function
+        // Unique cursor name
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos();
         let cursor_name = format!("pgpu_cursor_{}", nanos);
 
-        // 1. Calculate Target Count
+        // 1. Calculate Target Sample Count
         let target_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
 
-        // 2. Get Total Row Estimate
-        let total_rows: i64 = Spi::get_one(&format!(
-            "SELECT reltuples::bigint FROM pg_class WHERE oid = '{}'::regclass",
+        // 2. Robust Size Estimation (No ANALYZE dependency)
+        // We check the physical file size on disk.
+        let table_bytes: i64 = Spi::get_one(&format!(
+            "SELECT pg_relation_size('{}'::regclass)",
             qualified_table_name
-        )).expect("SPI failed to look up table size").unwrap_or(1_000_000);
+        )).expect("SPI failed to look up table size").unwrap_or(0);
 
-        let total_rows = total_rows.max(1) as u64;
+        let table_bytes = table_bytes.max(0) as u64;
+        let total_blocks = table_bytes / 8192; // Standard Postgres Page Size
+
+        // Conservative Estimate: Assume 50 rows per block (for TOASTed vectors).
+        // This is safe: If real density is higher (200 rows), we just read 4x more data (fast).
+        // If we assumed high density and it was low, we would run out of data.
+        let est_rows_from_disk = total_blocks * 50;
 
         // 3. Determine Query Strategy
-        let query = if target_samples < total_rows {
+        // We use Block Sampling if the estimated rows are significantly larger than our target.
+        let use_block_sampling = total_blocks > 100 && target_samples < (est_rows_from_disk / 2);
+
+        let query = if use_block_sampling {
             // A. FAST BLOCK SAMPLING (TABLESAMPLE SYSTEM)
-            let ratio = target_samples as f64 / total_rows as f64;
-            // Request 10% extra (1.1x) to cover empty pages/dead tuples
-            let percent = (ratio * 100.0 * 1.1).clamp(0.0001, 100.0);
+
+            // Calculate ratio based on our conservative disk estimate
+            let ratio = target_samples as f64 / est_rows_from_disk as f64;
+
+            // Multiply by 1.2x safety factor
+            let percent = (ratio * 100.0 * 1.2).clamp(0.0001, 100.0);
 
             info!("📉 Sampling Strategy: Block Sampling (TABLESAMPLE SYSTEM)");
-            info!("   ↳ Target: {} vectors ({} clusters * {} factor)", target_samples, num_clusters, sampling_factor);
-            info!("   ↳ Reading: {:.4}% of table blocks (Est. Total Rows: {})", percent, total_rows);
+            info!("   ↳ Table Size: {} MB ({} Blocks)", table_bytes / 1024 / 1024, total_blocks);
+            info!("   ↳ Target: {} vectors | Reading: {:.4}% of blocks", target_samples, percent);
 
             format!(
                 "SELECT {} FROM {} TABLESAMPLE SYSTEM({:.4})",
@@ -54,7 +67,10 @@ impl VectorReadBatcher {
             )
         } else {
             // B. FULL SEQUENTIAL SCAN (Fallback)
-            info!("📉 Sampling Strategy: Full Sequential Scan (Target > Total Table Size)");
+            // Used for small tables or when we need a huge % of data.
+            info!("📉 Sampling Strategy: Full Sequential Scan");
+            info!("   ↳ Reason: Table too small (<100 blocks) or Target Sample > 50% of table");
+
             format!("SELECT {} FROM {}", column_name, qualified_table_name)
         };
 
@@ -88,7 +104,7 @@ impl VectorReadBatcher {
             if let Ok(table) = client.select(&fetch_sql, None, &[]) {
                 for row in table {
                     if let Ok(entry) = row.get_datum_by_ordinal(1) {
-                        // Explicitly ask for pg_sys::Datum
+                        // Explicitly ask for pg_sys::Datum to resolve type inference error
                         if let Ok(Some(datum)) = entry.value::<pgrx::pg_sys::Datum>() {
                             unsafe {
                                 let raw_ptr = datum.cast_mut_ptr();
