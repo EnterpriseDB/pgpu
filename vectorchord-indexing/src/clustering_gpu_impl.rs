@@ -343,6 +343,7 @@ pub fn train_roots_gpu(
     num_roots: u32,
     iterations: u32,
     n_redo: u32,
+    spherical_centroids: bool,
 ) -> Vec<f32> {
     // 1. Define Total Vectors
     let total_vectors = full_vectors.len() / vector_dims as usize;
@@ -404,6 +405,11 @@ pub fn train_roots_gpu(
     let mut centroids_host = Array2::<f32>::zeros((num_roots as usize, vector_dims as usize));
     centroids_gpu.to_host(&res, &mut centroids_host).expect("retrieval failed");
 
+    if spherical_centroids {
+        debug1!("normalizing root centroids");
+        normalize_vectors(&mut centroids_host);
+    }
+
     info!("✅ [PHASE 1 DONE] Roots trained in {:.2?}", start.elapsed());
     centroids_host.into_raw_vec()
 }
@@ -464,6 +470,7 @@ pub fn train_leaves_for_bucket_gpu(
     vector_dims: u32,
     num_leaves_this_bucket: u32,
     iterations: u32,
+    spherical_centroids: bool,
 ) -> Vec<f32> {
     let num_vecs = bucket_vectors.len() / vector_dims as usize;
     if num_vecs < num_leaves_this_bucket as usize {
@@ -487,6 +494,10 @@ pub fn train_leaves_for_bucket_gpu(
 
     let mut centroids_host = Array2::<f32>::zeros((num_leaves_this_bucket as usize, vector_dims as usize));
     centroids_gpu.to_host(&res, &mut centroids_host).expect("retrieval failed");
+
+    if spherical_centroids {
+        normalize_vectors(&mut centroids_host);
+    }
 
     centroids_host.into_raw_vec()
 }

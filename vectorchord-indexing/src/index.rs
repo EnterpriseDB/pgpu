@@ -136,25 +136,10 @@ pub fn index(
 
 
         // ========================================================================================
-        // PRE-PROCESSING: Data Normalization
+        // PRE-PROCESSING: (Removed - VectorChord expects raw vectors, spherical normalization
+        // is applied to centroids after k-means, not to input vectors)
         // ========================================================================================
-        let mut d_pre_proc = std::time::Duration::new(0, 0);
-        if spherical_centroids {
-            let t_pre_start = Instant::now();
-            info!("📐 [Spherical Mode] Normalizing {} training vectors...", loaded_count);
-
-            // Normalize in place
-            for chunk in training_dataset.chunks_mut(vector_dims as usize) {
-                let mut norm_sq = 0.0;
-                for x in chunk.iter() { norm_sq += x * x; }
-                let norm = norm_sq.sqrt();
-                if norm > 1e-6 {
-                    for x in chunk.iter_mut() { *x /= norm; }
-                }
-            }
-            d_pre_proc = t_pre_start.elapsed();
-            info!("   ↳ Pre-processing complete in {:.2?}", d_pre_proc);
-        }
+        let d_pre_proc = std::time::Duration::new(0, 0);
 
         // ========================================================================================
         // PHASE 1: MANUAL QUALITY-CONTROLLED ROOTS
@@ -180,7 +165,8 @@ pub fn index(
                 vector_dims,
                 num_roots,
                 kmeans_iterations, // iterations
-                1    // single redo (loop handles the rest)
+                1,   // single redo (loop handles the rest)
+                spherical_centroids,
             );
             let d_train = t_train_start.elapsed();
 
@@ -225,30 +211,19 @@ pub fn index(
             pgrx::error!("❌ No training data found! The table might be empty or TABLESAMPLE returned 0 rows. Cannot continue.");
         }
         // ========================================================================================
-        // POST-PROCESSING: Centroid Normalization
+        // POST-PROCESSING: (Removed - train_roots_gpu now handles spherical normalization)
         // ========================================================================================
-        let mut root_centroids = best_roots;
+        let root_centroids = best_roots;
         let assignments = best_assignments;
-        let mut d_post_proc = std::time::Duration::new(0, 0);
-
-        if spherical_centroids {
-            let t_post_start = Instant::now();
-             for chunk in root_centroids.chunks_mut(vector_dims as usize) {
-                let mut norm_sq = 0.0;
-                for x in chunk.iter() { norm_sq += x * x; }
-                let norm = norm_sq.sqrt();
-                if norm > 1e-6 {
-                    for x in chunk.iter_mut() { *x /= norm; }
-                }
-            }
-            d_post_proc = t_post_start.elapsed();
-        }
+        let d_post_proc = std::time::Duration::new(0, 0);
 
         // ========================================================================================
-        // PHASE 3: SCATTER & RESIDUAL TRAINING
+        // PHASE 3: SCATTER & TRAIN LEAVES
+        // (Residual computation removed - VectorChord handles residuals during index build
+        // when residual_quantization=true. We train on absolute vectors here.)
         // ========================================================================================
         let t_p3_start = Instant::now();
-        info!("🚀 [PHASE 3] Training Leaves on Residuals"); // subtract the root centroid first (Vector - Root) and cluster the difference ()residual)
+        info!("🚀 [PHASE 3] Training Leaves on Partitioned Vectors");
 
         let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
 
@@ -256,14 +231,10 @@ pub fn index(
             if label >= 0 && (label as usize) < num_roots as usize {
                 let start = idx * vector_dims as usize;
                 let end = start + vector_dims as usize;
-
-                let root_start = label as usize * vector_dims as usize;
-                let root_vec = &root_centroids[root_start..root_start + vector_dims as usize];
                 let raw_vec = &training_dataset[start..end];
 
-                for j in 0..vector_dims as usize {
-                    buckets[label as usize].push(raw_vec[j] - root_vec[j]);
-                }
+                // Store raw vectors (no residual computation)
+                buckets[label as usize].extend_from_slice(raw_vec);
             }
         }
 
@@ -286,8 +257,8 @@ pub fn index(
             0.0
         };
 
-        for (i, bucket_residuals) in buckets.iter().enumerate() {
-            let n_vecs = bucket_residuals.len() / vector_dims as usize;
+        for (i, bucket_vectors) in buckets.iter().enumerate() {
+            let n_vecs = bucket_vectors.len() / vector_dims as usize;
             let parent_id = i as i32;
 
             if n_vecs == 0 {
@@ -301,41 +272,20 @@ pub fn index(
             let mut target_leaves = raw_target.round() as u32;
             target_leaves = target_leaves.clamp(1, n_vecs as u32);
 
-            let leaf_residuals = train_leaves_for_bucket_gpu(
-                bucket_residuals,
+            // Train leaves on absolute vectors (spherical normalization applied inside if needed)
+            let leaf_centroids = train_leaves_for_bucket_gpu(
+                bucket_vectors,
                 vector_dims,
                 target_leaves,
-                15
+                15,
+                spherical_centroids,
             );
 
-            let root_start = i * vector_dims as usize;
-            let root_vec = &root_centroids[root_start..root_start + vector_dims as usize];
-
-            for leaf_res_chunk in leaf_residuals.chunks(vector_dims as usize) {
-                let mut absolute_leaf = vec![0.0f32; vector_dims as usize];
-
-                // A. Reconstruct
-                for j in 0..vector_dims as usize {
-                    absolute_leaf[j] = root_vec[j] + leaf_res_chunk[j];
-                }
-
-                // B. Normalize (Spherical Only)
-                if spherical_centroids {
-                    let mut norm_sq = 0.0;
-                    for x in absolute_leaf.iter() {
-                        norm_sq += x * x;
-                    }
-                    let norm = norm_sq.sqrt();
-                    if norm > 1e-12 {
-                        for x in absolute_leaf.iter_mut() {
-                            *x /= norm;
-                        }
-                    }
-                }
-
-                final_results.push((absolute_leaf, parent_id));
+            // Store leaf centroids directly (no residual reconstruction needed)
+            for leaf_chunk in leaf_centroids.chunks(vector_dims as usize) {
+                final_results.push((leaf_chunk.to_vec(), parent_id));
             }
-            total_leaves_trained += leaf_residuals.len() / vector_dims as usize;
+            total_leaves_trained += leaf_centroids.len() / vector_dims as usize;
         }
         let d_p3 = t_p3_start.elapsed();
 
