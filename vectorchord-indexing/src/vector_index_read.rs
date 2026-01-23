@@ -8,6 +8,10 @@ use std::hash::{Hash, Hasher};
 const MAIN_FORKNUM: i32 = 0; // pg_sys::ForkNumber::MAIN_FORKNUM
 const INVALID_BUFFER: Buffer = 0;
 
+// Prefetch configuration - tune these for your I/O subsystem
+const PREFETCH_DISTANCE: usize = 64;  // Number of blocks to prefetch ahead (increase for NVMe)
+const VECTORS_PER_BATCH: u64 = 50000; // Vectors to return per next_batch() call
+
 /// VectorReadBatcher provides efficient random sampling of vectors from a PostgreSQL table
 /// using direct block access with Feistel-cipher-based block permutation.
 ///
@@ -19,8 +23,8 @@ pub struct VectorReadBatcher {
     target_samples: u64,
     vectors_read: u64,
     dims: u32,
-    total_blocks: BlockNumber,
     block_iterator: FeistelBlockIterator,
+    prefetch_queue: std::collections::VecDeque<BlockNumber>,
     current_block: Option<BlockReader>,
     active: bool,
 }
@@ -36,7 +40,7 @@ impl VectorReadBatcher {
         let target_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
 
         // Get relation and column info using unsafe PostgreSQL internals
-        let (heap_relation, column_attnum, dims, total_blocks, block_iterator) = unsafe {
+        let (heap_relation, column_attnum, dims, block_iterator) = unsafe {
             // Parse and open relation using pgrx utilities
             let rel_oid = resolve_table_oid(&qualified_table_name);
             let heap_relation = pg_sys::relation_open(rel_oid, pg_sys::AccessShareLock as i32);
@@ -99,20 +103,50 @@ impl VectorReadBatcher {
 
             let block_iterator = FeistelBlockIterator::new(total_blocks, blocks_to_scan);
 
-            (heap_relation, attnum, detected_dims, total_blocks, block_iterator)
+            (heap_relation, attnum, detected_dims, block_iterator)
         };
 
-        VectorReadBatcher {
+        let mut batcher = VectorReadBatcher {
             heap_relation,
             column_attnum,
             target_samples,
             vectors_read: 0,
             dims,
-            total_blocks,
             block_iterator,
+            prefetch_queue: std::collections::VecDeque::with_capacity(PREFETCH_DISTANCE + 1),
             current_block: None,
             active: true,
+        };
+
+        // Initial prefetch - fill the prefetch queue
+        batcher.fill_prefetch_queue();
+
+        batcher
+    }
+
+    /// Fill the prefetch queue and issue prefetch requests
+    fn fill_prefetch_queue(&mut self) {
+        unsafe {
+            while self.prefetch_queue.len() < PREFETCH_DISTANCE {
+                if let Some(block_num) = self.block_iterator.next() {
+                    // Issue async prefetch request
+                    pg_sys::PrefetchBuffer(self.heap_relation, MAIN_FORKNUM, block_num);
+                    self.prefetch_queue.push_back(block_num);
+                } else {
+                    break;
+                }
+            }
         }
+    }
+
+    /// Get next block from prefetch queue and refill
+    fn next_prefetched_block(&mut self) -> Option<BlockNumber> {
+        let block = self.prefetch_queue.pop_front();
+        if block.is_some() {
+            // Prefetch more blocks to keep the queue full
+            self.fill_prefetch_queue();
+        }
+        block
     }
 
     pub(crate) fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
@@ -120,8 +154,8 @@ impl VectorReadBatcher {
             return None;
         }
 
-        // Read vectors in batches of ~10000 for memory efficiency
-        let batch_target = 10000u64.min(self.target_samples - self.vectors_read);
+        // Read vectors in batches
+        let batch_target = VECTORS_PER_BATCH.min(self.target_samples - self.vectors_read);
 
         let mut vectors: Vec<f32> = Vec::with_capacity(batch_target as usize * self.dims.max(768) as usize);
         let mut dims: u32 = self.dims;
@@ -145,8 +179,8 @@ impl VectorReadBatcher {
                 self.current_block = None;
             }
 
-            // Get next block
-            if let Some(block_num) = self.block_iterator.next() {
+            // Get next block from prefetch queue
+            if let Some(block_num) = self.next_prefetched_block() {
                 self.current_block = Some(BlockReader::new(self.heap_relation, block_num));
             } else {
                 // No more blocks
