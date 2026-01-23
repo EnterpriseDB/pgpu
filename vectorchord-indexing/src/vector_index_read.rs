@@ -1,13 +1,24 @@
 use crate::vector_type;
 use pgrx::{debug1, info, warning, Spi};
-use std::time::{SystemTime, UNIX_EPOCH};
+use rand::seq::SliceRandom;
+use rand::thread_rng;
+use std::collections::HashSet;
 use std::time::Instant;
 
 pub struct VectorReadBatcher {
-    cursor_name: String,
+    qualified_table_name: String,
+    column_name: String,
+
+    // Sampling State
     target_samples: u64,
-    internal_batch_size: u64, // Separated from external batch_size
     vectors_read: u64,
+
+    // The list of Block Numbers we intend to read
+    blocks_to_read: Vec<u64>,
+    current_block_idx: usize,
+
+    // Constants
+    blocks_per_query: usize, // How many blocks to fetch in one SQL call
     active: bool,
 }
 
@@ -17,91 +28,112 @@ impl VectorReadBatcher {
         column_name: String,
         num_clusters: u32,
         sampling_factor: u32,
-        requested_batch_size: u64,
+        _requested_batch_size: u64, // Unused, we drive I/O by blocks now
     ) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos();
-        let cursor_name = format!("pgpu_cursor_{}", nanos);
-
         // 1. Calculate Target
         let target_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
 
-        // 2. Physical Size Check
+        // 2. Get Physical Size (Robust, No ANALYZE needed)
         let table_bytes: i64 = Spi::get_one(&format!(
             "SELECT pg_relation_size('{}'::regclass)",
             qualified_table_name
         )).expect("SPI failed to look up table size").unwrap_or(0);
 
-        // 3. Robust Estimation (Based on your ps output: 157 rows/block)
-        // We use 160 as the standard density for TOASTed vector tables (768d).
-        let estimated_rows: u64 = if table_bytes > 0 {
-            ((table_bytes / 8192) * 160) as u64
-        } else {
-            0
-        };
+        let total_blocks = (table_bytes / 8192).max(1) as u64;
 
-        info!("🔍 [DEBUG] Table Size: {} MB | Est Rows: {} (Density: 160/block) | Target: {}",
-            table_bytes / 1024 / 1024, estimated_rows, target_samples);
+        // 3. Estimate Density (Vectors per Block)
+        // Vectors are usually TOASTed. The main heap block contains pointers.
+        // A standard 8KB page fits ~150-200 pointers.
+        // We use a conservative 100 to ensure we pick ENOUGH blocks.
+        let est_vectors_per_block = 100;
 
-        // 4. Strategy Selection
-        // Use Block Sampling if target is less than 90% of our estimate
-        let can_use_tablesample = table_bytes > 0;
-        let use_block_sampling = can_use_tablesample && (target_samples < (estimated_rows as f64 * 0.9) as u64);
+        // How many blocks do we need?
+        let blocks_needed = (target_samples / est_vectors_per_block) + 1;
 
-        let query = if use_block_sampling {
-            let ratio = target_samples as f64 / estimated_rows as f64;
-            // 1.15x buffer to be safe
-            let percent = (ratio * 100.0 * 1.15).clamp(0.0001, 100.0);
+        // Safety Buffer: Read 20% extra blocks to handle empty pages or dead rows
+        let blocks_to_queue = (blocks_needed as f64 * 1.2) as u64;
+        let blocks_to_queue = blocks_to_queue.clamp(1, total_blocks);
 
-            info!("📉 Sampling Strategy: Block Sampling (TABLESAMPLE SYSTEM)");
-            info!("   ↳ Reading: {:.4}% of blocks to get ~{} vectors", percent, target_samples);
+        info!("🔍 [SAMPLER] Physical Table: {} MB ({} Blocks)", table_bytes / 1024 / 1024, total_blocks);
+        info!("🔍 [SAMPLER] Target: {} vectors. Plan: Read {} random blocks (approx {:.2}%)",
+            target_samples, blocks_to_queue, (blocks_to_queue as f64 / total_blocks as f64) * 100.0);
 
-            format!(
-                "SELECT {} FROM {} TABLESAMPLE SYSTEM({:.4})",
-                column_name, qualified_table_name, percent
-            )
-        } else {
-            info!("📉 Sampling Strategy: Full Sequential Scan");
-            info!("   ↳ Reason: Target Sample size is nearly the full table size.");
+        // 4. Generate Random Block List
+        let mut rng = thread_rng();
+        let mut all_blocks: Vec<u64> = (0..total_blocks).collect();
 
-            format!("SELECT {} FROM {}", column_name, qualified_table_name)
-        };
+        // Fisher-Yates Shuffle to pick random blocks efficiently
+        // If we need most of the table, just shuffle the whole list.
+        // If we need a small sample, we can partial shuffle, but full shuffle is fast enough for <10M blocks.
+        all_blocks.shuffle(&mut rng);
 
-        Spi::run(&format!("DECLARE \"{}\" NO SCROLL CURSOR FOR {}", cursor_name, query))
-             .expect("failed to declare sampling cursor");
-
-        // CRITICAL FIX: Cap internal fetch size to 50k to prevent OOM crash.
-        // Your code still gets 'requested_batch_size' eventually, but we fetch from DB in small sips.
-        let internal_batch_size = requested_batch_size.clamp(1000, 50_000);
+        // Keep only what we need
+        let blocks_to_read = all_blocks.into_iter().take(blocks_to_queue as usize).collect();
 
         VectorReadBatcher {
-            cursor_name,
+            qualified_table_name,
+            column_name,
             target_samples,
-            internal_batch_size,
             vectors_read: 0,
+            blocks_to_read,
+            current_block_idx: 0,
+            blocks_per_query: 50, // Read 50 blocks per SPI call (efficient batching)
             active: true,
         }
     }
 
     pub(crate) fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
+        // Stop if we have enough vectors OR run out of blocks
         if !self.active || self.vectors_read >= self.target_samples {
-            if self.active { self.end_scan(); }
+            return None;
+        }
+        if self.current_block_idx >= self.blocks_to_read.len() {
+            info!("⚠️ [SAMPLER] Exhausted all queued blocks. (Read: {} / Target: {})", self.vectors_read, self.target_samples);
+            self.active = false;
             return None;
         }
 
         let start_time = Instant::now();
-        // Use the capped internal_batch_size (50k), NOT the huge 10M one
-        let fetch_sql = format!("FETCH FORWARD {} FROM \"{}\"", self.internal_batch_size, self.cursor_name);
 
+        // 1. Get the next chunk of Block IDs
+        let end_idx = (self.current_block_idx + self.blocks_per_query).min(self.blocks_to_read.len());
+        let batch_blocks = &self.blocks_to_read[self.current_block_idx..end_idx];
+        self.current_block_idx = end_idx;
+
+        // 2. Build the Direct Block Access Query (TID Scan)
+        // We use a CTE with values to force Postgres to scan specific Block IDs.
+        // Logic: JOIN specific block numbers to the table on ctid range.
+
+        let block_list_str: String = batch_blocks.iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let query = format!(
+            "WITH target_blocks(blk) AS (VALUES ({})) \
+             SELECT t.{} \
+             FROM {} t \
+             JOIN target_blocks b \
+             ON t.ctid >= (b.blk::text || ',0')::tid \
+             AND t.ctid < ((b.blk + 1)::text || ',0')::tid",
+             // The VALUES list: (1), (42), (105)...
+             block_list_str
+                 .split(',')
+                 .map(|s| format!("({})", s))
+                 .collect::<Vec<_>>()
+                 .join(","),
+             self.column_name,
+             self.qualified_table_name
+        );
+
+        // 3. Execute
         let (all_vectors, dims, read_count) = Spi::connect(|client| {
             let mut vectors: Vec<f32> = Vec::new();
             let mut dims: u32 = 0;
             let mut count = 0;
 
-            let table = client.select(&fetch_sql, None, &[])
-                .expect("SPI SELECT failed inside next_batch");
+            let table = client.select(&query, None, &[])
+                .expect("Failed to execute TID block scan");
 
             for row in table {
                 if let Ok(entry) = row.get_datum_by_ordinal(1) {
@@ -126,23 +158,20 @@ impl VectorReadBatcher {
             (vectors, dims, count)
         });
 
-        if read_count == 0 {
-            info!("🔍 [DEBUG] Cursor exhausted. (Read: {} / Target: {})", self.vectors_read, self.target_samples);
-            self.end_scan();
-            return None;
-        }
-
         self.vectors_read += read_count as u64;
-        // Comment out debug1 to reduce log spam if fetching small chunks
-        // debug1!("✅ Batch Loaded: {} vectors in {:.2?}", read_count, start_time.elapsed());
+
+        // If we read 0, we simply continue to the next batch of blocks in the next call
+        // But for the caller, we return Some(empty) if necessary?
+        // Better: if read_count is 0, we might recurse or just return empty so loop continues.
+        // Returning empty Vec is fine, the caller handles it.
+
+        // debug1!("✅ Scanned {} blocks -> {} vectors ({:.2?})", batch_blocks.len(), read_count, start_time.elapsed());
 
         Some((all_vectors, dims))
     }
 
     pub(crate) fn end_scan(&mut self) {
-        if self.active {
-            let _ = Spi::run(&format!("CLOSE \"{}\"", self.cursor_name));
-            self.active = false;
-        }
+        self.active = false;
+        // No cursor to close in this implementation
     }
 }
