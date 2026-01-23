@@ -1,6 +1,5 @@
 use crate::clustering_gpu_impl::{
-    assign_to_roots_gpu, run_clustering_batch, run_clustering_consolidate,
-    train_leaves_for_bucket_gpu, train_roots_gpu,
+    bottom_up, run_clustering_batch, run_clustering_consolidate, BottomUpResult,
 };
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
@@ -50,40 +49,41 @@ pub fn index(
     let global_start = Instant::now();
 
     // ========================================================================================
-    // PATH A: TOP-DOWN HIERARCHICAL BUILD
+    // PATH A: BOTTOM-UP HIERARCHICAL BUILD (GPU Optimized)
     // Triggered if `lists` has 2 elements (e.g. [400, 160000])
+    //
+    // Strategy: ONE GPU k-means for all leaves, then cluster leaves into roots.
+    // This is much faster than top-down (which made N separate GPU calls).
     // ========================================================================================
 
     if let Some(num_roots) = num_clusters_top_option {
         let num_leaves = num_clusters_leaf;
-        let num_leaves_per_root = num_leaves / num_roots;
         let num_samples_target = (num_leaves as u64).saturating_mul(sampling_factor as u64);
 
+        info!("🏗️ [BOTTOM-UP BUILD] GPU-Accelerated Hierarchical Clustering");
+        info!("📊 Target: {} Roots | {} Leaves", num_roots, num_leaves);
+        info!("📉 Sampling: Factor={} -> Reading ~{} vectors", sampling_factor, num_samples_target);
 
-        info!("🏗️ [HIERARCHICAL DETECTED] Starting Top-Down Build");
-        info!("📊 Target: {} Roots | {} Leaves ({} per root)", num_roots, num_leaves, num_leaves_per_root);
-        info!("📉 Sampling: Factor={} -> Reading {} vectors for training", sampling_factor, num_samples_target);
+        info!("⚙️ Configuration:\n\
+           \t• Leaves:            {}\n\
+           \t• Roots:             {}\n\
+           \t• Sampling Factor:   {}\n\
+           \t• Batch Size:        {}\n\
+           \t• KMeans Iterations: {}",
+           num_leaves, num_roots, sampling_factor, batch_size, kmeans_iterations);
 
-        info!("⚙️ Clustering Configuration:\n\
-           \t• Target Lists (Leaf):  {}\n\
-           \t• Sampling Factor:      {}\n\
-           \t• Batch Size:           {}\n\
-           \t• KMeans Iterations:    {}\n\
-           \t• KMeans N-Redo:        {} (Best of N runs)",
-           num_clusters_leaf, sampling_factor, batch_size, kmeans_iterations, kmeans_nredo);
-
+        // ================================================================================
+        // STEP 1: Load training data
+        // ================================================================================
         let t_load_start = Instant::now();
 
-        // --- SAMPLER INITIALIZATION ---
-        // We do not pass random_sampling anymore. It is enforced internally.
         let mut batcher = VectorReadBatcher::new(
             qualified_table.clone(),
             column_name.clone(),
-            num_leaves,        // num_clusters
-            sampling_factor,   // factor
+            num_leaves,
+            sampling_factor,
             batch_size,
         );
-
 
         let mut training_dataset: Vec<f32> = Vec::with_capacity((num_samples_target as usize) * 768);
         let mut vector_dims = 0;
@@ -100,18 +100,18 @@ pub fn index(
                 let total_bytes = (num_samples_target as u64) * (dims as u64) * 4;
                 let gb_usage = total_bytes as f64 / 1_073_741_824.0;
 
-                info!("📝 Detected Vector Dims: {}  ", dims);
-                info!("💾 Estimated RAM Requirement for Training Data: {:.2} GB", gb_usage);
+                info!("📝 Detected Vector Dims: {}", dims);
+                info!("💾 Estimated RAM for Training Data: {:.2} GB", gb_usage);
 
                 if gb_usage > 64.0 {
-                    warning!("⚠️ High RAM usage detected! Ensure your server has at least {:.0} GB free.", gb_usage * 1.2);
+                    warning!("⚠️ High RAM usage! Ensure {:.0} GB free.", gb_usage * 1.2);
                 }
             }
 
             loaded_count += vecs.len() / dims as usize;
             training_dataset.extend(vecs);
 
-            // --- PROGRESS LOGGING (Every 5 seconds) ---
+            // Progress logging every 5 seconds
             let elapsed_since_log = last_log_time.elapsed().as_secs_f64();
             if elapsed_since_log >= 5.0 {
                 let vectors_since_log = loaded_count - last_log_count;
@@ -121,216 +121,94 @@ pub fn index(
                 let eta_secs = if rate > 0.0 { remaining as f64 / rate } else { 0.0 };
 
                 info!(
-                    "⏳ Loaded {}/{} ({:.1}%) | Rate: {:.0} vec/s | ETA: {:.0}s",
+                    "⏳ Loaded {}/{} ({:.1}%) | {:.0} vec/s | ETA: {:.0}s",
                     loaded_count, num_samples_target, percent, rate, eta_secs
                 );
 
                 last_log_time = Instant::now();
                 last_log_count = loaded_count;
             }
-            // ------------------------------------------
         }
         batcher.end_scan();
         let d_load = t_load_start.elapsed();
-        info!("✅ Training Dataset Loaded: {} vectors. Time: {:.2?}", loaded_count, d_load);
+        info!("✅ Loaded {} vectors in {:.2?}", loaded_count, d_load);
 
-
-        // ========================================================================================
-        // PRE-PROCESSING: (Removed - VectorChord expects raw vectors, spherical normalization
-        // is applied to centroids after k-means, not to input vectors)
-        // ========================================================================================
-        let d_pre_proc = std::time::Duration::new(0, 0);
-
-        // ========================================================================================
-        // PHASE 1: MANUAL QUALITY-CONTROLLED ROOTS
-        // ========================================================================================
-        let t_p1_start = Instant::now();
-        let num_attempts = kmeans_nredo;
-        info!("🏗️ [PHASE 1] Starting Manual Quality-Control (Attempts: {}) ", num_attempts);
-
-        let mut best_roots: Vec<f32> = Vec::new();
-        let mut best_assignments: Vec<i32> = Vec::new();
-        let mut lowest_max_bucket: usize = usize::MAX;
-
-        let mut best_train_duration = std::time::Duration::new(0, 0);
-        let mut best_part_duration = std::time::Duration::new(0, 0);
-
-        for attempt in 1..=num_attempts {
-            let attempt_start = Instant::now();
-
-            // 1. Train candidate roots on GPU
-            let t_train_start = Instant::now();
-            let candidate_roots = train_roots_gpu(
-                &training_dataset,
-                vector_dims,
-                num_roots,
-                kmeans_iterations, // iterations
-                1,   // single redo (loop handles the rest)
-                spherical_centroids,
-            );
-            let d_train = t_train_start.elapsed();
-
-            // 2. PARTITION: Find assignments to evaluate this attempt
-            let t_part_start = Instant::now();
-            let candidate_assignments = assign_to_roots_gpu(
-                &training_dataset,
-                &candidate_roots,
-                vector_dims,
-                num_roots
-            );
-            let d_part = t_part_start.elapsed();
-
-            // 3. ANALYZE: Count bucket sizes
-            let mut counts = vec![0usize; num_roots as usize];
-            for &label in &candidate_assignments {
-                if label >= 0 && (label as usize) < num_roots as usize {
-                    counts[label as usize] += 1;
-                }
-            }
-
-            let current_max = *counts.iter().max().unwrap_or(&usize::MAX);
-
-            info!("  ↳ Attempt {}: Max Bucket = {} (Train: {:.2?}, Part: {:.2?}, Total: {:.2?})",
-                attempt, current_max, d_train, d_part, attempt_start.elapsed());
-
-            if current_max < lowest_max_bucket {
-                lowest_max_bucket = current_max;
-                best_roots = candidate_roots;
-                best_assignments = candidate_assignments;
-                best_train_duration = d_train;
-                best_part_duration = d_part;
-            }
-        }
-
-        let d_p1_total_wall = t_p1_start.elapsed();
-        info!("✅ Phase 1 Done. Best Attempt: Train {:.2?} / Part {:.2?}", best_train_duration, best_part_duration);
-
-
-        // --- FIX: CHECK FOR EMPTY DATA ---
         if loaded_count == 0 || vector_dims == 0 {
-            pgrx::error!("❌ No training data found! The table might be empty or TABLESAMPLE returned 0 rows. Cannot continue.");
+            pgrx::error!("❌ No training data found! Table might be empty.");
         }
-        // ========================================================================================
-        // POST-PROCESSING: (Removed - train_roots_gpu now handles spherical normalization)
-        // ========================================================================================
-        let root_centroids = best_roots;
-        let assignments = best_assignments;
-        let d_post_proc = std::time::Duration::new(0, 0);
 
-        // ========================================================================================
-        // PHASE 3: SCATTER & TRAIN LEAVES
-        // (Residual computation removed - VectorChord handles residuals during index build
-        // when residual_quantization=true. We train on absolute vectors here.)
-        // ========================================================================================
-        let t_p3_start = Instant::now();
-        info!("🚀 [PHASE 3] Training Leaves on Partitioned Vectors");
+        // ================================================================================
+        // STEP 2: Run bottom-up GPU clustering
+        // ================================================================================
+        let t_cluster_start = Instant::now();
 
-        let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
+        let BottomUpResult {
+            root_centroids,
+            leaf_centroids,
+            leaf_to_root,
+        } = bottom_up(
+            training_dataset,
+            vector_dims,
+            num_leaves,
+            num_roots,
+            kmeans_iterations,
+            spherical_centroids,
+        );
 
-        for (idx, &label) in assignments.iter().enumerate() {
-            if label >= 0 && (label as usize) < num_roots as usize {
-                let start = idx * vector_dims as usize;
-                let end = start + vector_dims as usize;
-                let raw_vec = &training_dataset[start..end];
+        let d_cluster = t_cluster_start.elapsed();
 
-                // Store raw vectors (no residual computation)
-                buckets[label as usize].extend_from_slice(raw_vec);
-            }
-        }
+        // ================================================================================
+        // STEP 3: Build centroids table
+        // ================================================================================
+        let t_store_start = Instant::now();
 
         let mut final_results: Vec<(Vec<f32>, i32)> = Vec::new();
 
-        // 1. Store Roots
+        // Add root centroids (parent_id = -1)
+        let num_roots_actual = root_centroids.len() / vector_dims as usize;
         for root_vec in root_centroids.chunks(vector_dims as usize) {
             final_results.push((root_vec.to_vec(), -1));
         }
 
-        // 2. Train Leaves
-        let mut total_leaves_trained = 0;
-        let mut missing_leaves = 0;
-        let mut min_bucket = usize::MAX;
-        let mut max_bucket = 0;
-
-        let leaves_per_vector_ratio = if loaded_count > 0 {
-            num_leaves as f64 / loaded_count as f64
-        } else {
-            0.0
-        };
-
-        for (i, bucket_vectors) in buckets.iter().enumerate() {
-            let n_vecs = bucket_vectors.len() / vector_dims as usize;
-            let parent_id = i as i32;
-
-            if n_vecs == 0 {
-                missing_leaves += num_leaves / num_roots;
-                continue;
-            }
-            if n_vecs < min_bucket { min_bucket = n_vecs; }
-            if n_vecs > max_bucket { max_bucket = n_vecs; }
-
-            let raw_target = n_vecs as f64 * leaves_per_vector_ratio;
-            let mut target_leaves = raw_target.round() as u32;
-            target_leaves = target_leaves.clamp(1, n_vecs as u32);
-
-            // Train leaves on absolute vectors (spherical normalization applied inside if needed)
-            let leaf_centroids = train_leaves_for_bucket_gpu(
-                bucket_vectors,
-                vector_dims,
-                target_leaves,
-                15,
-                spherical_centroids,
-            );
-
-            // Store leaf centroids directly (no residual reconstruction needed)
-            for leaf_chunk in leaf_centroids.chunks(vector_dims as usize) {
-                final_results.push((leaf_chunk.to_vec(), parent_id));
-            }
-            total_leaves_trained += leaf_centroids.len() / vector_dims as usize;
+        // Add leaf centroids with their parent assignments
+        let num_leaves_actual = leaf_centroids.len() / vector_dims as usize;
+        for (leaf_idx, leaf_vec) in leaf_centroids.chunks(vector_dims as usize).enumerate() {
+            let parent_id = leaf_to_root[leaf_idx];
+            final_results.push((leaf_vec.to_vec(), parent_id));
         }
-        let d_p3 = t_p3_start.elapsed();
 
-        info!("🏁 [HIERARCHY COMPLETE] Trained {} Leaves. Total Centroids: {}  ", total_leaves_trained, final_results.len());
-        info!("💾 Total Centroids (Roots+Leaves): {}  ", final_results.len());
+        info!("💾 Storing {} centroids ({} roots + {} leaves)...",
+              final_results.len(), num_roots_actual, num_leaves_actual);
 
-        let t_store_start = Instant::now();
         centroids_table::store_centroids(final_results, centroid_table_name.clone(), vector_dims);
         let d_store = t_store_start.elapsed();
 
-        // --- SUMMARY LOG ---
+        // ================================================================================
+        // SUMMARY
+        // ================================================================================
         info!(
-            "\n⏱️  [TIMING SUMMARY]\n\
-            \t• 📥 Data Loading:     {:.2?}  \n\
-            \t• 📐 Pre-Processing:   {:.2?} (Data Normalization)\n\
-            \t• 🏗️ Phase 1 (Total):  {:.2?}  \n\
-            \t   ↳ Best Train:       {:.2?}  \n\
-            \t   ↳ Best Part:        {:.2?}  \n\
-            \t   ↳ QC Overhead:      {:.2?} (Retries/Logic)\n\
-            \t• 🔧 Post-Processing:  {:.2?} (Centroid Norm)\n\
-            \t• 🌿 Phase 3 (Leaves): {:.2?} (Inc. Leaf Norm)\n\
-            \t• 💾 Storage:          {:.2?} (Centroids Store) \n\
+            "\n⏱️  [TIMING SUMMARY - BOTTOM-UP]\n\
+            \t• 📥 Data Loading:    {:.2?}\n\
+            \t• 🚀 GPU Clustering:  {:.2?}\n\
+            \t• 💾 Storage:         {:.2?}\n\
             \t-----------------------------\n\
-            \t📊 [SKEW & QUALITY REPORT]\n\
-            \t• Min Bucket Size:     {}\n\
-            \t• Max Bucket Size:     {}\n\
-            \t• Leaves Trained:      {}\n\
-            \t• Leaves Dropped:      {}\n\
+            \t📊 [RESULTS]\n\
+            \t• Vectors Sampled:    {}\n\
+            \t• Root Centroids:     {}\n\
+            \t• Leaf Centroids:     {}\n\
             \t-----------------------------\n\
-            \t👉 TOTAL CLUSTERING TIME:    {:.2?}  ",
+            \t👉 TOTAL TIME:        {:.2?}",
             d_load,
-            d_pre_proc,
-            d_p1_total_wall,
-            best_train_duration,
-            best_part_duration,
-            d_p1_total_wall.saturating_sub(best_train_duration + best_part_duration),
-            d_post_proc,
-            d_p3,
+            d_cluster,
             d_store,
-            min_bucket, max_bucket, total_leaves_trained, missing_leaves,
+            loaded_count,
+            num_roots_actual,
+            num_leaves_actual,
             global_start.elapsed()
         );
 
     // ========================================================================================
-    // PATH B: FLAT / LEGACY BUILD
+    // PATH B: FLAT BUILD (single level, no hierarchy)
     // ========================================================================================
     } else {
         info!("🏗️ [FLAT DETECTED] Running Bottom-Up Batch Clustering");
