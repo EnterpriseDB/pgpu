@@ -23,7 +23,7 @@ pub fn index(
     skip_index_build: bool,
     spherical_centroids: bool,
     residual_quantization: bool,
-    _random_sampling: bool,
+    _: bool,
 ) {
     // 1. Validate Inputs & Hardware
     let (num_clusters_top_option, num_clusters_leaf) = match lists.len() {
@@ -384,6 +384,17 @@ pub fn index(
         let mut weights_all: Vec<f32> = Vec::new();
         let mut dims: u32 = 0;
         let mut batch_count = 0;
+
+        let num_samples_target = (num_clusters_leaf as u64).saturating_mul(sampling_factor as u64);
+        let num_batches = num_samples_target.div_ceil(batch_size) as u32; // FIXED: Variable defined
+
+        let num_clusters_per_intermediate_batch: u32 = match num_batches {
+            1 => num_clusters_leaf,
+            _ => {
+                let target = num_clusters_leaf * 4;
+                std::cmp::max(target / num_batches, 3)
+            }
+        };
 
         while let Some((vecs, batch_dims)) = batcher.next_batch() {
             batch_count += 1;
