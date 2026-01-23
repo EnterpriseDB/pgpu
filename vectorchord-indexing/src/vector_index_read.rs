@@ -94,7 +94,7 @@ impl VectorReadBatcher {
                     // get_datum_by_ordinal returns Result<Entry>, not Result<Option<Datum>>
                     if let Ok(entry) = row.get_datum_by_ordinal(1) {
                         // Check if the entry has a value (is not null)
-                        if let Some(datum) = entry.value() {
+                        if let Ok(Some(datum)) = entry.value() {
                             unsafe {
                                 let raw_ptr = datum.cast_mut_ptr();
                                 let detoasted_ptr = pgrx::pg_sys::pg_detoast_datum(raw_ptr);
