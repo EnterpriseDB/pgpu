@@ -94,8 +94,11 @@ impl VectorReadBatcher {
                     // get_datum_by_ordinal returns Result<Entry>, not Result<Option<Datum>>
                     if let Ok(entry) = row.get_datum_by_ordinal(1) {
                         // Check if the entry has a value (is not null)
-                        if let Ok(Some(datum)) = entry.value() {
+                        if let Ok(Some(datum)) = entry.value::<pgrx::pg_sys::Datum>() {
                             unsafe {
+                                // Now we have the raw datum, we can cast it to a pointer
+                                // We specify cast_mut_ptr::<pg_sys::varlena>() to be precise,
+                                // but usually inference works if pg_detoast_datum is called next.
                                 let raw_ptr = datum.cast_mut_ptr();
                                 let detoasted_ptr = pgrx::pg_sys::pg_detoast_datum(raw_ptr);
 
