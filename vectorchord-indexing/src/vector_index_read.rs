@@ -303,11 +303,10 @@ fn resolve_table_oid(qualified_table_name: &str) -> pg_sys::Oid {
 }
 
 /// BlockReader handles reading tuples from a single heap block
-/// Uses direct smgr reads to bypass the buffer cache for better performance
 struct BlockReader {
     relation: pg_sys::Relation,
-    // Local page buffer - not in shared_buffers
-    local_page: Box<[u8; 8192]>,
+    buffer: pg_sys::Buffer,
+    page: pg_sys::Page,
     current_offset: u16,
     max_offset: u16,
 }
@@ -315,53 +314,31 @@ struct BlockReader {
 impl BlockReader {
     fn new(relation: pg_sys::Relation, block_num: BlockNumber) -> Self {
         unsafe {
-            // Allocate a local page buffer (8KB aligned)
-            let mut local_page = Box::new([0u8; 8192]);
+            // Read through buffer manager (benefits from OS read-ahead for sequential access)
+            let buffer = pg_sys::ReadBuffer(relation, block_num);
+            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
 
-            // Read directly from storage manager, bypassing buffer cache
-            let smgr = (*relation).rd_smgr;
-
-            // Ensure smgr is open
-            if smgr.is_null() {
-                pg_sys::RelationOpenSmgr(relation);
-            }
-            let smgr = (*relation).rd_smgr;
-
-            // Direct read into our local buffer
-            pg_sys::smgrread(
-                smgr,
-                MAIN_FORKNUM,
-                block_num,
-                local_page.as_mut_ptr() as pg_sys::Page,
-            );
-
-            let page = local_page.as_ptr() as pg_sys::Page;
+            let page = pg_sys::BufferGetPage(buffer);
             let max_offset = page_get_max_offset_number(page);
 
             BlockReader {
                 relation,
-                local_page,
+                buffer,
+                page,
                 current_offset: 1, // Offsets start at 1 in PostgreSQL
                 max_offset,
             }
         }
     }
 
-    #[inline]
-    fn page(&self) -> pg_sys::Page {
-        self.local_page.as_ptr() as pg_sys::Page
-    }
-
     fn next_tuple_datum(&mut self, attnum: i16) -> Option<Datum> {
         unsafe {
-            let page = self.page();
-
             while self.current_offset <= self.max_offset {
                 let offset = self.current_offset;
                 self.current_offset += 1;
 
                 // Get item pointer for this offset
-                let item_id = page_get_item_id(page, offset);
+                let item_id = page_get_item_id(self.page, offset);
 
                 // Skip dead/unused items
                 if !item_id_is_normal(item_id) {
@@ -369,7 +346,7 @@ impl BlockReader {
                 }
 
                 // Get the heap tuple header
-                let item = page_get_item(page, item_id);
+                let item = page_get_item(self.page, item_id);
                 let htup = item as *mut pg_sys::HeapTupleHeaderData;
 
                 // Check tuple visibility - simplified check for sampling
@@ -407,7 +384,15 @@ impl BlockReader {
     }
 }
 
-// No Drop needed - local_page is automatically freed when Box is dropped
+impl Drop for BlockReader {
+    fn drop(&mut self) {
+        unsafe {
+            if self.buffer != 0 {
+                pg_sys::UnlockReleaseBuffer(self.buffer);
+            }
+        }
+    }
+}
 
 // =============================================================================
 // PostgreSQL Page Access Macros (reimplemented in Rust)
