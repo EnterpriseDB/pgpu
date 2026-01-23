@@ -19,63 +19,69 @@ impl VectorReadBatcher {
         sampling_factor: u32,
         batch_size: u64,
     ) -> Self {
-        // Unique cursor name
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .subsec_nanos();
         let cursor_name = format!("pgpu_cursor_{}", nanos);
 
-        // 1. Calculate Target Sample Count
+        // 1. Calculate Target
         let target_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
+        info!("🔍 [DEBUG] Initializing Batcher. Target Samples: {} ({} clusters * {})", target_samples, num_clusters, sampling_factor);
 
-        // 2. Robust Size Estimation (No ANALYZE dependency)
-        // We check the physical file size on disk.
+        // 2. Size Estimation (Debug Logs Added)
         let table_bytes: i64 = Spi::get_one(&format!(
             "SELECT pg_relation_size('{}'::regclass)",
             qualified_table_name
         )).expect("SPI failed to look up table size").unwrap_or(0);
 
-        let table_bytes = table_bytes.max(0) as u64;
-        let total_blocks = table_bytes / 8192; // Standard Postgres Page Size
+        let reltuples: i64 = Spi::get_one(&format!(
+            "SELECT reltuples::bigint FROM pg_class WHERE oid = '{}'::regclass",
+            qualified_table_name
+        )).unwrap_or(Some(0)).unwrap_or(0);
 
-        // Conservative Estimate: Assume 50 rows per block (for TOASTed vectors).
-        // This is safe: If real density is higher (200 rows), we just read 4x more data (fast).
-        // If we assumed high density and it was low, we would run out of data.
-        let est_rows_from_disk = total_blocks * 50;
+        info!("🔍 [DEBUG] Table Stats -> Physical Size: {} bytes | pg_class.reltuples: {}", table_bytes, reltuples);
 
-        // 3. Determine Query Strategy
-        // We use Block Sampling if the estimated rows are significantly larger than our target.
-        let use_block_sampling = total_blocks > 100 && target_samples < (est_rows_from_disk / 2);
+        // 3. Fallback Logic
+        let estimated_rows: u64 = if table_bytes > 0 {
+            // Assume 50 rows per 8KB block (conservative for vectors)
+            ((table_bytes / 8192) * 50) as u64
+        } else {
+            reltuples.max(0) as u64
+        };
+
+        info!("🔍 [DEBUG] Final Estimated Rows (Conservative): {}", estimated_rows);
+
+        // 4. Determine Strategy
+        let can_use_tablesample = table_bytes > 0; // Cannot use tablesample on size 0 (partition parents/views)
+        let use_block_sampling = can_use_tablesample && (target_samples < estimated_rows);
 
         let query = if use_block_sampling {
-            // A. FAST BLOCK SAMPLING (TABLESAMPLE SYSTEM)
-
-            // Calculate ratio based on our conservative disk estimate
-            let ratio = target_samples as f64 / est_rows_from_disk as f64;
-
-            // Multiply by 1.2x safety factor
+            let ratio = target_samples as f64 / estimated_rows as f64;
             let percent = (ratio * 100.0 * 1.2).clamp(0.0001, 100.0);
 
             info!("📉 Sampling Strategy: Block Sampling (TABLESAMPLE SYSTEM)");
-            info!("   ↳ Table Size: {} MB ({} Blocks)", table_bytes / 1024 / 1024, total_blocks);
-            info!("   ↳ Target: {} vectors | Reading: {:.4}% of blocks", target_samples, percent);
+            info!("   ↳ Calculated Percent: {:.6}% (Ratio: {:.6})", percent, ratio);
 
             format!(
                 "SELECT {} FROM {} TABLESAMPLE SYSTEM({:.4})",
                 column_name, qualified_table_name, percent
             )
         } else {
-            // B. FULL SEQUENTIAL SCAN (Fallback)
-            // Used for small tables or when we need a huge % of data.
             info!("📉 Sampling Strategy: Full Sequential Scan");
-            info!("   ↳ Reason: Table too small (<100 blocks) or Target Sample > 50% of table");
+            if !can_use_tablesample {
+                info!("   ↳ Reason: Physical size is 0 (Partitioned Table or View?)");
+            } else {
+                info!("   ↳ Reason: Target ({}) >= Est Rows ({})", target_samples, estimated_rows);
+            }
 
             format!("SELECT {} FROM {}", column_name, qualified_table_name)
         };
 
-        // 4. Declare the Cursor
-        Spi::run(&format!("DECLARE \"{}\" CURSOR FOR {}", cursor_name, query))
+        info!("🔍 [DEBUG] Declaring Cursor: \"{}\"", cursor_name);
+        info!("🔍 [DEBUG] Query: {}", query);
+
+        Spi::run(&format!("DECLARE \"{}\" NO SCROLL CURSOR FOR {}", cursor_name, query))
              .expect("failed to declare sampling cursor");
 
         VectorReadBatcher {
@@ -94,34 +100,40 @@ impl VectorReadBatcher {
         }
 
         let start_time = Instant::now();
-        let fetch_sql = format!("FETCH {} FROM \"{}\"", self.batch_size, self.cursor_name);
+        let fetch_sql = format!("FETCH FORWARD {} FROM \"{}\"", self.batch_size, self.cursor_name);
+
+        // info!("🔍 [DEBUG] Executing Fetch: {}", fetch_sql); // Uncomment if very verbose needed
 
         let (all_vectors, dims, read_count) = Spi::connect(|client| {
             let mut vectors: Vec<f32> = Vec::new();
             let mut dims: u32 = 0;
             let mut count = 0;
 
-            if let Ok(table) = client.select(&fetch_sql, None, &[]) {
-                for row in table {
-                    if let Ok(entry) = row.get_datum_by_ordinal(1) {
-                        // Explicitly ask for pg_sys::Datum to resolve type inference error
-                        if let Ok(Some(datum)) = entry.value::<pgrx::pg_sys::Datum>() {
-                            unsafe {
-                                let raw_ptr = datum.cast_mut_ptr();
-                                let detoasted_ptr = pgrx::pg_sys::pg_detoast_datum(raw_ptr);
+            // Use .expect to force panic with message if cursor is gone
+            let table = client.select(&fetch_sql, None, &[])
+                .expect("SPI SELECT failed inside next_batch (Cursor may be closed or invalid)");
 
-                                let byte_slice = pgrx::varlena_to_byte_slice(detoasted_ptr);
-                                let (vec_vals, vec_dims) = vector_type::decode_pgvector_vector(byte_slice);
+            for row in table {
+                if let Ok(entry) = row.get_datum_by_ordinal(1) {
+                    if let Ok(Some(datum)) = entry.value::<pgrx::pg_sys::Datum>() {
+                        unsafe {
+                            let raw_ptr = datum.cast_mut_ptr();
+                            let detoasted_ptr = pgrx::pg_sys::pg_detoast_datum(raw_ptr);
 
-                                if dims == 0 { dims = vec_dims; }
-                                vectors.extend_from_slice(&vec_vals);
-                                count += 1;
+                            let byte_slice = pgrx::varlena_to_byte_slice(detoasted_ptr);
+                            let (vec_vals, vec_dims) = vector_type::decode_pgvector_vector(byte_slice);
 
-                                if detoasted_ptr != raw_ptr {
-                                    pgrx::pg_sys::pfree(detoasted_ptr as *mut std::ffi::c_void);
-                                }
+                            if dims == 0 { dims = vec_dims; }
+                            vectors.extend_from_slice(&vec_vals);
+                            count += 1;
+
+                            if detoasted_ptr != raw_ptr {
+                                pgrx::pg_sys::pfree(detoasted_ptr as *mut std::ffi::c_void);
                             }
                         }
+                    } else {
+                         // Very verbose: log if we hit NULLs
+                         // warning!("🔍 [DEBUG] Row found but datum was NULL or invalid");
                     }
                 }
             }
@@ -129,6 +141,7 @@ impl VectorReadBatcher {
         });
 
         if read_count == 0 {
+            info!("🔍 [DEBUG] Cursor exhausted. Closing scan. (Total Read: {})", self.vectors_read);
             self.end_scan();
             return None;
         }
