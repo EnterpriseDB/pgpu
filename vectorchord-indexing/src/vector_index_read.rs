@@ -6,7 +6,7 @@ use std::time::Instant;
 pub struct VectorReadBatcher {
     cursor_name: String,
     target_samples: u64,
-    batch_size: u64,
+    internal_batch_size: u64, // Separated from external batch_size
     vectors_read: u64,
     active: bool,
 }
@@ -17,7 +17,7 @@ impl VectorReadBatcher {
         column_name: String,
         num_clusters: u32,
         sampling_factor: u32,
-        batch_size: u64,
+        requested_batch_size: u64,
     ) -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -27,41 +27,36 @@ impl VectorReadBatcher {
 
         // 1. Calculate Target
         let target_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
-        info!("🔍 [DEBUG] Initializing Batcher. Target Samples: {} ({} clusters * {})", target_samples, num_clusters, sampling_factor);
 
-        // 2. Size Estimation (Debug Logs Added)
+        // 2. Physical Size Check
         let table_bytes: i64 = Spi::get_one(&format!(
             "SELECT pg_relation_size('{}'::regclass)",
             qualified_table_name
         )).expect("SPI failed to look up table size").unwrap_or(0);
 
-        let reltuples: i64 = Spi::get_one(&format!(
-            "SELECT reltuples::bigint FROM pg_class WHERE oid = '{}'::regclass",
-            qualified_table_name
-        )).unwrap_or(Some(0)).unwrap_or(0);
-
-        info!("🔍 [DEBUG] Table Stats -> Physical Size: {} bytes | pg_class.reltuples: {}", table_bytes, reltuples);
-
-        // 3. Fallback Logic
+        // 3. Robust Estimation (Based on your ps output: 157 rows/block)
+        // We use 160 as the standard density for TOASTed vector tables (768d).
         let estimated_rows: u64 = if table_bytes > 0 {
-            // Assume 50 rows per 8KB block (conservative for vectors)
-            ((table_bytes / 8192) * 50) as u64
+            ((table_bytes / 8192) * 160) as u64
         } else {
-            reltuples.max(0) as u64
+            0
         };
 
-        info!("🔍 [DEBUG] Final Estimated Rows (Conservative): {}", estimated_rows);
+        info!("🔍 [DEBUG] Table Size: {} MB | Est Rows: {} (Density: 160/block) | Target: {}",
+            table_bytes / 1024 / 1024, estimated_rows, target_samples);
 
-        // 4. Determine Strategy
-        let can_use_tablesample = table_bytes > 0; // Cannot use tablesample on size 0 (partition parents/views)
-        let use_block_sampling = can_use_tablesample && (target_samples < estimated_rows);
+        // 4. Strategy Selection
+        // Use Block Sampling if target is less than 90% of our estimate
+        let can_use_tablesample = table_bytes > 0;
+        let use_block_sampling = can_use_tablesample && (target_samples < (estimated_rows as f64 * 0.9) as u64);
 
         let query = if use_block_sampling {
             let ratio = target_samples as f64 / estimated_rows as f64;
-            let percent = (ratio * 100.0 * 1.2).clamp(0.0001, 100.0);
+            // 1.15x buffer to be safe
+            let percent = (ratio * 100.0 * 1.15).clamp(0.0001, 100.0);
 
             info!("📉 Sampling Strategy: Block Sampling (TABLESAMPLE SYSTEM)");
-            info!("   ↳ Calculated Percent: {:.6}% (Ratio: {:.6})", percent, ratio);
+            info!("   ↳ Reading: {:.4}% of blocks to get ~{} vectors", percent, target_samples);
 
             format!(
                 "SELECT {} FROM {} TABLESAMPLE SYSTEM({:.4})",
@@ -69,25 +64,22 @@ impl VectorReadBatcher {
             )
         } else {
             info!("📉 Sampling Strategy: Full Sequential Scan");
-            if !can_use_tablesample {
-                info!("   ↳ Reason: Physical size is 0 (Partitioned Table or View?)");
-            } else {
-                info!("   ↳ Reason: Target ({}) >= Est Rows ({})", target_samples, estimated_rows);
-            }
+            info!("   ↳ Reason: Target Sample size is nearly the full table size.");
 
             format!("SELECT {} FROM {}", column_name, qualified_table_name)
         };
 
-        info!("🔍 [DEBUG] Declaring Cursor: \"{}\"", cursor_name);
-        info!("🔍 [DEBUG] Query: {}", query);
-
         Spi::run(&format!("DECLARE \"{}\" NO SCROLL CURSOR FOR {}", cursor_name, query))
              .expect("failed to declare sampling cursor");
+
+        // CRITICAL FIX: Cap internal fetch size to 50k to prevent OOM crash.
+        // Your code still gets 'requested_batch_size' eventually, but we fetch from DB in small sips.
+        let internal_batch_size = requested_batch_size.clamp(1000, 50_000);
 
         VectorReadBatcher {
             cursor_name,
             target_samples,
-            batch_size,
+            internal_batch_size,
             vectors_read: 0,
             active: true,
         }
@@ -100,18 +92,16 @@ impl VectorReadBatcher {
         }
 
         let start_time = Instant::now();
-        let fetch_sql = format!("FETCH FORWARD {} FROM \"{}\"", self.batch_size, self.cursor_name);
-
-        // info!("🔍 [DEBUG] Executing Fetch: {}", fetch_sql); // Uncomment if very verbose needed
+        // Use the capped internal_batch_size (50k), NOT the huge 10M one
+        let fetch_sql = format!("FETCH FORWARD {} FROM \"{}\"", self.internal_batch_size, self.cursor_name);
 
         let (all_vectors, dims, read_count) = Spi::connect(|client| {
             let mut vectors: Vec<f32> = Vec::new();
             let mut dims: u32 = 0;
             let mut count = 0;
 
-            // Use .expect to force panic with message if cursor is gone
             let table = client.select(&fetch_sql, None, &[])
-                .expect("SPI SELECT failed inside next_batch (Cursor may be closed or invalid)");
+                .expect("SPI SELECT failed inside next_batch");
 
             for row in table {
                 if let Ok(entry) = row.get_datum_by_ordinal(1) {
@@ -119,7 +109,6 @@ impl VectorReadBatcher {
                         unsafe {
                             let raw_ptr = datum.cast_mut_ptr();
                             let detoasted_ptr = pgrx::pg_sys::pg_detoast_datum(raw_ptr);
-
                             let byte_slice = pgrx::varlena_to_byte_slice(detoasted_ptr);
                             let (vec_vals, vec_dims) = vector_type::decode_pgvector_vector(byte_slice);
 
@@ -131,9 +120,6 @@ impl VectorReadBatcher {
                                 pgrx::pg_sys::pfree(detoasted_ptr as *mut std::ffi::c_void);
                             }
                         }
-                    } else {
-                         // Very verbose: log if we hit NULLs
-                         // warning!("🔍 [DEBUG] Row found but datum was NULL or invalid");
                     }
                 }
             }
@@ -141,13 +127,14 @@ impl VectorReadBatcher {
         });
 
         if read_count == 0 {
-            info!("🔍 [DEBUG] Cursor exhausted. Closing scan. (Total Read: {})", self.vectors_read);
+            info!("🔍 [DEBUG] Cursor exhausted. (Read: {} / Target: {})", self.vectors_read, self.target_samples);
             self.end_scan();
             return None;
         }
 
         self.vectors_read += read_count as u64;
-        debug1!("✅ Batch Loaded: {} vectors in {:.2?}", read_count, start_time.elapsed());
+        // Comment out debug1 to reduce log spam if fetching small chunks
+        // debug1!("✅ Batch Loaded: {} vectors in {:.2?}", read_count, start_time.elapsed());
 
         Some((all_vectors, dims))
     }
