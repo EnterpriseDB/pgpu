@@ -23,7 +23,7 @@ pub fn index(
     skip_index_build: bool,
     spherical_centroids: bool,
     residual_quantization: bool,
-    random_sampling: bool,
+    _random_sampling: bool,
 ) {
     // 1. Validate Inputs & Hardware
     let (num_clusters_top_option, num_clusters_leaf) = match lists.len() {
@@ -81,14 +81,17 @@ pub fn index(
            num_clusters_leaf, sampling_factor, batch_size, kmeans_iterations, kmeans_nredo);
 
         let t_load_start = Instant::now();
+
+        // --- SAMPLER INITIALIZATION ---
+        // We do not pass random_sampling anymore. It is enforced internally.
         let mut batcher = VectorReadBatcher::new(
             qualified_table.clone(),
             column_name.clone(),
-            num_samples_to_read,
+            num_leaves,        // num_clusters
+            sampling_factor,   // factor
             batch_size,
-            1,
-            random_sampling,
         );
+
 
         let mut training_dataset: Vec<f32> = Vec::with_capacity((num_samples_to_read as usize) * 768);
         let mut vector_dims = 0;
@@ -166,7 +169,7 @@ pub fn index(
                 &training_dataset,
                 vector_dims,
                 num_roots,
-                100, // iterations
+                kmeans_iterations, // iterations
                 1    // single redo (loop handles the rest)
             );
             let d_train = t_train_start.elapsed();
@@ -367,24 +370,14 @@ pub fn index(
     } else {
         info!("🏗️ [FLAT DETECTED] Running Bottom-Up Batch Clustering");
 
-        let num_samples = (num_clusters_leaf as u64).saturating_mul(sampling_factor as u64);
-        let num_batches = num_samples.div_ceil(batch_size) as u32;
-
-        let num_clusters_per_intermediate_batch: u32 = match num_batches {
-            1 => num_clusters_leaf,
-            _ => {
-                let target = num_clusters_leaf * 4;
-                std::cmp::max(target / num_batches, 3)
-            }
-        };
-
+        // --- SAMPLER INITIALIZATION ---
+        // New call format
         let mut batcher = VectorReadBatcher::new(
             qualified_table.clone(),
             column_name.clone(),
-            num_samples,
+            num_clusters_leaf, // num_clusters
+            sampling_factor,   // factor
             batch_size,
-            num_clusters_per_intermediate_batch as u64,
-            random_sampling,
         );
 
         let mut centroids_all: Vec<f32> = Vec::new();
