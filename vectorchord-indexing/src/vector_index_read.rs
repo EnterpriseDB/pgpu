@@ -1,8 +1,12 @@
 use crate::vector_type;
-use pgrx::pg_sys::{self, BlockNumber, Datum, Buffer, InvalidBuffer, MAIN_FORKNUM};
+use pgrx::pg_sys::{self, BlockNumber, Datum, Buffer};
 use pgrx::info;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+// PostgreSQL constants not exposed by pgrx
+const MAIN_FORKNUM: i32 = 0; // pg_sys::ForkNumber::MAIN_FORKNUM
+const INVALID_BUFFER: Buffer = 0;
 
 /// VectorReadBatcher provides efficient random sampling of vectors from a PostgreSQL table
 /// using direct block access with Feistel-cipher-based block permutation.
@@ -181,31 +185,24 @@ impl Drop for VectorReadBatcher {
 }
 
 /// Resolve a qualified table name to an OID
-unsafe fn resolve_table_oid(qualified_table_name: &str) -> pg_sys::Oid {
+fn resolve_table_oid(qualified_table_name: &str) -> pg_sys::Oid {
     // Use regclass cast via SPI for reliable name resolution
     let query = format!("SELECT '{}'::regclass::oid", qualified_table_name);
 
-    let oid = pgrx::Spi::connect(|client| {
-        match client.select(&query, None, None) {
+    let oid: Option<pg_sys::Oid> = pgrx::Spi::connect(|client| {
+        let result = client.select(&query, None, &[]);
+        match result {
             Ok(table) => {
-                if let Some(row) = table.first().table {
-                    row.get_datum_by_ordinal(1)
-                        .ok()
-                        .and_then(|d| d.value::<pg_sys::Oid>().ok().flatten())
-                        .unwrap_or(pg_sys::InvalidOid)
-                } else {
-                    pg_sys::InvalidOid
-                }
+                table.first().get_one::<pg_sys::Oid>().ok().flatten()
             }
-            Err(_) => pg_sys::InvalidOid,
+            Err(_) => None,
         }
     });
 
-    if oid == pg_sys::InvalidOid {
-        pgrx::error!("Table '{}' not found", qualified_table_name);
+    match oid {
+        Some(o) if o != pg_sys::InvalidOid => o,
+        _ => pgrx::error!("Table '{}' not found", qualified_table_name),
     }
-
-    oid
 }
 
 /// BlockReader handles reading tuples from a single heap block
@@ -215,7 +212,6 @@ struct BlockReader {
     page: pg_sys::Page,
     current_offset: u16,
     max_offset: u16,
-    snapshot: pg_sys::Snapshot,
 }
 
 impl BlockReader {
@@ -225,8 +221,7 @@ impl BlockReader {
             pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
 
             let page = pg_sys::BufferGetPage(buffer);
-            let max_offset = pg_sys::PageGetMaxOffsetNumber(page);
-            let snapshot = pg_sys::GetActiveSnapshot();
+            let max_offset = page_get_max_offset_number(page);
 
             BlockReader {
                 relation,
@@ -234,7 +229,6 @@ impl BlockReader {
                 page,
                 current_offset: 1, // Offsets start at 1 in PostgreSQL
                 max_offset,
-                snapshot,
             }
         }
     }
@@ -246,20 +240,19 @@ impl BlockReader {
                 self.current_offset += 1;
 
                 // Get item pointer for this offset
-                let item_id = pg_sys::PageGetItemId(self.page, offset);
+                let item_id = page_get_item_id(self.page, offset);
 
                 // Skip dead/unused items
-                if !pg_sys::ItemIdIsNormal(item_id) {
+                if !item_id_is_normal(item_id) {
                     continue;
                 }
 
                 // Get the heap tuple header
-                let item = pg_sys::PageGetItem(self.page, item_id);
+                let item = page_get_item(self.page, item_id);
                 let htup = item as *mut pg_sys::HeapTupleHeaderData;
 
-                // Check tuple visibility using MVCC
-                // For sampling, we use a simpler check - just verify it's not dead
-                if !is_tuple_visible(htup, self.snapshot) {
+                // Check tuple visibility - simplified check for sampling
+                if !is_tuple_visible(htup) {
                     continue;
                 }
 
@@ -268,7 +261,7 @@ impl BlockReader {
 
                 // Build a minimal HeapTupleData for attribute extraction
                 let mut tuple_data = pg_sys::HeapTupleData {
-                    t_len: (*item_id).lp_len() as u32,
+                    t_len: item_id_get_length(item_id),
                     t_self: pg_sys::ItemPointerData::default(),
                     t_tableOid: pg_sys::InvalidOid,
                     t_data: htup,
@@ -296,48 +289,136 @@ impl BlockReader {
 impl Drop for BlockReader {
     fn drop(&mut self) {
         unsafe {
-            if self.buffer != InvalidBuffer {
+            if self.buffer != INVALID_BUFFER {
                 pg_sys::UnlockReleaseBuffer(self.buffer);
             }
         }
     }
 }
 
+// =============================================================================
+// PostgreSQL Page Access Macros (reimplemented in Rust)
+// These are macros in PostgreSQL C code, not exposed as functions in pgrx
+// =============================================================================
+
+/// PageGetMaxOffsetNumber - get the last valid offset on a page
+/// Equivalent to: ((PageHeader)(page))->pd_lower <= SizeOfPageHeaderData ? 0 :
+///                (((PageHeader)(page))->pd_lower - SizeOfPageHeaderData) / sizeof(ItemIdData)
+#[inline]
+unsafe fn page_get_max_offset_number(page: pg_sys::Page) -> u16 {
+    let header = page as *const pg_sys::PageHeaderData;
+    let pd_lower = (*header).pd_lower as usize;
+
+    // SizeOfPageHeaderData = 24 bytes
+    const SIZE_OF_PAGE_HEADER_DATA: usize = 24;
+    // sizeof(ItemIdData) = 4 bytes
+    const SIZE_OF_ITEM_ID_DATA: usize = 4;
+
+    if pd_lower <= SIZE_OF_PAGE_HEADER_DATA {
+        0
+    } else {
+        ((pd_lower - SIZE_OF_PAGE_HEADER_DATA) / SIZE_OF_ITEM_ID_DATA) as u16
+    }
+}
+
+/// PageGetItemId - get pointer to an ItemId on a page
+/// Equivalent to: &((PageHeader)(page))->pd_linp[(offsetNumber) - 1]
+#[inline]
+unsafe fn page_get_item_id(page: pg_sys::Page, offset_number: u16) -> *const pg_sys::ItemIdData {
+    let header = page as *const pg_sys::PageHeaderData;
+    let linp = std::ptr::addr_of!((*header).pd_linp) as *const pg_sys::ItemIdData;
+    linp.add((offset_number - 1) as usize)
+}
+
+/// PageGetItem - get pointer to the actual item on a page
+/// Equivalent to: (Item)(((char *)(page)) + ItemIdGetOffset(itemId))
+#[inline]
+unsafe fn page_get_item(page: pg_sys::Page, item_id: *const pg_sys::ItemIdData) -> pg_sys::Item {
+    let offset = item_id_get_offset(item_id);
+    (page as *mut u8).add(offset as usize) as pg_sys::Item
+}
+
+/// ItemIdGetOffset - extract offset from ItemIdData
+/// The offset is stored in bits 0-14 of lp_off_flags
+#[inline]
+unsafe fn item_id_get_offset(item_id: *const pg_sys::ItemIdData) -> u16 {
+    // In PostgreSQL, ItemIdData is a 32-bit value with:
+    // - lp_off: 15 bits (offset)
+    // - lp_flags: 2 bits
+    // - lp_len: 15 bits (length)
+    // The structure uses bitfields, but we can access via the raw u32
+    let raw = std::ptr::read_unaligned(item_id as *const u32);
+    (raw & 0x7FFF) as u16 // Lower 15 bits are offset
+}
+
+/// ItemIdGetLength - extract length from ItemIdData
+#[inline]
+unsafe fn item_id_get_length(item_id: *const pg_sys::ItemIdData) -> u32 {
+    let raw = std::ptr::read_unaligned(item_id as *const u32);
+    (raw >> 17) & 0x7FFF // Upper 15 bits (after 2 flag bits) are length
+}
+
+/// ItemIdGetFlags - extract flags from ItemIdData
+#[inline]
+unsafe fn item_id_get_flags(item_id: *const pg_sys::ItemIdData) -> u8 {
+    let raw = std::ptr::read_unaligned(item_id as *const u32);
+    ((raw >> 15) & 0x3) as u8 // Bits 15-16 are flags
+}
+
+/// ItemIdIsNormal - check if item is normal (in use, not dead/redirect)
+/// LP_NORMAL = 1
+#[inline]
+unsafe fn item_id_is_normal(item_id: *const pg_sys::ItemIdData) -> bool {
+    item_id_get_flags(item_id) == 1 // LP_NORMAL
+}
+
 /// Simple visibility check for heap tuples
-unsafe fn is_tuple_visible(htup: *mut pg_sys::HeapTupleHeaderData, snapshot: pg_sys::Snapshot) -> bool {
-    // Get tuple's xmin (inserting transaction)
-    let xmin = (*htup).t_choice.t_heap.t_xmin;
-
-    // For our sampling purposes, we accept tuples that are:
-    // 1. Committed (xmin is in the past)
-    // 2. Not deleted (xmax is invalid or not committed)
-
+/// For sampling purposes, we accept tuples that appear committed
+unsafe fn is_tuple_visible(htup: *mut pg_sys::HeapTupleHeaderData) -> bool {
     // Check infomask for committed status
     let infomask = (*htup).t_infomask;
 
-    // HEAP_XMIN_COMMITTED means the tuple is definitely visible
-    if (infomask & pg_sys::HEAP_XMIN_COMMITTED as u16) != 0 {
+    // HEAP_XMIN_COMMITTED (0x0100) means the inserting transaction committed
+    const HEAP_XMIN_COMMITTED: u16 = 0x0100;
+    // HEAP_XMIN_INVALID (0x0200) means the tuple was never valid
+    const HEAP_XMIN_INVALID: u16 = 0x0200;
+    // HEAP_XMAX_COMMITTED (0x0400) means the deleting transaction committed
+    const HEAP_XMAX_COMMITTED: u16 = 0x0400;
+    // HEAP_XMAX_INVALID (0x0800) means no delete in progress
+    const HEAP_XMAX_INVALID: u16 = 0x0800;
+
+    // If xmin is marked as committed
+    if (infomask & HEAP_XMIN_COMMITTED) != 0 {
         // Check if it's been deleted
-        let xmax = (*htup).t_choice.t_heap.t_xmax;
-        if xmax == 0 || xmax == pg_sys::InvalidTransactionId {
+        if (infomask & HEAP_XMAX_INVALID) != 0 {
+            // Not deleted - visible
             return true;
         }
-        // If xmax is set but not committed, tuple is still visible
-        if (infomask & pg_sys::HEAP_XMAX_COMMITTED as u16) == 0 {
+        if (infomask & HEAP_XMAX_COMMITTED) == 0 {
+            // Delete not committed yet - still visible
             return true;
         }
         // Deleted and committed - not visible
         return false;
     }
 
-    // HEAP_XMIN_INVALID means tuple was never valid
-    if (infomask & pg_sys::HEAP_XMIN_INVALID as u16) != 0 {
+    // If xmin is marked as invalid, tuple was never valid
+    if (infomask & HEAP_XMIN_INVALID) != 0 {
         return false;
     }
 
-    // For in-progress transactions, do a proper visibility check
-    // This is a simplified check - in production you'd use HeapTupleSatisfiesVisibility
-    // But for sampling, we can be slightly loose
+    // For tuples without hint bits set, we need to check transaction status
+    // For sampling, we'll optimistically include them (they're likely committed)
+    // This is acceptable since sampling doesn't need perfect accuracy
+    let xmin = (*htup).t_choice.t_heap.t_xmin;
+
+    // Check if it's a frozen transaction (always visible)
+    // FrozenTransactionId = 2
+    if xmin == pg_sys::FrozenTransactionId {
+        return true;
+    }
+
+    // For other transactions, check if committed
     pg_sys::TransactionIdDidCommit(xmin)
 }
 
