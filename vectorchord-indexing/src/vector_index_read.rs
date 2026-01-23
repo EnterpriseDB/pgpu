@@ -1,9 +1,8 @@
 use crate::vector_type;
-use pgrx::pg_sys::{format_type_be, SysScanDesc};
-use pgrx::{debug1, heap_getattr_raw, pg_sys, warning, PgRelation, Spi};
-use std::ffi::CStr;
+use pgrx::{debug1, info, warning, Spi};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::Instant;
-use std::num::NonZero;
+
 pub struct VectorReadBatcher {
     cursor_name: String,
     target_samples: u64,
@@ -20,10 +19,14 @@ impl VectorReadBatcher {
         sampling_factor: u32,
         batch_size: u64,
     ) -> Self {
-        let cursor_name = format!("pgpu_cursor_{}", pgrx::pg_sys::get_pseudorandom_u32());
+        // Fix: Use SystemTime for a unique cursor suffix instead of missing pg_sys function
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let cursor_name = format!("pgpu_cursor_{}", nanos);
 
         // 1. Calculate Target Count
-        // (num_clusters * sampling_factor)
         let target_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
 
         // 2. Get Total Row Estimate
@@ -35,12 +38,10 @@ impl VectorReadBatcher {
         let total_rows = total_rows.max(1) as u64;
 
         // 3. Determine Query Strategy
-        // If we need less than the total table, we ALWAYS use Block Sampling (TABLESAMPLE SYSTEM).
-        // This is the VectorChord strategy: O(1) random block access.
         let query = if target_samples < total_rows {
-            // Calculate Percentage
-            // We request 10% MORE data (1.1x) to be safe against empty pages
+            // A. FAST BLOCK SAMPLING (TABLESAMPLE SYSTEM)
             let ratio = target_samples as f64 / total_rows as f64;
+            // Request 10% extra (1.1x) to cover empty pages/dead tuples
             let percent = (ratio * 100.0 * 1.1).clamp(0.0001, 100.0);
 
             info!("📉 Sampling Strategy: Block Sampling (TABLESAMPLE SYSTEM)");
@@ -52,9 +53,8 @@ impl VectorReadBatcher {
                 column_name, qualified_table_name, percent
             )
         } else {
-            // Fallback: If we need the whole table (or more), just read it all sequentially.
+            // B. FULL SEQUENTIAL SCAN (Fallback)
             info!("📉 Sampling Strategy: Full Sequential Scan (Target > Total Table Size)");
-
             format!("SELECT {} FROM {}", column_name, qualified_table_name)
         };
 
@@ -72,15 +72,12 @@ impl VectorReadBatcher {
     }
 
     pub(crate) fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
-        // Stop if we've read enough or cursor is exhausted
         if !self.active || self.vectors_read >= self.target_samples {
             if self.active { self.end_scan(); }
             return None;
         }
 
         let start_time = Instant::now();
-
-        // 1. Fetch next chunk from the stream
         let fetch_sql = format!("FETCH {} FROM \"{}\"", self.batch_size, self.cursor_name);
 
         let (all_vectors, dims, read_count) = Spi::connect(|client| {
@@ -90,15 +87,10 @@ impl VectorReadBatcher {
 
             if let Ok(table) = client.select(&fetch_sql, None, &[]) {
                 for row in table {
-                    // ERROR 2 FIX: Correctly unpack the SpiHeapTupleDataEntry
-                    // get_datum_by_ordinal returns Result<Entry>, not Result<Option<Datum>>
                     if let Ok(entry) = row.get_datum_by_ordinal(1) {
-                        // Check if the entry has a value (is not null)
+                        // Explicitly ask for pg_sys::Datum
                         if let Ok(Some(datum)) = entry.value::<pgrx::pg_sys::Datum>() {
                             unsafe {
-                                // Now we have the raw datum, we can cast it to a pointer
-                                // We specify cast_mut_ptr::<pg_sys::varlena>() to be precise,
-                                // but usually inference works if pg_detoast_datum is called next.
                                 let raw_ptr = datum.cast_mut_ptr();
                                 let detoasted_ptr = pgrx::pg_sys::pg_detoast_datum(raw_ptr);
 
@@ -120,14 +112,12 @@ impl VectorReadBatcher {
             (vectors, dims, count)
         });
 
-        // 2. Handle End of Stream
         if read_count == 0 {
             self.end_scan();
             return None;
         }
 
         self.vectors_read += read_count as u64;
-
         debug1!("✅ Batch Loaded: {} vectors in {:.2?}", read_count, start_time.elapsed());
 
         Some((all_vectors, dims))
