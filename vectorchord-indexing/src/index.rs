@@ -91,7 +91,8 @@ pub fn index(
 
         info!("📥 Loading training samples into RAM...");
 
-        let mut last_log_time = Instant::now(); // <--- Initialize timer
+        let mut last_log_time = Instant::now();
+        let mut last_log_count: usize = 0;
 
         while let Some((vecs, dims)) = batcher.next_batch() {
             if vector_dims == 0 {
@@ -111,16 +112,23 @@ pub fn index(
             training_dataset.extend(vecs);
 
             // --- PROGRESS LOGGING (Every 5 seconds) ---
-            if last_log_time.elapsed().as_secs() >= 5 {
+            let elapsed_since_log = last_log_time.elapsed().as_secs_f64();
+            if elapsed_since_log >= 5.0 {
+                let vectors_since_log = loaded_count - last_log_count;
+                let rate = vectors_since_log as f64 / elapsed_since_log;
                 let percent = (loaded_count as f64 / num_samples_target as f64) * 100.0;
-                info!("⏳ Sampling Progress: {:.1}% ({}/{} vectors)", percent, loaded_count, num_samples_target);
+                let remaining = num_samples_target as usize - loaded_count;
+                let eta_secs = if rate > 0.0 { remaining as f64 / rate } else { 0.0 };
+
+                info!(
+                    "⏳ Loaded {}/{} ({:.1}%) | Rate: {:.0} vec/s | ETA: {:.0}s",
+                    loaded_count, num_samples_target, percent, rate, eta_secs
+                );
+
                 last_log_time = Instant::now();
+                last_log_count = loaded_count;
             }
             // ------------------------------------------
-
-            if loaded_count % 5_000_000 == 0 {
-                info!("... Loaded {}/{} samples", loaded_count, num_samples_target);
-            }
         }
         batcher.end_scan();
         let d_load = t_load_start.elapsed();

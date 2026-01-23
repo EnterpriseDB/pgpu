@@ -1,48 +1,166 @@
 use crate::vector_type;
-use pgrx::pg_sys::{self, BlockNumber, Datum};
+use pgrx::pg_sys::{self, BlockNumber, Datum, OffsetNumber};
 use pgrx::info;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-
-// PostgreSQL constants not exposed by pgrx
-const MAIN_FORKNUM: i32 = 0; // pg_sys::ForkNumber::MAIN_FORKNUM
+use std::ptr::NonNull;
 
 // Configuration
-const VECTORS_PER_BATCH: u64 = 50000; // Vectors to return per next_batch() call
+const VECTORS_PER_BATCH: u64 = 50000;
 
-// If sampling more than this fraction of the table, use sequential scan instead of random blocks
-// Sequential I/O is 10-100x faster than random I/O
-const SEQUENTIAL_SCAN_THRESHOLD: f64 = 0.15; // 15%
+// =============================================================================
+// Reimplementation of PostgreSQL's inline table sampling functions
+// These are static inline in tableam.h, not exposed by pgrx
+// =============================================================================
 
-/// Scan mode selection based on sampling fraction
-enum ScanMode {
-    /// Random block access - for small samples (<15% of table)
-    Random { block_iterator: FeistelBlockIterator },
-    /// Sequential scan with reservoir sampling - for large samples (>15% of table)
-    Sequential {
-        current_block_num: BlockNumber,
-        total_blocks: BlockNumber,
-        sample_probability: f64,
-        rng_state: u64,
-    },
+/// Reimplementation of table_scan_sample_next_block from tableam.h
+/// Calls our TSM callback to get the next block, then calls the tableam to read it
+#[inline]
+unsafe fn table_scan_sample_next_block(
+    scan: pg_sys::TableScanDesc,
+    scanstate: *mut pg_sys::SampleScanState,
+) -> bool {
+    let scan_ref = &*scan;
+
+    // Get nblocks from the scan descriptor
+    // In heap AM, this is stored in rs_nblocks
+    let rs_nblocks = scan_ref.rs_nblocks;
+
+    if rs_nblocks == 0 {
+        return false;
+    }
+
+    // Get the TSM routine and call NextSampleBlock
+    let tsm = (*scanstate).tsmroutine as *const TsmRoutine;
+
+    if let Some(next_block_fn) = (*tsm).NextSampleBlock {
+        let blockno = next_block_fn(scanstate, rs_nblocks);
+        if blockno == pg_sys::InvalidBlockNumber {
+            return false;
+        }
+    }
+
+    // Call the tableam's scan_sample_next_block
+    let relation = scan_ref.rs_rd;
+    let tableam = (*relation).rd_tableam;
+
+    if let Some(scan_sample_next_block_fn) = (*tableam).scan_sample_next_block {
+        return scan_sample_next_block_fn(scan, scanstate);
+    }
+
+    false
+}
+
+/// Reimplementation of table_scan_sample_next_tuple from tableam.h
+#[inline]
+unsafe fn table_scan_sample_next_tuple(
+    scan: pg_sys::TableScanDesc,
+    scanstate: *mut pg_sys::SampleScanState,
+    slot: *mut pg_sys::TupleTableSlot,
+) -> bool {
+    let scan_ref = &*scan;
+
+    // Get the TSM routine and call NextSampleTuple
+    let tsm = (*scanstate).tsmroutine as *const TsmRoutine;
+
+    if let Some(next_tuple_fn) = (*tsm).NextSampleTuple {
+        // Get max offset from scan - for heap this is stored after reading the block
+        // We pass the current block's max offset
+        let blockno = scan_ref.rs_cblock;
+        let maxoffset = scan_ref.rs_ntuples as OffsetNumber;
+
+        let tupoffset = next_tuple_fn(scanstate, blockno, maxoffset);
+        if tupoffset == pg_sys::InvalidOffsetNumber {
+            return false;
+        }
+    }
+
+    // Call the tableam's scan_sample_next_tuple
+    let relation = scan_ref.rs_rd;
+    let tableam = (*relation).rd_tableam;
+
+    if let Some(scan_sample_next_tuple_fn) = (*tableam).scan_sample_next_tuple {
+        return scan_sample_next_tuple_fn(scan, scanstate, slot);
+    }
+
+    false
+}
+
+/// Reimplementation of table_endscan from tableam.h
+#[inline]
+unsafe fn table_endscan(scan: pg_sys::TableScanDesc) {
+    let scan_ref = &*scan;
+    let relation = scan_ref.rs_rd;
+    let tableam = (*relation).rd_tableam;
+
+    if let Some(scan_end_fn) = (*tableam).scan_end {
+        scan_end_fn(scan);
+    }
+}
+
+/// Reimplementation of table_beginscan_sampling from tableam.h
+/// This sets up a table scan for TABLESAMPLE operations
+#[inline]
+unsafe fn table_beginscan_sampling(
+    rel: pg_sys::Relation,
+    snapshot: pg_sys::Snapshot,
+    nkeys: std::ffi::c_int,
+    key: *mut pg_sys::ScanKeyData,
+    allow_strat: bool,
+    allow_sync: bool,
+    allow_pagemode: bool,
+) -> pg_sys::TableScanDesc {
+    // Build flags for the scan
+    let mut flags: u32 = pg_sys::SO_TYPE_SAMPLESCAN;
+
+    if allow_strat {
+        flags |= pg_sys::SO_ALLOW_STRAT;
+    }
+    if allow_sync {
+        flags |= pg_sys::SO_ALLOW_SYNC;
+    }
+    if allow_pagemode {
+        flags |= pg_sys::SO_ALLOW_PAGEMODE;
+    }
+
+    // Call the tableam's scan_begin function
+    let tableam = (*rel).rd_tableam;
+
+    if let Some(scan_begin_fn) = (*tableam).scan_begin {
+        return scan_begin_fn(rel, snapshot, nkeys, key, std::ptr::null_mut(), flags);
+    }
+
+    std::ptr::null_mut()
+}
+
+/// Reimplementation of table_slot_create from tableam.h
+/// Creates a TupleTableSlot suitable for the given relation
+#[inline]
+unsafe fn table_slot_create(
+    rel: pg_sys::Relation,
+    _reglist: *mut *mut pg_sys::List,
+) -> *mut pg_sys::TupleTableSlot {
+    let tableam = (*rel).rd_tableam;
+
+    if let Some(slot_callbacks_fn) = (*tableam).slot_callbacks {
+        let callbacks = slot_callbacks_fn(rel);
+        return pg_sys::MakeSingleTupleTableSlot((*rel).rd_att, callbacks);
+    }
+
+    // Fallback - shouldn't happen with valid heap relations
+    pg_sys::MakeSingleTupleTableSlot((*rel).rd_att, std::ptr::null())
 }
 
 /// VectorReadBatcher provides efficient random sampling of vectors from a PostgreSQL table.
-///
-/// Automatically selects the optimal strategy:
-/// - Small samples (<15%): Random block access with Feistel permutation
-/// - Large samples (>15%): Sequential scan with probabilistic selection (10-100x faster)
-///
-/// This implementation bypasses SPI calls entirely for maximum performance,
-/// replicating the approach used by VectorChord 1.0.
+/// Uses PostgreSQL's native table sampling infrastructure with Feistel-based block permutation,
+/// matching VectorChord's implementation for optimal performance.
 pub struct VectorReadBatcher {
-    heap_relation: pg_sys::Relation,
+    sampler: Option<HeapSampler>,
+    sample: Option<HeapSample>,
     column_attnum: i16,
     target_samples: u64,
     vectors_read: u64,
     dims: u32,
-    scan_mode: ScanMode,
-    current_block: Option<BlockReader>,
     active: bool,
 }
 
@@ -56,9 +174,8 @@ impl VectorReadBatcher {
     ) -> Self {
         let target_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
 
-        // Get relation and column info using unsafe PostgreSQL internals
-        let (heap_relation, column_attnum, dims, scan_mode) = unsafe {
-            // Parse and open relation using pgrx utilities
+        let (sampler, column_attnum, dims) = unsafe {
+            // Parse and open relation
             let rel_oid = resolve_table_oid(&qualified_table_name);
             let heap_relation = pg_sys::relation_open(rel_oid, pg_sys::AccessShareLock as i32);
 
@@ -77,93 +194,45 @@ impl VectorReadBatcher {
             let type_mod = attr.atttypmod;
             let detected_dims = if type_mod > 0 { type_mod as u32 } else { 0 };
 
-            // Get total number of blocks using the fork-aware function
-            let total_blocks = pg_sys::RelationGetNumberOfBlocksInFork(
-                heap_relation,
-                MAIN_FORKNUM,
-            );
+            // Get total number of blocks
+            let total_blocks = pg_sys::RelationGetNumberOfBlocksInFork(heap_relation, 0);
 
-            // Calculate density for planning
-            const BLOCK_SIZE: u64 = 8192;
-            const PAGE_HEADER: u64 = 24;
-            const TUPLE_HEADER: u64 = 24;
-            const LINE_POINTER: u64 = 4;
-            const TOAST_PTR_SIZE: u64 = 18;
-
+            // Calculate density for logging
             let vec_byte_size = detected_dims as u64 * 4;
             let is_toasted = vec_byte_size > 2000 || vec_byte_size == 0;
-            let data_size = if is_toasted { TOAST_PTR_SIZE } else { vec_byte_size };
-            let row_footprint = TUPLE_HEADER + data_size + LINE_POINTER;
-            let density = if row_footprint > 0 {
-                (BLOCK_SIZE - PAGE_HEADER) / row_footprint
-            } else {
-                100 // Default estimate
-            };
-
-            let estimated_total_rows = total_blocks as u64 * density;
-            let sample_fraction = target_samples as f64 / estimated_total_rows.max(1) as f64;
+            let density = if is_toasted { 177 } else { (8192 - 24) / (24 + vec_byte_size + 4) };
+            let estimated_rows = total_blocks as u64 * density;
 
             info!(
-                "[SAMPLER] Table: {} blocks, ~{} rows. Dims: {}. Mode: {}",
-                total_blocks,
-                estimated_total_rows,
-                detected_dims,
-                if is_toasted { "TOAST" } else { "INLINE" }
+                "[SAMPLER] Table: {} blocks (~{} rows). Target: {} samples. Dims: {}",
+                total_blocks, estimated_rows, target_samples, detected_dims
             );
 
-            // Choose scan strategy based on sample fraction
-            let scan_mode = if sample_fraction > SEQUENTIAL_SCAN_THRESHOLD {
-                // Large sample - use sequential scan (much faster for >15% of table)
-                let sample_prob = (target_samples as f64 / estimated_total_rows as f64) * 1.05; // 5% oversample
-                let seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos() as u64;
+            // Get snapshot
+            let snapshot = pg_sys::GetActiveSnapshot();
 
-                info!(
-                    "[SAMPLER] Using SEQUENTIAL scan (sampling {:.1}% > {:.0}% threshold). Target: {} vectors",
-                    sample_fraction * 100.0,
-                    SEQUENTIAL_SCAN_THRESHOLD * 100.0,
-                    target_samples
-                );
+            // Create sampler
+            let sampler = HeapSampler::new(heap_relation, snapshot, total_blocks);
 
-                ScanMode::Sequential {
-                    current_block_num: 0,
-                    total_blocks,
-                    sample_probability: sample_prob.min(1.0),
-                    rng_state: seed,
-                }
-            } else {
-                // Small sample - use random block access
-                let blocks_needed = (target_samples / density.max(1)) + 1;
-                let blocks_to_scan = (blocks_needed as f64 * 1.1) as u32;
-                let blocks_to_scan = blocks_to_scan.clamp(1, total_blocks);
-
-                info!(
-                    "[SAMPLER] Using RANDOM block scan (sampling {:.1}% < {:.0}% threshold). Reading {} blocks",
-                    sample_fraction * 100.0,
-                    SEQUENTIAL_SCAN_THRESHOLD * 100.0,
-                    blocks_to_scan
-                );
-
-                ScanMode::Random {
-                    block_iterator: FeistelBlockIterator::new(total_blocks, blocks_to_scan),
-                }
-            };
-
-            (heap_relation, attnum, detected_dims, scan_mode)
+            (Some(sampler), attnum, detected_dims)
         };
 
-        VectorReadBatcher {
-            heap_relation,
+        let mut batcher = VectorReadBatcher {
+            sampler,
+            sample: None,
             column_attnum,
             target_samples,
             vectors_read: 0,
             dims,
-            scan_mode,
-            current_block: None,
             active: true,
+        };
+
+        // Initialize the sample
+        if let Some(ref sampler) = batcher.sampler {
+            batcher.sample = Some(sampler.sample());
         }
+
+        batcher
     }
 
     pub(crate) fn next_batch(&mut self) -> Option<(Vec<f32>, u32)> {
@@ -171,86 +240,30 @@ impl VectorReadBatcher {
             return None;
         }
 
-        // Read vectors in batches
+        let sample = self.sample.as_mut()?;
         let batch_target = VECTORS_PER_BATCH.min(self.target_samples - self.vectors_read);
 
         let mut vectors: Vec<f32> = Vec::with_capacity(batch_target as usize * self.dims.max(768) as usize);
         let mut dims: u32 = self.dims;
         let mut count: u64 = 0;
 
-        match &mut self.scan_mode {
-            ScanMode::Random { block_iterator } => {
-                // Random block access mode
-                while count < batch_target {
-                    // Try to get next tuple from current block
-                    if let Some(ref mut block_reader) = self.current_block {
-                        if let Some(datum) = block_reader.next_tuple_datum(self.column_attnum) {
-                            if let Some((vec_vals, vec_dims)) = extract_vector_from_datum(datum) {
-                                if dims == 0 {
-                                    dims = vec_dims;
-                                }
-                                vectors.extend_from_slice(&vec_vals);
-                                count += 1;
-                                continue;
-                            }
-                            continue; // Skip null/invalid tuples
+        while count < batch_target {
+            match sample.next(self.column_attnum) {
+                Some(datum) => {
+                    if let Some((vec_vals, vec_dims)) = extract_vector_from_datum(datum) {
+                        if dims == 0 {
+                            dims = vec_dims;
                         }
-                        // Current block exhausted, release it
-                        self.current_block = None;
-                    }
-
-                    // Get next block
-                    if let Some(block_num) = block_iterator.next() {
-                        self.current_block = Some(BlockReader::new(self.heap_relation, block_num));
-                    } else {
-                        // No more blocks
-                        break;
+                        vectors.extend_from_slice(&vec_vals);
+                        count += 1;
                     }
                 }
-            }
-
-            ScanMode::Sequential {
-                current_block_num,
-                total_blocks,
-                sample_probability,
-                rng_state,
-            } => {
-                // Sequential scan with probabilistic sampling
-                while count < batch_target {
-                    // Try to get next tuple from current block
-                    if let Some(ref mut block_reader) = self.current_block {
-                        if let Some(datum) = block_reader.next_tuple_datum(self.column_attnum) {
-                            // Fast XorShift random for sampling decision
-                            *rng_state ^= *rng_state << 13;
-                            *rng_state ^= *rng_state >> 7;
-                            *rng_state ^= *rng_state << 17;
-                            let rand_val = (*rng_state as f64) / (u64::MAX as f64);
-
-                            if rand_val < *sample_probability {
-                                if let Some((vec_vals, vec_dims)) = extract_vector_from_datum(datum) {
-                                    if dims == 0 {
-                                        dims = vec_dims;
-                                    }
-                                    vectors.extend_from_slice(&vec_vals);
-                                    count += 1;
-                                }
-                            }
-                            // Skip this tuple (not sampled) or null
-                            continue;
-                        }
-                        // Current block exhausted, release it
-                        self.current_block = None;
+                None => {
+                    if count == 0 {
+                        self.active = false;
+                        return None;
                     }
-
-                    // Get next block (sequential)
-                    if *current_block_num < *total_blocks {
-                        let block_to_load = *current_block_num;
-                        *current_block_num += 1;
-                        self.current_block = Some(BlockReader::new(self.heap_relation, block_to_load));
-                    } else {
-                        // No more blocks
-                        break;
-                    }
+                    break;
                 }
             }
         }
@@ -268,30 +281,26 @@ impl VectorReadBatcher {
 
     pub(crate) fn end_scan(&mut self) {
         self.active = false;
-        self.current_block = None;
+        self.sample = None;
+        self.sampler = None;
     }
 }
 
 impl Drop for VectorReadBatcher {
     fn drop(&mut self) {
-        self.current_block = None;
-        unsafe {
-            pg_sys::relation_close(self.heap_relation, pg_sys::AccessShareLock as i32);
-        }
+        self.sample = None;
+        self.sampler = None;
     }
 }
 
 /// Resolve a qualified table name to an OID
 fn resolve_table_oid(qualified_table_name: &str) -> pg_sys::Oid {
-    // Use regclass cast via SPI for reliable name resolution
     let query = format!("SELECT '{}'::regclass::oid", qualified_table_name);
 
     let oid: Option<pg_sys::Oid> = pgrx::Spi::connect(|client| {
         let result = client.select(&query, None, &[]);
         match result {
-            Ok(table) => {
-                table.first().get_one::<pg_sys::Oid>().ok().flatten()
-            }
+            Ok(table) => table.first().get_one::<pg_sys::Oid>().ok().flatten(),
             Err(_) => None,
         }
     });
@@ -300,224 +309,6 @@ fn resolve_table_oid(qualified_table_name: &str) -> pg_sys::Oid {
         Some(o) if o != pg_sys::InvalidOid => o,
         _ => pgrx::error!("Table '{}' not found", qualified_table_name),
     }
-}
-
-/// BlockReader handles reading tuples from a single heap block
-struct BlockReader {
-    relation: pg_sys::Relation,
-    buffer: pg_sys::Buffer,
-    page: pg_sys::Page,
-    current_offset: u16,
-    max_offset: u16,
-}
-
-impl BlockReader {
-    fn new(relation: pg_sys::Relation, block_num: BlockNumber) -> Self {
-        unsafe {
-            // Read through buffer manager (benefits from OS read-ahead for sequential access)
-            let buffer = pg_sys::ReadBuffer(relation, block_num);
-            pg_sys::LockBuffer(buffer, pg_sys::BUFFER_LOCK_SHARE as i32);
-
-            let page = pg_sys::BufferGetPage(buffer);
-            let max_offset = page_get_max_offset_number(page);
-
-            BlockReader {
-                relation,
-                buffer,
-                page,
-                current_offset: 1, // Offsets start at 1 in PostgreSQL
-                max_offset,
-            }
-        }
-    }
-
-    fn next_tuple_datum(&mut self, attnum: i16) -> Option<Datum> {
-        unsafe {
-            while self.current_offset <= self.max_offset {
-                let offset = self.current_offset;
-                self.current_offset += 1;
-
-                // Get item pointer for this offset
-                let item_id = page_get_item_id(self.page, offset);
-
-                // Skip dead/unused items
-                if !item_id_is_normal(item_id) {
-                    continue;
-                }
-
-                // Get the heap tuple header
-                let item = page_get_item(self.page, item_id);
-                let htup = item as *mut pg_sys::HeapTupleHeaderData;
-
-                // Check tuple visibility - simplified check for sampling
-                if !is_tuple_visible(htup) {
-                    continue;
-                }
-
-                // Extract the attribute value
-                let tuple_desc = (*self.relation).rd_att;
-
-                // Build a minimal HeapTupleData for attribute extraction
-                let mut tuple_data = pg_sys::HeapTupleData {
-                    t_len: item_id_get_length(item_id),
-                    t_self: pg_sys::ItemPointerData::default(),
-                    t_tableOid: pg_sys::InvalidOid,
-                    t_data: htup,
-                };
-
-                let mut is_null: bool = true;
-                let datum = pg_sys::heap_getattr(
-                    &mut tuple_data,
-                    attnum as i32,
-                    tuple_desc,
-                    &mut is_null,
-                );
-
-                if is_null {
-                    continue;
-                }
-
-                return Some(datum);
-            }
-        }
-        None
-    }
-}
-
-impl Drop for BlockReader {
-    fn drop(&mut self) {
-        unsafe {
-            if self.buffer != 0 {
-                pg_sys::UnlockReleaseBuffer(self.buffer);
-            }
-        }
-    }
-}
-
-// =============================================================================
-// PostgreSQL Page Access Macros (reimplemented in Rust)
-// These are macros in PostgreSQL C code, not exposed as functions in pgrx
-// =============================================================================
-
-/// PageGetMaxOffsetNumber - get the last valid offset on a page
-/// Equivalent to: ((PageHeader)(page))->pd_lower <= SizeOfPageHeaderData ? 0 :
-///                (((PageHeader)(page))->pd_lower - SizeOfPageHeaderData) / sizeof(ItemIdData)
-#[inline]
-unsafe fn page_get_max_offset_number(page: pg_sys::Page) -> u16 {
-    let header = page as *const pg_sys::PageHeaderData;
-    let pd_lower = (*header).pd_lower as usize;
-
-    // SizeOfPageHeaderData = 24 bytes
-    const SIZE_OF_PAGE_HEADER_DATA: usize = 24;
-    // sizeof(ItemIdData) = 4 bytes
-    const SIZE_OF_ITEM_ID_DATA: usize = 4;
-
-    if pd_lower <= SIZE_OF_PAGE_HEADER_DATA {
-        0
-    } else {
-        ((pd_lower - SIZE_OF_PAGE_HEADER_DATA) / SIZE_OF_ITEM_ID_DATA) as u16
-    }
-}
-
-/// PageGetItemId - get pointer to an ItemId on a page
-/// Equivalent to: &((PageHeader)(page))->pd_linp[(offsetNumber) - 1]
-#[inline]
-unsafe fn page_get_item_id(page: pg_sys::Page, offset_number: u16) -> *const pg_sys::ItemIdData {
-    let header = page as *const pg_sys::PageHeaderData;
-    let linp = std::ptr::addr_of!((*header).pd_linp) as *const pg_sys::ItemIdData;
-    linp.add((offset_number - 1) as usize)
-}
-
-/// PageGetItem - get pointer to the actual item on a page
-/// Equivalent to: (Item)(((char *)(page)) + ItemIdGetOffset(itemId))
-#[inline]
-unsafe fn page_get_item(page: pg_sys::Page, item_id: *const pg_sys::ItemIdData) -> pg_sys::Item {
-    let offset = item_id_get_offset(item_id);
-    (page as *mut u8).add(offset as usize) as pg_sys::Item
-}
-
-/// ItemIdGetOffset - extract offset from ItemIdData
-/// The offset is stored in bits 0-14 of lp_off_flags
-#[inline]
-unsafe fn item_id_get_offset(item_id: *const pg_sys::ItemIdData) -> u16 {
-    // In PostgreSQL, ItemIdData is a 32-bit value with:
-    // - lp_off: 15 bits (offset)
-    // - lp_flags: 2 bits
-    // - lp_len: 15 bits (length)
-    // The structure uses bitfields, but we can access via the raw u32
-    let raw = std::ptr::read_unaligned(item_id as *const u32);
-    (raw & 0x7FFF) as u16 // Lower 15 bits are offset
-}
-
-/// ItemIdGetLength - extract length from ItemIdData
-#[inline]
-unsafe fn item_id_get_length(item_id: *const pg_sys::ItemIdData) -> u32 {
-    let raw = std::ptr::read_unaligned(item_id as *const u32);
-    (raw >> 17) & 0x7FFF // Upper 15 bits (after 2 flag bits) are length
-}
-
-/// ItemIdGetFlags - extract flags from ItemIdData
-#[inline]
-unsafe fn item_id_get_flags(item_id: *const pg_sys::ItemIdData) -> u8 {
-    let raw = std::ptr::read_unaligned(item_id as *const u32);
-    ((raw >> 15) & 0x3) as u8 // Bits 15-16 are flags
-}
-
-/// ItemIdIsNormal - check if item is normal (in use, not dead/redirect)
-/// LP_NORMAL = 1
-#[inline]
-unsafe fn item_id_is_normal(item_id: *const pg_sys::ItemIdData) -> bool {
-    item_id_get_flags(item_id) == 1 // LP_NORMAL
-}
-
-/// Simple visibility check for heap tuples
-/// For sampling purposes, we accept tuples that appear committed
-unsafe fn is_tuple_visible(htup: *mut pg_sys::HeapTupleHeaderData) -> bool {
-    // Check infomask for committed status
-    let infomask = (*htup).t_infomask;
-
-    // HEAP_XMIN_COMMITTED (0x0100) means the inserting transaction committed
-    const HEAP_XMIN_COMMITTED: u16 = 0x0100;
-    // HEAP_XMIN_INVALID (0x0200) means the tuple was never valid
-    const HEAP_XMIN_INVALID: u16 = 0x0200;
-    // HEAP_XMAX_COMMITTED (0x0400) means the deleting transaction committed
-    const HEAP_XMAX_COMMITTED: u16 = 0x0400;
-    // HEAP_XMAX_INVALID (0x0800) means no delete in progress
-    const HEAP_XMAX_INVALID: u16 = 0x0800;
-
-    // If xmin is marked as committed
-    if (infomask & HEAP_XMIN_COMMITTED) != 0 {
-        // Check if it's been deleted
-        if (infomask & HEAP_XMAX_INVALID) != 0 {
-            // Not deleted - visible
-            return true;
-        }
-        if (infomask & HEAP_XMAX_COMMITTED) == 0 {
-            // Delete not committed yet - still visible
-            return true;
-        }
-        // Deleted and committed - not visible
-        return false;
-    }
-
-    // If xmin is marked as invalid, tuple was never valid
-    if (infomask & HEAP_XMIN_INVALID) != 0 {
-        return false;
-    }
-
-    // For tuples without hint bits set, we need to check transaction status
-    // For sampling, we'll optimistically include them (they're likely committed)
-    // This is acceptable since sampling doesn't need perfect accuracy
-    let xmin = (*htup).t_choice.t_heap.t_xmin;
-
-    // Check if it's a frozen transaction (always visible)
-    // FrozenTransactionId = 2
-    if xmin == pg_sys::FrozenTransactionId {
-        return true;
-    }
-
-    // For other transactions, check if committed
-    pg_sys::TransactionIdDidCommit(xmin)
 }
 
 /// Extract vector data from a datum
@@ -532,7 +323,6 @@ fn extract_vector_from_datum(datum: Datum) -> Option<(Vec<f32>, u32)> {
         let byte_slice = pgrx::varlena_to_byte_slice(detoasted_ptr);
         let (vec_vals, vec_dims) = vector_type::decode_pgvector_vector(byte_slice);
 
-        // Free detoasted memory if it was allocated
         if detoasted_ptr != raw_ptr {
             pg_sys::pfree(detoasted_ptr as *mut std::ffi::c_void);
         }
@@ -541,12 +331,189 @@ fn extract_vector_from_datum(datum: Datum) -> Option<(Vec<f32>, u32)> {
     }
 }
 
-/// FeistelBlockIterator generates a random permutation of block numbers using a Feistel cipher.
-/// This provides uniform random sampling without needing to store all block numbers.
+// =============================================================================
+// PostgreSQL Table Sampling Infrastructure (matches VectorChord's approach)
+// =============================================================================
+
+/// HeapSampler manages the sampling scan setup
+struct HeapSampler {
+    heap_relation: pg_sys::Relation,
+    snapshot: pg_sys::Snapshot,
+    total_blocks: BlockNumber,
+}
+
+impl HeapSampler {
+    unsafe fn new(
+        heap_relation: pg_sys::Relation,
+        snapshot: pg_sys::Snapshot,
+        total_blocks: BlockNumber,
+    ) -> Self {
+        Self {
+            heap_relation,
+            snapshot,
+            total_blocks,
+        }
+    }
+
+    fn sample(&self) -> HeapSample {
+        unsafe {
+            // Create sampler state with Feistel permutation
+            let state = NonNull::new_unchecked(Box::into_raw(Box::new(SamplerState {
+                blocks_iter: Some(Box::new(FeistelBlockIterator::new(self.total_blocks))),
+                tuples_iter: None,
+            })));
+
+            // Create sample scan state with our custom TSM routine
+            let sample_scan_state = NonNull::new_unchecked(Box::into_raw(Box::new(
+                pg_sys::SampleScanState {
+                    tsmroutine: (&raw const TSM_ROUTINE.0).cast_mut().cast(),
+                    tsm_state: state.as_ptr().cast(),
+                    ..core::mem::zeroed()
+                },
+            )));
+
+            // Begin sampling scan using our reimplemented function
+            let table_scan_desc = table_beginscan_sampling(
+                self.heap_relation,
+                self.snapshot,
+                0,
+                std::ptr::null_mut(),
+                true,  // allow_strat
+                false, // allow_sync
+                true,  // allow_pagemode
+            );
+
+            // Create executor state
+            let estate = pg_sys::CreateExecutorState();
+            let econtext = pg_sys::MakePerTupleExprContext(estate);
+
+            // Create tuple slot using our reimplemented function
+            let slot = table_slot_create(self.heap_relation, std::ptr::null_mut());
+
+            HeapSample {
+                heap_relation: self.heap_relation,
+                estate,
+                econtext,
+                slot,
+                state,
+                sample_scan_state,
+                table_scan_desc,
+                done: false,
+                have_block: false,
+            }
+        }
+    }
+}
+
+impl Drop for HeapSampler {
+    fn drop(&mut self) {
+        unsafe {
+            pg_sys::relation_close(self.heap_relation, pg_sys::AccessShareLock as i32);
+        }
+    }
+}
+
+/// HeapSample handles the actual tuple iteration
+struct HeapSample {
+    heap_relation: pg_sys::Relation,
+    estate: *mut pg_sys::EState,
+    econtext: *mut pg_sys::ExprContext,
+    slot: *mut pg_sys::TupleTableSlot,
+    state: NonNull<SamplerState>,
+    sample_scan_state: NonNull<pg_sys::SampleScanState>,
+    table_scan_desc: pg_sys::TableScanDesc,
+    done: bool,
+    have_block: bool,
+}
+
+impl HeapSample {
+    fn next(&mut self, attnum: i16) -> Option<Datum> {
+        if self.done {
+            return None;
+        }
+
+        unsafe {
+            loop {
+                if !self.have_block {
+                    // Get next sample block using our reimplemented function
+                    if !table_scan_sample_next_block(
+                        self.table_scan_desc,
+                        self.sample_scan_state.as_ptr(),
+                    ) {
+                        self.have_block = false;
+                        self.done = true;
+                        return None;
+                    }
+                    self.have_block = true;
+                }
+
+                // Get next tuple using our reimplemented function
+                if !table_scan_sample_next_tuple(
+                    self.table_scan_desc,
+                    self.sample_scan_state.as_ptr(),
+                    self.slot,
+                ) {
+                    self.have_block = false;
+                    continue;
+                }
+
+                // Reset per-tuple memory context (important for performance!)
+                pg_sys::MemoryContextReset((*self.econtext).ecxt_per_tuple_memory);
+
+                // Extract attribute from slot
+                let mut is_null: bool = true;
+                let datum = pg_sys::slot_getattr(self.slot, attnum as i32, &mut is_null);
+
+                if is_null {
+                    continue;
+                }
+
+                return Some(datum);
+            }
+        }
+    }
+}
+
+impl Drop for HeapSample {
+    fn drop(&mut self) {
+        unsafe {
+            // Reset memory context
+            if !self.econtext.is_null() {
+                pg_sys::MemoryContextReset((*self.econtext).ecxt_per_tuple_memory);
+            }
+
+            // End the table scan using our reimplemented function
+            table_endscan(self.table_scan_desc);
+
+            // Free our state boxes
+            let _ = Box::from_raw(self.sample_scan_state.as_ptr());
+            let _ = Box::from_raw(self.state.as_ptr());
+
+            // Free tuple slot
+            if !self.slot.is_null() {
+                pg_sys::ExecDropSingleTupleTableSlot(self.slot);
+            }
+
+            // Free executor state
+            if !self.estate.is_null() {
+                pg_sys::FreeExecutorState(self.estate);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Sampler State and Feistel Iterator
+// =============================================================================
+
+struct SamplerState {
+    blocks_iter: Option<Box<FeistelBlockIterator>>,
+    tuples_iter: Option<std::ops::RangeInclusive<u16>>,
+}
+
+/// Feistel cipher-based block permutation for random sampling
 struct FeistelBlockIterator {
     total_blocks: u32,
-    blocks_to_return: u32,
-    blocks_returned: u32,
     permutation_index: u32,
     width: u32,
     key_0: u64,
@@ -554,8 +521,7 @@ struct FeistelBlockIterator {
 }
 
 impl FeistelBlockIterator {
-    fn new(total_blocks: u32, blocks_to_sample: u32) -> Self {
-        // Width must be even and large enough to cover total_blocks
+    fn new(total_blocks: u32) -> Self {
         let width = if total_blocks <= 1 {
             2
         } else {
@@ -563,7 +529,6 @@ impl FeistelBlockIterator {
             (log2 as u32).next_multiple_of(2).max(2)
         };
 
-        // Generate random keys using system time as seed
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -572,14 +537,11 @@ impl FeistelBlockIterator {
         let mut hasher = DefaultHasher::new();
         seed.hash(&mut hasher);
         let key_0 = hasher.finish();
-
         (seed ^ 0xDEADBEEF).hash(&mut hasher);
         let key_1 = hasher.finish();
 
         FeistelBlockIterator {
             total_blocks,
-            blocks_to_return: blocks_to_sample.min(total_blocks),
-            blocks_returned: 0,
             permutation_index: 0,
             width,
             key_0,
@@ -587,7 +549,6 @@ impl FeistelBlockIterator {
         }
     }
 
-    /// Feistel cipher round function
     fn feistel_round(&self, round: u32, value: u32) -> u32 {
         let mut hasher = DefaultHasher::new();
         round.hash(&mut hasher);
@@ -597,7 +558,6 @@ impl FeistelBlockIterator {
         hasher.finish() as u32
     }
 
-    /// Apply Feistel cipher to generate pseudo-random permutation
     fn feistel_permute(&self, input: u32) -> u32 {
         let half_width = self.width / 2;
         let mask = (1u32 << half_width) - 1;
@@ -605,7 +565,6 @@ impl FeistelBlockIterator {
         let mut left = (input >> half_width) & mask;
         let mut right = input & mask;
 
-        // 8 rounds of Feistel cipher
         for round in 0..8 {
             let new_left = right;
             let new_right = left ^ (self.feistel_round(round, right) & mask);
@@ -621,20 +580,13 @@ impl Iterator for FeistelBlockIterator {
     type Item = BlockNumber;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.blocks_returned >= self.blocks_to_return {
-            return None;
-        }
-
         let max_permutation = 1u32 << self.width;
 
-        // Find next valid block number through permutation
         while self.permutation_index < max_permutation {
             let permuted = self.feistel_permute(self.permutation_index);
             self.permutation_index += 1;
 
-            // Only return if within valid block range
             if permuted < self.total_blocks {
-                self.blocks_returned += 1;
                 return Some(permuted);
             }
         }
@@ -642,3 +594,72 @@ impl Iterator for FeistelBlockIterator {
         None
     }
 }
+
+// =============================================================================
+// TSM (Table Sampling Method) Callbacks
+// =============================================================================
+
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn tsm_next_sample_block(
+    node: *mut pg_sys::SampleScanState,
+    _nblocks: BlockNumber,
+) -> BlockNumber {
+    let state: &mut SamplerState = &mut *((*node).tsm_state as *mut SamplerState);
+
+    if let Some(ref mut iter) = state.blocks_iter {
+        if let Some(block) = iter.next() {
+            return block;
+        }
+    }
+
+    pg_sys::InvalidBlockNumber
+}
+
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn tsm_next_sample_tuple(
+    node: *mut pg_sys::SampleScanState,
+    _blockno: BlockNumber,
+    maxoffset: OffsetNumber,
+) -> OffsetNumber {
+    let state: &mut SamplerState = &mut *((*node).tsm_state as *mut SamplerState);
+
+    let iter = state.tuples_iter.get_or_insert(1..=maxoffset);
+
+    if let Some(offset) = iter.next() {
+        offset
+    } else {
+        state.tuples_iter = None;
+        pg_sys::InvalidOffsetNumber
+    }
+}
+
+// TSM Routine structure
+struct SyncTsmRoutine(TsmRoutine);
+unsafe impl Sync for SyncTsmRoutine {}
+
+#[repr(C)]
+struct TsmRoutine {
+    type_: pg_sys::NodeTag,
+    parameterTypes: *mut pg_sys::List,
+    repeatable_across_queries: bool,
+    repeatable_across_scans: bool,
+    SampleScanGetSampleSize: Option<unsafe extern "C-unwind" fn(*mut pg_sys::PlannerInfo, *mut pg_sys::RelOptInfo, *mut pg_sys::List, *mut BlockNumber, *mut f64)>,
+    InitSampleScan: Option<unsafe extern "C-unwind" fn(*mut pg_sys::SampleScanState, std::ffi::c_int)>,
+    BeginSampleScan: Option<unsafe extern "C-unwind" fn(*mut pg_sys::SampleScanState, *mut Datum, std::ffi::c_int, u32)>,
+    NextSampleBlock: Option<unsafe extern "C-unwind" fn(*mut pg_sys::SampleScanState, BlockNumber) -> BlockNumber>,
+    NextSampleTuple: Option<unsafe extern "C-unwind" fn(*mut pg_sys::SampleScanState, BlockNumber, OffsetNumber) -> OffsetNumber>,
+    EndSampleScan: Option<unsafe extern "C-unwind" fn(*mut pg_sys::SampleScanState)>,
+}
+
+static TSM_ROUTINE: SyncTsmRoutine = SyncTsmRoutine(TsmRoutine {
+    type_: pg_sys::NodeTag::T_TsmRoutine,
+    parameterTypes: std::ptr::null_mut(),
+    repeatable_across_queries: false,
+    repeatable_across_scans: false,
+    SampleScanGetSampleSize: None,
+    InitSampleScan: None,
+    BeginSampleScan: None,
+    NextSampleBlock: Some(tsm_next_sample_block),
+    NextSampleTuple: Some(tsm_next_sample_tuple),
+    EndSampleScan: None,
+});
