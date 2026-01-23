@@ -1,5 +1,6 @@
 use crate::vector_type;
 use pgrx::{debug1, info, warning, Spi};
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::Instant;
 
 pub struct VectorReadBatcher {
@@ -31,6 +32,7 @@ impl VectorReadBatcher {
         let target_samples = (num_clusters as u64).saturating_mul(sampling_factor as u64);
 
         // 2. Get Physical Size (Robust, No ANALYZE needed)
+        // We use pg_relation_size to get the exact on-disk byte count.
         let table_bytes: i64 = Spi::get_one(&format!(
             "SELECT pg_relation_size('{}'::regclass)",
             qualified_table_name
@@ -39,13 +41,13 @@ impl VectorReadBatcher {
         let total_blocks = (table_bytes / 8192).max(1) as u64;
 
         // 3. Estimate Density (Vectors per Block)
-        // Vectors are usually TOASTed. A conservative 100 rows/block ensures we read enough.
+        // Vectors are usually TOASTed (stored externally).
+        // A conservative 100 rows/block ensures we queue enough blocks to hit the target.
         let est_vectors_per_block = 100;
 
-        // How many blocks do we need?
         let blocks_needed = (target_samples / est_vectors_per_block) + 1;
 
-        // Safety Buffer: Read 20% extra blocks
+        // Safety Buffer: Read 20% extra blocks to handle empty pages/dead rows
         let blocks_to_queue = (blocks_needed as f64 * 1.2) as u64;
         let blocks_to_queue = blocks_to_queue.clamp(1, total_blocks);
 
@@ -53,22 +55,33 @@ impl VectorReadBatcher {
         info!("🔍 [SAMPLER] Target: {} vectors. Plan: Read {} random blocks (approx {:.2}%)",
             target_samples, blocks_to_queue, (blocks_to_queue as f64 / total_blocks as f64) * 100.0);
 
-        // 4. Generate Random Block List (Manual Shuffle without 'rand' crate)
+        // 4. Generate Random Block List (Manual Shuffle)
         let mut all_blocks: Vec<u64> = (0..total_blocks).collect();
 
-        // Simple Fisher-Yates Shuffle using Postgres internal RNG
+        // --- Dependency-Free Random Shuffle (Xorshift) ---
+        // Seed with current time
+        let mut seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        // Simple Fisher-Yates shuffle
         let len = all_blocks.len();
         if len > 1 {
             for i in (1..len).rev() {
-                // Generate random index between 0 and i
-                // We use a simplified modulo for block shuffling (good enough for sampling)
-                let rnd = unsafe { pgrx::pg_sys::get_pseudorandom_u32() } as usize;
+                // Xorshift algorithm to generate next random number
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+
+                let rnd = seed as usize;
                 let j = rnd % (i + 1);
                 all_blocks.swap(i, j);
             }
         }
+        // --------------------------------------------------
 
-        // Keep only what we need
+        // Keep only the random subset we need
         let blocks_to_read = all_blocks.into_iter().take(blocks_to_queue as usize).collect();
 
         VectorReadBatcher {
@@ -78,7 +91,7 @@ impl VectorReadBatcher {
             vectors_read: 0,
             blocks_to_read,
             current_block_idx: 0,
-            blocks_per_query: 50, // Read 50 blocks per SPI call
+            blocks_per_query: 50, // Read 50 blocks per SQL call for efficiency
             active: true,
         }
     }
@@ -102,25 +115,29 @@ impl VectorReadBatcher {
         self.current_block_idx = end_idx;
 
         // 2. Build the Direct Block Access Query (TID Scan)
+        // We use a Common Table Expression (CTE) with VALUES to force Postgres
+        // to join specifically on the block numbers we want.
+        // Logic: ctid >= (block, 0) AND ctid < (block+1, 0)
+
         let block_list_str: String = batch_blocks.iter()
             .map(|b| b.to_string())
             .collect::<Vec<_>>()
             .join(",");
 
-        // Query logic: Join on ctid range to force block scan
-        // ctid >= '(block, 0)' AND ctid < '(block+1, 0)' covers the whole block
+        // Note: We format the list as "(1), (4), (9)..." for the VALUES clause
+        let values_list = batch_blocks.iter()
+            .map(|b| format!("({})", b))
+            .collect::<Vec<_>>()
+            .join(",");
+
         let query = format!(
-            "WITH target_blocks(blk) AS (VALUES ({})) \
+            "WITH target_blocks(blk) AS (VALUES {}) \
              SELECT t.{} \
              FROM {} t \
              JOIN target_blocks b \
              ON t.ctid >= (b.blk::text || ',0')::tid \
              AND t.ctid < ((b.blk + 1)::text || ',0')::tid",
-             block_list_str
-                 .split(',')
-                 .map(|s| format!("({})", s)) // Wrap in parens for VALUES: (1), (2)
-                 .collect::<Vec<_>>()
-                 .join(","),
+             values_list,
              self.column_name,
              self.qualified_table_name
         );
@@ -159,9 +176,10 @@ impl VectorReadBatcher {
 
         self.vectors_read += read_count as u64;
 
-        // Use debug1 only if needed to avoid unused warning
         debug1!("✅ Scanned {} blocks -> {} vectors ({:.2?})", batch_blocks.len(), read_count, _start_time.elapsed());
 
+        // If a batch of blocks was empty (e.g. vacuumed pages), we return empty vectors.
+        // The caller loop in index.rs will just call next_batch() again immediately.
         Some((all_vectors, dims))
     }
 
