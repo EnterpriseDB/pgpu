@@ -92,6 +92,8 @@ pub fn index(
 
         info!("📥 Loading training samples into RAM...");
 
+        let mut last_log_time = Instant::now(); // <--- Initialize timer
+
         while let Some((vecs, dims)) = batcher.next_batch() {
             if vector_dims == 0 {
                 vector_dims = dims;
@@ -108,6 +110,14 @@ pub fn index(
 
             loaded_count += vecs.len() / dims as usize;
             training_dataset.extend(vecs);
+
+            // --- PROGRESS LOGGING (Every 5 seconds) ---
+            if last_log_time.elapsed().as_secs() >= 5 {
+                let percent = (loaded_count as f64 / num_samples_target as f64) * 100.0;
+                info!("⏳ Sampling Progress: {:.1}% ({}/{} vectors)", percent, loaded_count, num_samples_target);
+                last_log_time = Instant::now();
+            }
+            // ------------------------------------------
 
             if loaded_count % 5_000_000 == 0 {
                 info!("... Loaded {}/{} samples", loaded_count, num_samples_to_read);
