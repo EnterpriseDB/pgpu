@@ -65,13 +65,6 @@ pub fn index(
         info!("📊 Target: {} Roots | {} Leaves ({} per root)", num_roots, num_leaves, num_leaves_per_root);
         info!("📉 Sampling: Factor={} -> Reading {} vectors for training", sampling_factor, num_samples_to_read);
 
-        if random_sampling {
-            info!("🎲 [Random Sampling Active] Reading data from random table offsets to ensure index quality.");
-            info!("   ↳ This is slower than sequential reading but prevents \"Big Bucket\" issues.");
-        } else {
-            warning!("⏩ [Sequential Sampling Active] Reading contiguous data. Faster, but risky if data is sorted on disk.");
-        }
-
         info!("⚙️ Clustering Configuration:\n\
            \t• Target Lists (Leaf):  {}\n\
            \t• Sampling Factor:      {}\n\
