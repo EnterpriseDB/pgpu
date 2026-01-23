@@ -419,6 +419,7 @@ impl Drop for HeapSampler {
 
 /// HeapSample handles the actual tuple iteration
 struct HeapSample {
+    #[allow(dead_code)]
     heap_relation: pg_sys::Relation,
     estate: *mut pg_sys::EState,
     econtext: *mut pg_sys::ExprContext,
@@ -641,7 +642,9 @@ unsafe extern "C-unwind" fn tsm_next_sample_tuple(
 struct SyncTsmRoutine(TsmRoutine);
 unsafe impl Sync for SyncTsmRoutine {}
 
+// Field names match PostgreSQL's C struct TsmRoutine
 #[repr(C)]
+#[allow(non_snake_case)]
 struct TsmRoutine {
     type_: pg_sys::NodeTag,
     parameterTypes: *mut pg_sys::List,
