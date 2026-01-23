@@ -22,9 +22,9 @@ unsafe fn table_scan_sample_next_block(
 ) -> bool {
     let scan_ref = &*scan;
 
-    // Get nblocks from the scan descriptor
-    // In heap AM, this is stored in rs_nblocks
-    let rs_nblocks = scan_ref.rs_nblocks;
+    // Cast to HeapScanDesc to access heap-specific fields
+    let heap_scan = scan as *const pg_sys::HeapScanDescData;
+    let rs_nblocks = (*heap_scan).rs_nblocks;
 
     if rs_nblocks == 0 {
         return false;
@@ -60,14 +60,16 @@ unsafe fn table_scan_sample_next_tuple(
 ) -> bool {
     let scan_ref = &*scan;
 
+    // Cast to HeapScanDesc to access heap-specific fields
+    let heap_scan = scan as *const pg_sys::HeapScanDescData;
+
     // Get the TSM routine and call NextSampleTuple
     let tsm = (*scanstate).tsmroutine as *const TsmRoutine;
 
     if let Some(next_tuple_fn) = (*tsm).NextSampleTuple {
         // Get max offset from scan - for heap this is stored after reading the block
-        // We pass the current block's max offset
-        let blockno = scan_ref.rs_cblock;
-        let maxoffset = scan_ref.rs_ntuples as OffsetNumber;
+        let blockno = (*heap_scan).rs_cblock;
+        let maxoffset = (*heap_scan).rs_ntuples as OffsetNumber;
 
         let tupoffset = next_tuple_fn(scanstate, blockno, maxoffset);
         if tupoffset == pg_sys::InvalidOffsetNumber {
@@ -110,17 +112,19 @@ unsafe fn table_beginscan_sampling(
     allow_sync: bool,
     allow_pagemode: bool,
 ) -> pg_sys::TableScanDesc {
+    use pg_sys::ScanOptions;
+
     // Build flags for the scan
-    let mut flags: u32 = pg_sys::SO_TYPE_SAMPLESCAN;
+    let mut flags: u32 = ScanOptions::SO_TYPE_SAMPLESCAN as u32;
 
     if allow_strat {
-        flags |= pg_sys::SO_ALLOW_STRAT;
+        flags |= ScanOptions::SO_ALLOW_STRAT as u32;
     }
     if allow_sync {
-        flags |= pg_sys::SO_ALLOW_SYNC;
+        flags |= ScanOptions::SO_ALLOW_SYNC as u32;
     }
     if allow_pagemode {
-        flags |= pg_sys::SO_ALLOW_PAGEMODE;
+        flags |= ScanOptions::SO_ALLOW_PAGEMODE as u32;
     }
 
     // Call the tableam's scan_begin function
