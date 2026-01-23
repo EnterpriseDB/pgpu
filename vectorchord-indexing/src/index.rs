@@ -202,6 +202,11 @@ pub fn index(
         let d_p1_total_wall = t_p1_start.elapsed();
         info!("✅ Phase 1 Done. Best Attempt: Train {:.2?} / Part {:.2?}", best_train_duration, best_part_duration);
 
+
+        // --- FIX: CHECK FOR EMPTY DATA ---
+        if loaded_count == 0 || vector_dims == 0 {
+            pgrx::error!("❌ No training data found! The table might be empty or TABLESAMPLE returned 0 rows. Cannot continue.");
+        }
         // ========================================================================================
         // POST-PROCESSING: Centroid Normalization
         // ========================================================================================
