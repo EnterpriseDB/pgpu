@@ -227,11 +227,10 @@ impl VectorReadBatcher {
         while count < batch_target {
             match sample.next(self.column_attnum) {
                 Some(datum) => {
-                    if let Some((vec_vals, vec_dims)) = extract_vector_from_datum(datum) {
+                    if let Some(vec_dims) = extract_vector_to_buffer(datum, &mut vectors) {
                         if dims == 0 {
                             dims = vec_dims;
                         }
-                        vectors.extend_from_slice(&vec_vals);
                         count += 1;
                     }
                 }
@@ -288,8 +287,9 @@ fn resolve_table_oid(qualified_table_name: &str) -> pg_sys::Oid {
     }
 }
 
-/// Extract vector data from a datum
-fn extract_vector_from_datum(datum: Datum) -> Option<(Vec<f32>, u32)> {
+/// Extract vector data from a datum directly into a destination buffer.
+/// Returns the dimension of the vector, or None if datum is null.
+fn extract_vector_to_buffer(datum: Datum, dest: &mut Vec<f32>) -> Option<u32> {
     if datum.is_null() {
         return None;
     }
@@ -298,13 +298,13 @@ fn extract_vector_from_datum(datum: Datum) -> Option<(Vec<f32>, u32)> {
         let raw_ptr = datum.cast_mut_ptr();
         let detoasted_ptr = pg_sys::pg_detoast_datum(raw_ptr);
         let byte_slice = pgrx::varlena_to_byte_slice(detoasted_ptr);
-        let (vec_vals, vec_dims) = vector_type::decode_pgvector_vector(byte_slice);
+        let dims = vector_type::decode_pgvector_vector_into(byte_slice, dest);
 
         if detoasted_ptr != raw_ptr {
             pg_sys::pfree(detoasted_ptr as *mut std::ffi::c_void);
         }
 
-        Some((vec_vals, vec_dims))
+        Some(dims)
     }
 }
 
