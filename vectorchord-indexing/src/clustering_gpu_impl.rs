@@ -285,11 +285,13 @@ pub fn train_roots_gpu(
         .expect("alloc failed");
 
     // Use non-hierarchical k-means for small cluster counts (roots are typically ~400)
+    // IMPORTANT: Explicitly disable hierarchical to avoid multi-GPU bugs
     let params = kmeans::Params::new()
         .expect("params failed")
         .set_n_clusters(num_roots as i32)
         .set_max_iter(iterations as i32)
         .set_metric(DistanceType::L2Expanded)
+        .set_hierarchical(false)
         .set_n_init(1);
 
     let (inertia, n_iter) = kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
@@ -298,6 +300,11 @@ pub fn train_roots_gpu(
     centroids_gpu
         .to_host(&res, &mut centroids_host)
         .expect("retrieval failed");
+
+    // Explicit drop to ensure GPU cleanup before next phase
+    drop(centroids_gpu);
+    drop(dataset);
+    drop(res);
 
     if spherical_centroids {
         normalize_vectors(&mut centroids_host);
@@ -379,6 +386,10 @@ pub fn assign_to_roots_gpu(
         }
     }
 
+    // Explicit cleanup before returning
+    drop(roots_gpu);
+    drop(res);
+
     info!("✅ [PHASE 2] Assignment complete in {:.2?}", start.elapsed());
     final_labels
 }
@@ -418,15 +429,14 @@ pub fn train_leaves_for_bucket_gpu(
         .to_device(&res)
         .expect("alloc failed");
 
-    // Use hierarchical k-means for larger cluster counts
-    let use_hierarchical = num_leaves > 256;
+    // IMPORTANT: Disable hierarchical k-means to avoid multi-GPU bugs
+    // Non-hierarchical is slower but more reliable
     let params = kmeans::Params::new()
         .expect("params failed")
         .set_n_clusters(num_leaves as i32)
         .set_max_iter(iterations as i32)
         .set_metric(DistanceType::L2Expanded)
-        .set_hierarchical(use_hierarchical)
-        .set_hierarchical_n_iters(iterations as i32);
+        .set_hierarchical(false);
 
     kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
         .expect("k-means fit failed");
@@ -435,6 +445,11 @@ pub fn train_leaves_for_bucket_gpu(
         .to_host(&res, &mut centroids_host)
         .expect("retrieval failed");
 
+    // Explicit cleanup
+    drop(centroids_gpu);
+    drop(dataset);
+    drop(res);
+
     if spherical_centroids {
         normalize_vectors(&mut centroids_host);
     }
@@ -442,176 +457,3 @@ pub fn train_leaves_for_bucket_gpu(
     centroids_host.into_raw_vec()
 }
 
-// ============================================================================================
-// SECTION 3: BOTTOM-UP HIERARCHICAL CLUSTERING (Alternative approach)
-// ============================================================================================
-
-/// Bottom-up hierarchical clustering result
-pub struct BottomUpResult {
-    pub root_centroids: Vec<f32>,
-    pub leaf_centroids: Vec<f32>,
-    pub leaf_to_root: Vec<i32>,
-}
-
-/// Bottom-up clustering: train all leaves first, then cluster leaves into roots.
-/// This is an alternative to top-down, useful when data fits in GPU memory.
-pub fn bottom_up(
-    vectors: Vec<f32>,
-    vector_dims: u32,
-    num_leaves: u32,
-    num_roots: u32,
-    kmeans_iterations: u32,
-    spherical_centroids: bool,
-) -> BottomUpResult {
-    let total_vectors = vectors.len() / vector_dims as usize;
-    let is_hierarchical = num_roots > 0;
-
-    info!("🚀 [BOTTOM-UP] Starting GPU hierarchical clustering");
-    info!("   Input vectors: {}, Dims: {}", total_vectors, vector_dims);
-    info!("   Target: {} leaves, {} roots", num_leaves, if is_hierarchical { num_roots } else { 0 });
-    log_gpu_memory();
-
-    let overall_start = Instant::now();
-
-    // =========================================================================
-    // PHASE 1: Train ALL leaf centroids
-    // =========================================================================
-    info!("📍 [PHASE 1] Training {} leaf centroids from {} vectors...", num_leaves, total_vectors);
-    let phase1_start = Instant::now();
-
-    let res = Resources::new().expect("GPU Resource creation failed");
-
-    let vectors_array = Array2::from_shape_vec(
-        (total_vectors, vector_dims as usize),
-        vectors
-    ).expect("Failed to reshape vectors");
-
-    let dataset_gpu = ManagedTensor::from(&vectors_array)
-        .to_device(&res)
-        .expect("Failed to transfer vectors to GPU");
-
-    let mut leaf_centroids_host = Array2::<f32>::zeros((num_leaves as usize, vector_dims as usize));
-    let mut leaf_centroids_gpu = ManagedTensor::from(&leaf_centroids_host)
-        .to_device(&res)
-        .expect("Failed to allocate leaf centroids on GPU");
-
-    // Use hierarchical k-means for large cluster counts
-    let leaf_params = kmeans::Params::new()
-        .expect("Failed to create k-means params")
-        .set_n_clusters(num_leaves as i32)
-        .set_max_iter(kmeans_iterations as i32)
-        .set_metric(DistanceType::L2Expanded)
-        .set_hierarchical(true)
-        .set_hierarchical_n_iters(kmeans_iterations as i32);
-
-    let (inertia, n_iter) = kmeans::fit(
-        &res,
-        &leaf_params,
-        &dataset_gpu,
-        &None,
-        &mut leaf_centroids_gpu
-    ).expect("Leaf k-means training failed");
-
-    info!("   K-means converged: inertia={:.2e}, iters={}", inertia, n_iter);
-
-    leaf_centroids_gpu
-        .to_host(&res, &mut leaf_centroids_host)
-        .expect("Leaf centroids transfer failed");
-
-    if spherical_centroids {
-        normalize_vectors(&mut leaf_centroids_host);
-    }
-
-    let leaf_centroids_flat = leaf_centroids_host.into_raw_vec();
-    info!("✅ [PHASE 1] Leaf training complete in {:.2?}", phase1_start.elapsed());
-
-    // =========================================================================
-    // PHASE 2: Train root centroids from leaves (if hierarchical)
-    // =========================================================================
-    if !is_hierarchical {
-        info!("🎉 [BOTTOM-UP] Flat index complete in {:.2?}", overall_start.elapsed());
-        return BottomUpResult {
-            root_centroids: Vec::new(),
-            leaf_centroids: leaf_centroids_flat,
-            leaf_to_root: vec![-1; num_leaves as usize],
-        };
-    }
-
-    info!("📍 [PHASE 2] Training {} roots from {} leaves...", num_roots, num_leaves);
-    let phase2_start = Instant::now();
-
-    let leaf_array = Array2::from_shape_vec(
-        (num_leaves as usize, vector_dims as usize),
-        leaf_centroids_flat.clone()
-    ).expect("Failed to reshape leaf centroids");
-
-    let leaf_dataset_gpu = ManagedTensor::from(&leaf_array)
-        .to_device(&res)
-        .expect("Failed to transfer leaf centroids to GPU");
-
-    let mut root_centroids_host = Array2::<f32>::zeros((num_roots as usize, vector_dims as usize));
-    let mut root_centroids_gpu = ManagedTensor::from(&root_centroids_host)
-        .to_device(&res)
-        .expect("Failed to allocate root centroids on GPU");
-
-    let root_params = kmeans::Params::new()
-        .expect("Failed to create k-means params")
-        .set_n_clusters(num_roots as i32)
-        .set_max_iter(kmeans_iterations as i32)
-        .set_metric(DistanceType::L2Expanded)
-        .set_hierarchical(false);
-
-    let (root_inertia, root_n_iter) = kmeans::fit(
-        &res,
-        &root_params,
-        &leaf_dataset_gpu,
-        &None,
-        &mut root_centroids_gpu,
-    ).expect("Root k-means training failed");
-
-    info!("   K-means converged: inertia={:.2e}, iters={}", root_inertia, root_n_iter);
-
-    root_centroids_gpu
-        .to_host(&res, &mut root_centroids_host)
-        .expect("Root centroids transfer failed");
-
-    if spherical_centroids {
-        normalize_vectors(&mut root_centroids_host);
-    }
-
-    info!("✅ [PHASE 2] Root training complete in {:.2?}", phase2_start.elapsed());
-
-    // =========================================================================
-    // PHASE 3: Assign each leaf to nearest root
-    // =========================================================================
-    info!("📍 [PHASE 3] Assigning {} leaves to {} roots...", num_leaves, num_roots);
-    let phase3_start = Instant::now();
-
-    let mut leaf_to_root_host = Array1::<i32>::zeros(num_leaves as usize);
-    let mut leaf_to_root_gpu = ManagedTensor::from(&leaf_to_root_host)
-        .to_device(&res)
-        .expect("Failed to allocate leaf-to-root labels on GPU");
-
-    kmeans::predict(
-        &res,
-        &root_params,
-        &leaf_dataset_gpu,
-        &None,
-        &root_centroids_gpu,
-        &mut leaf_to_root_gpu,
-        false,
-    ).expect("Leaf-to-root assignment failed");
-
-    leaf_to_root_gpu
-        .to_host(&res, &mut leaf_to_root_host)
-        .expect("Leaf-to-root transfer failed");
-
-    info!("✅ [PHASE 3] Assignment complete in {:.2?}", phase3_start.elapsed());
-    info!("🎉 [BOTTOM-UP] Total clustering time: {:.2?}", overall_start.elapsed());
-
-    BottomUpResult {
-        root_centroids: root_centroids_host.into_raw_vec(),
-        leaf_centroids: leaf_centroids_flat,
-        leaf_to_root: leaf_to_root_host.into_raw_vec(),
-    }
-}
