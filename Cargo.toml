@@ -17,7 +17,7 @@ members = ["vectorchord-indexing"]
 [workspace.dependencies]
 cuvs = { git = "https://github.com/rapidsai/cuvs", tag = "v25.12.00", version = "25.12.0", default-features = false }
 ndarray = "0.15.6"
-pgrx = { git = "https://github.com/pgcentralfoundation/pgrx", tag = "v0.16.1", default-features = false, features = ["cshim"] }
+pgrx = { git = "https://github.com/pgcentralfoundation/pgrx", tag = "v0.16.1", default-features = false }
 
 [features]
 default = ["pg17"]
