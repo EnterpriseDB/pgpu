@@ -46,6 +46,11 @@ fn log_gpu_memory() {
     }
 }
 
+/// Create a new GPU Resources handle for reuse across multiple operations.
+pub fn create_gpu_resources() -> Resources {
+    Resources::new().expect("GPU Resource creation failed")
+}
+
 // ============================================================================================
 // SECTION 1: FLAT INDEXING LOGIC (for single-level indexes)
 // ============================================================================================
@@ -338,7 +343,7 @@ pub fn assign_to_roots_gpu(
         .expect("transfer failed");
 
     let mut final_labels = Vec::with_capacity(total_vectors);
-    let batch_size = 2_000_000; // Match main branch
+    let batch_size = 10_000_000; // Larger batches for better GPU utilization
     let mut processed = 0;
 
     let params = kmeans::Params::new()
@@ -388,39 +393,55 @@ pub fn assign_to_roots_gpu(
     final_labels
 }
 
-/// Train leaf centroids for a single bucket of vectors.
+/// Train leaf centroids for a single bucket using pre-created Resources.
+/// Takes vector indices and the full dataset to avoid copying vectors into buckets.
 pub fn train_leaves_for_bucket_gpu(
-    bucket_vectors: &Vec<f32>,
+    res: &Resources,
+    all_vectors: &[f32],
+    bucket_indices: &[usize],
     vector_dims: u32,
     num_leaves: u32,
     iterations: u32,
     spherical_centroids: bool,
 ) -> Vec<f32> {
-    let num_vecs = bucket_vectors.len() / vector_dims as usize;
+    let num_vecs = bucket_indices.len();
 
     if num_vecs < num_leaves as usize {
+        // Return the actual vectors for small buckets
+        let mut result = Vec::with_capacity(num_vecs * vector_dims as usize);
+        for &idx in bucket_indices {
+            let start = idx * vector_dims as usize;
+            let end = start + vector_dims as usize;
+            result.extend_from_slice(&all_vectors[start..end]);
+        }
         warning!("⚠️ Bucket too small ({} vectors < {} leaves)", num_vecs, num_leaves);
-        return bucket_vectors.clone();
+        return result;
     }
 
     if num_vecs == 0 {
         return Vec::new();
     }
 
-    let res = Resources::new().expect("GPU Resource failed");
+    // Gather vectors for this bucket (only copy what we need for this bucket)
+    let mut bucket_data: Vec<f32> = Vec::with_capacity(num_vecs * vector_dims as usize);
+    for &idx in bucket_indices {
+        let start = idx * vector_dims as usize;
+        let end = start + vector_dims as usize;
+        bucket_data.extend_from_slice(&all_vectors[start..end]);
+    }
 
     let dataset_array = Array2::from_shape_vec(
         (num_vecs, vector_dims as usize),
-        bucket_vectors.clone()
+        bucket_data
     ).expect("reshape failed");
 
     let dataset = ManagedTensor::from(&dataset_array)
-        .to_device(&res)
+        .to_device(res)
         .expect("transfer failed");
 
     let mut centroids_host = Array2::<f32>::zeros((num_leaves as usize, vector_dims as usize));
     let mut centroids_gpu = ManagedTensor::from(&centroids_host)
-        .to_device(&res)
+        .to_device(res)
         .expect("alloc failed");
 
     // Match main branch configuration
@@ -432,11 +453,11 @@ pub fn train_leaves_for_bucket_gpu(
         .set_batch_samples(0)
         .set_batch_centroids(0);
 
-    kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
+    kmeans::fit(res, &params, &dataset, &None, &mut centroids_gpu)
         .expect("k-means fit failed");
 
     centroids_gpu
-        .to_host(&res, &mut centroids_host)
+        .to_host(res, &mut centroids_host)
         .expect("retrieval failed");
 
     if spherical_centroids {

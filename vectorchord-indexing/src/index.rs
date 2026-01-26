@@ -1,5 +1,5 @@
 use crate::clustering_gpu_impl::{
-    assign_to_roots_gpu, run_clustering_batch, run_clustering_consolidate,
+    assign_to_roots_gpu, create_gpu_resources, run_clustering_batch, run_clustering_consolidate,
     train_leaves_for_bucket_gpu, train_roots_gpu,
 };
 use crate::guc::use_gpu_acceleration;
@@ -233,13 +233,11 @@ pub fn index(
         let t_leaves_start = Instant::now();
         info!("🚀 [PHASE 3] Training leaves for {} buckets...", num_roots);
 
-        // Build buckets
-        let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
+        // Build index-based buckets (store indices, not vectors - saves ~120GB RAM)
+        let mut bucket_indices: Vec<Vec<usize>> = vec![Vec::new(); num_roots as usize];
         for (idx, &label) in assignments.iter().enumerate() {
             if label >= 0 && (label as usize) < num_roots as usize {
-                let start = idx * vector_dims as usize;
-                let end = start + vector_dims as usize;
-                buckets[label as usize].extend_from_slice(&training_dataset[start..end]);
+                bucket_indices[label as usize].push(idx);
             }
         }
 
@@ -257,10 +255,13 @@ pub fn index(
             final_results.push((root_vec.to_vec(), -1));
         }
 
+        // Create GPU resources once for all bucket training (avoids 400x initialization overhead)
+        let gpu_res = create_gpu_resources();
+
         // Train leaves for each bucket
         let mut total_leaves_trained = 0;
-        for (bucket_idx, bucket_vectors) in buckets.iter().enumerate() {
-            let n_vecs = bucket_vectors.len() / vector_dims as usize;
+        for (bucket_idx, indices) in bucket_indices.iter().enumerate() {
+            let n_vecs = indices.len();
             let parent_id = bucket_idx as i32;
 
             if n_vecs == 0 {
@@ -272,7 +273,9 @@ pub fn index(
             let target_leaves = (raw_target.round() as u32).clamp(1, n_vecs as u32);
 
             let leaf_centroids = train_leaves_for_bucket_gpu(
-                bucket_vectors,
+                &gpu_res,
+                &training_dataset,
+                indices,
                 vector_dims,
                 target_leaves,
                 kmeans_iterations / 2, // Fewer iterations for leaves (speed)
