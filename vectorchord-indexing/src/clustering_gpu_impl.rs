@@ -545,8 +545,13 @@ fn train_leaves_batched(
     let num_batches = (total_vectors + batch_size_vectors - 1) / batch_size_vectors;
 
     // Target: 4x leaves as intermediate centroids for quality, spread across batches
+    // Cap at 100k per batch - non-hierarchical k-means gets slow beyond this
+    const MAX_INTERMEDIATES_PER_BATCH: usize = 100_000;
     let total_intermediates = (num_leaves as usize).saturating_mul(4);
-    let intermediates_per_batch = std::cmp::max(total_intermediates / num_batches, 64);
+    let intermediates_per_batch = std::cmp::min(
+        std::cmp::max(total_intermediates / num_batches, 64),
+        MAX_INTERMEDIATES_PER_BATCH,
+    );
 
     info!("   Batching: {} batches, {} intermediates/batch", num_batches, intermediates_per_batch);
 
@@ -623,15 +628,14 @@ fn cluster_batch_to_intermediates(
         .to_device(&res)
         .expect("Failed to allocate labels on GPU");
 
-    // Use hierarchical for efficiency with many clusters
-    let use_hierarchical = num_clusters > 256;
+    // Use non-hierarchical k-means for batches to avoid cuVS multi-device issues
+    // The hierarchical algorithm seems to trigger cudaErrorInvalidDevice on some systems
     let params = kmeans::Params::new()
         .expect("Failed to create k-means params")
         .set_n_clusters(num_clusters as i32)
         .set_max_iter(kmeans_iterations as i32)
         .set_metric(DistanceType::L2Expanded)
-        .set_hierarchical(use_hierarchical)
-        .set_hierarchical_n_iters(kmeans_iterations as i32);
+        .set_hierarchical(false);
 
     let (_inertia, _n_iter) = kmeans::fit(
         &res,
