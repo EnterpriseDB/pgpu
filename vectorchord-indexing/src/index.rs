@@ -1,5 +1,6 @@
 use crate::clustering_gpu_impl::{
-    bottom_up, run_clustering_batch, run_clustering_consolidate, BottomUpResult,
+    assign_to_roots_gpu, run_clustering_batch, run_clustering_consolidate,
+    train_leaves_for_bucket_gpu, train_roots_gpu,
 };
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
@@ -49,18 +50,20 @@ pub fn index(
     let global_start = Instant::now();
 
     // ========================================================================================
-    // PATH A: BOTTOM-UP HIERARCHICAL BUILD (GPU Optimized)
+    // PATH A: TOP-DOWN HIERARCHICAL BUILD
     // Triggered if `lists` has 2 elements (e.g. [400, 160000])
     //
-    // Strategy: ONE GPU k-means for all leaves, then cluster leaves into roots.
-    // This is much faster than top-down (which made N separate GPU calls).
+    // Strategy:
+    // 1. Train root centroids from sample
+    // 2. Assign all vectors to their nearest root
+    // 3. Train leaf centroids for each root's bucket
     // ========================================================================================
 
     if let Some(num_roots) = num_clusters_top_option {
         let num_leaves = num_clusters_leaf;
         let num_samples_target = (num_leaves as u64).saturating_mul(sampling_factor as u64);
 
-        info!("🏗️ [BOTTOM-UP BUILD] GPU-Accelerated Hierarchical Clustering");
+        info!("🏗️ [TOP-DOWN BUILD] GPU-Accelerated Hierarchical Clustering");
         info!("📊 Target: {} Roots | {} Leaves", num_roots, num_leaves);
         info!("📉 Sampling: Factor={} -> Reading ~{} vectors", sampling_factor, num_samples_target);
 
@@ -138,47 +141,129 @@ pub fn index(
         }
 
         // ================================================================================
-        // STEP 2: Run bottom-up GPU clustering
+        // STEP 2: Normalize training data (if spherical)
         // ================================================================================
-        let t_cluster_start = Instant::now();
+        let t_norm_start = Instant::now();
+        if spherical_centroids {
+            info!("📐 Normalizing {} training vectors...", loaded_count);
+            for chunk in training_dataset.chunks_mut(vector_dims as usize) {
+                let mut norm_sq = 0.0f32;
+                for x in chunk.iter() { norm_sq += x * x; }
+                let norm = norm_sq.sqrt();
+                if norm > 1e-6 {
+                    for x in chunk.iter_mut() { *x /= norm; }
+                }
+            }
+        }
+        let d_norm = t_norm_start.elapsed();
 
-        let BottomUpResult {
-            root_centroids,
-            leaf_centroids,
-            leaf_to_root,
-        } = bottom_up(
-            training_dataset,
+        // ================================================================================
+        // STEP 3: Train root centroids
+        // ================================================================================
+        let t_roots_start = Instant::now();
+        let root_centroids = train_roots_gpu(
+            &training_dataset,
             vector_dims,
-            num_leaves,
             num_roots,
             kmeans_iterations,
             spherical_centroids,
         );
-
-        let d_cluster = t_cluster_start.elapsed();
+        let d_roots = t_roots_start.elapsed();
 
         // ================================================================================
-        // STEP 3: Build centroids table
+        // STEP 4: Assign all vectors to roots
         // ================================================================================
-        let t_store_start = Instant::now();
+        let t_assign_start = Instant::now();
+        let assignments = assign_to_roots_gpu(
+            &training_dataset,
+            &root_centroids,
+            vector_dims,
+            num_roots,
+        );
+        let d_assign = t_assign_start.elapsed();
+
+        // Analyze bucket distribution
+        let mut bucket_counts = vec![0usize; num_roots as usize];
+        for &label in &assignments {
+            if label >= 0 && (label as usize) < num_roots as usize {
+                bucket_counts[label as usize] += 1;
+            }
+        }
+        let min_bucket = *bucket_counts.iter().min().unwrap_or(&0);
+        let max_bucket = *bucket_counts.iter().max().unwrap_or(&0);
+        info!("   Bucket distribution: min={}, max={}, ratio={:.2}x",
+              min_bucket, max_bucket, max_bucket as f64 / (min_bucket.max(1) as f64));
+
+        // ================================================================================
+        // STEP 5: Build buckets and train leaves
+        // ================================================================================
+        let t_leaves_start = Instant::now();
+        info!("🚀 [PHASE 3] Training leaves for {} buckets...", num_roots);
+
+        // Build buckets
+        let mut buckets: Vec<Vec<f32>> = vec![Vec::new(); num_roots as usize];
+        for (idx, &label) in assignments.iter().enumerate() {
+            if label >= 0 && (label as usize) < num_roots as usize {
+                let start = idx * vector_dims as usize;
+                let end = start + vector_dims as usize;
+                buckets[label as usize].extend_from_slice(&training_dataset[start..end]);
+            }
+        }
+
+        // Calculate leaves per bucket proportionally
+        let leaves_per_vector_ratio = if loaded_count > 0 {
+            num_leaves as f64 / loaded_count as f64
+        } else {
+            0.0
+        };
 
         let mut final_results: Vec<(Vec<f32>, i32)> = Vec::new();
 
         // Add root centroids (parent_id = -1)
-        let num_roots_actual = root_centroids.len() / vector_dims as usize;
         for root_vec in root_centroids.chunks(vector_dims as usize) {
             final_results.push((root_vec.to_vec(), -1));
         }
 
-        // Add leaf centroids with their parent assignments
-        let num_leaves_actual = leaf_centroids.len() / vector_dims as usize;
-        for (leaf_idx, leaf_vec) in leaf_centroids.chunks(vector_dims as usize).enumerate() {
-            let parent_id = leaf_to_root[leaf_idx];
-            final_results.push((leaf_vec.to_vec(), parent_id));
-        }
+        // Train leaves for each bucket
+        let mut total_leaves_trained = 0;
+        for (bucket_idx, bucket_vectors) in buckets.iter().enumerate() {
+            let n_vecs = bucket_vectors.len() / vector_dims as usize;
+            let parent_id = bucket_idx as i32;
 
+            if n_vecs == 0 {
+                continue;
+            }
+
+            // Calculate target leaves proportionally
+            let raw_target = n_vecs as f64 * leaves_per_vector_ratio;
+            let target_leaves = (raw_target.round() as u32).clamp(1, n_vecs as u32);
+
+            let leaf_centroids = train_leaves_for_bucket_gpu(
+                bucket_vectors,
+                vector_dims,
+                target_leaves,
+                kmeans_iterations / 2, // Fewer iterations for leaves (speed)
+                spherical_centroids,
+            );
+
+            for leaf_vec in leaf_centroids.chunks(vector_dims as usize) {
+                final_results.push((leaf_vec.to_vec(), parent_id));
+            }
+            total_leaves_trained += leaf_centroids.len() / vector_dims as usize;
+
+            if (bucket_idx + 1) % 50 == 0 {
+                info!("   ... trained {}/{} buckets ({} leaves so far)",
+                      bucket_idx + 1, num_roots, total_leaves_trained);
+            }
+        }
+        let d_leaves = t_leaves_start.elapsed();
+
+        // ================================================================================
+        // STEP 6: Store centroids
+        // ================================================================================
+        let t_store_start = Instant::now();
         info!("💾 Storing {} centroids ({} roots + {} leaves)...",
-              final_results.len(), num_roots_actual, num_leaves_actual);
+              final_results.len(), num_roots, total_leaves_trained);
 
         centroids_table::store_centroids(final_results, centroid_table_name.clone(), vector_dims);
         let d_store = t_store_start.elapsed();
@@ -187,23 +272,31 @@ pub fn index(
         // SUMMARY
         // ================================================================================
         info!(
-            "\n⏱️  [TIMING SUMMARY - BOTTOM-UP]\n\
-            \t• 📥 Data Loading:    {:.2?}\n\
-            \t• 🚀 GPU Clustering:  {:.2?}\n\
-            \t• 💾 Storage:         {:.2?}\n\
+            "\n⏱️  [TIMING SUMMARY - TOP-DOWN]\n\
+            \t• 📥 Data Loading:     {:.2?}\n\
+            \t• 📐 Normalization:    {:.2?}\n\
+            \t• 🌳 Root Training:    {:.2?}\n\
+            \t• 📍 Assignment:       {:.2?}\n\
+            \t• 🌿 Leaf Training:    {:.2?}\n\
+            \t• 💾 Storage:          {:.2?}\n\
             \t-----------------------------\n\
             \t📊 [RESULTS]\n\
-            \t• Vectors Sampled:    {}\n\
-            \t• Root Centroids:     {}\n\
-            \t• Leaf Centroids:     {}\n\
+            \t• Vectors Sampled:     {}\n\
+            \t• Root Centroids:      {}\n\
+            \t• Leaf Centroids:      {}\n\
+            \t• Min/Max Bucket:      {}/{}\n\
             \t-----------------------------\n\
-            \t👉 TOTAL TIME:        {:.2?}",
+            \t👉 TOTAL TIME:         {:.2?}",
             d_load,
-            d_cluster,
+            d_norm,
+            d_roots,
+            d_assign,
+            d_leaves,
             d_store,
             loaded_count,
-            num_roots_actual,
-            num_leaves_actual,
+            num_roots,
+            total_leaves_trained,
+            min_bucket, max_bucket,
             global_start.elapsed()
         );
 

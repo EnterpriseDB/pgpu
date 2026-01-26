@@ -11,16 +11,10 @@ use std::time::Instant;
 // GPU MEMORY UTILITIES
 // ============================================================================================
 
-/// Query available GPU memory using nvidia-smi for GPU 0 (primary GPU).
-/// Returns (free_bytes, total_bytes) or None if query fails.
+/// Query available GPU memory using nvidia-smi for GPU 0.
 fn query_gpu_memory() -> Option<(usize, usize)> {
-    // Query specifically GPU 0 to avoid multi-GPU confusion
     let output = Command::new("nvidia-smi")
-        .args([
-            "--id=0",
-            "--query-gpu=memory.free,memory.total",
-            "--format=csv,noheader,nounits"
-        ])
+        .args(["--id=0", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"])
         .output()
         .ok()?;
 
@@ -41,35 +35,16 @@ fn query_gpu_memory() -> Option<(usize, usize)> {
     }
 }
 
-/// Get usable GPU memory for vector data.
-/// Uses 75% of free memory to leave room for:
-/// - Centroids (can be large with 160k+ clusters)
-/// - Labels array
-/// - cuVS hierarchical k-means workspace
-/// Note: Set CUDA_VISIBLE_DEVICES=0 to avoid multi-GPU issues
-fn get_gpu_memory_budget() -> usize {
-    const DEFAULT_BUDGET: usize = 10_000_000_000; // 10GB fallback
-    const MEMORY_USAGE_RATIO: f64 = 0.75; // Use 75% for vectors
-
-    match query_gpu_memory() {
-        Some((free_bytes, total_bytes)) => {
-            let usable = (free_bytes as f64 * MEMORY_USAGE_RATIO) as usize;
-            info!("   GPU 0 memory: {:.1}GB free / {:.1}GB total -> using {:.1}GB for vectors (75%)",
-                  free_bytes as f64 / 1e9,
-                  total_bytes as f64 / 1e9,
-                  usable as f64 / 1e9);
-            usable
-        }
-        None => {
-            warning!("   Could not query GPU memory (nvidia-smi failed), using {:.1}GB default",
-                     DEFAULT_BUDGET as f64 / 1e9);
-            DEFAULT_BUDGET
-        }
+/// Get GPU memory info for logging
+fn log_gpu_memory() {
+    if let Some((free, total)) = query_gpu_memory() {
+        info!("   GPU memory: {:.1}GB free / {:.1}GB total",
+              free as f64 / 1e9, total as f64 / 1e9);
     }
 }
 
 // ============================================================================================
-// SECTION 1: EXISTING FLAT INDEXING LOGIC
+// SECTION 1: FLAT INDEXING LOGIC (for single-level indexes)
 // ============================================================================================
 
 pub fn run_clustering_batch(
@@ -86,8 +61,8 @@ pub fn run_clustering_batch(
     let num_vectors = vectors.len() / vector_dims as usize;
     let res = Resources::new().expect("GPU Resource creation failed");
 
-    // Shape is (rows, cols). Rows is determined by the length of the vector input divided by dimensions.
-    let vectors_array  = Array2::from_shape_vec((num_vectors, vector_dims as usize),vectors).expect("shaping vectors failed");
+    let vectors_array = Array2::from_shape_vec((num_vectors, vector_dims as usize), vectors)
+        .expect("shaping vectors failed");
     let dataset = ManagedTensor::from(&vectors_array)
         .to_device(&res)
         .expect("vectors->tensor transformation failed");
@@ -115,19 +90,13 @@ pub fn run_clustering_batch(
         .set_hierarchical(true)
         .set_hierarchical_n_iters(kmeans_iterations as i32);
 
-    debug1!(
-        "⏱️ preparing/transferring data done at: {:.2?}",
-        start_time.elapsed()
-    );
+    debug1!("⏱️ preparing/transferring data done at: {:.2?}", start_time.elapsed());
 
     debug1!("running kmeans");
     let (inertia, n_iter) = kmeans::fit(&res, &kmeans_params, &dataset, &None, &mut centroids_gpu)
         .expect("kmeans training failed");
     debug1!("kmeans done with inertia: {inertia}, n_iter: {n_iter}");
-    debug1!(
-        "⏱️ kmeans training data done at: {:.2?}",
-        start_time.elapsed()
-    );
+    debug1!("⏱️ kmeans training data done at: {:.2?}", start_time.elapsed());
 
     let _inertia_pred = kmeans::predict(
         &res,
@@ -139,10 +108,7 @@ pub fn run_clustering_batch(
         false,
     )
     .expect("kmeans prediction failed");
-    debug1!(
-        "⏱️ kmeans predict data done at: {:.2?}",
-        start_time.elapsed()
-    );
+    debug1!("⏱️ kmeans predict data done at: {:.2?}", start_time.elapsed());
 
     debug1!("retrieve results from GPU");
     labels_gpu
@@ -152,10 +118,7 @@ pub fn run_clustering_batch(
     centroids_gpu
         .to_host(&res, &mut centroids_host)
         .expect("centroids->host transfer failed");
-    debug1!(
-        "⏱️ retrieved data from GPU at: {:.2?}",
-        start_time.elapsed()
-    );
+    debug1!("⏱️ retrieved data from GPU at: {:.2?}", start_time.elapsed());
 
     let weights = labels_to_weights(num_clusters, &labels_host);
 
@@ -167,15 +130,11 @@ pub fn run_clustering_batch(
 
     let centroids_owned: Vec<f32> = centroids_host.into_raw_vec().into();
 
-    debug1!(
-        "\tClustering (k-means) done in: {:.2?}",
-        start_time.elapsed()
-    );
+    debug1!("\tClustering (k-means) done in: {:.2?}", start_time.elapsed());
     (centroids_owned, weights)
 }
 
 fn labels_to_weights(num_clusters: u32, labels_host: &ArrayBase<OwnedRepr<i32>, Ix1>) -> Vec<f32> {
-    // Calculate weights based on cluster assignment counts
     let mut counts = vec![0.0; num_clusters as usize];
     for &label in labels_host.iter() {
         counts[label as usize] += 1.0;
@@ -196,14 +155,13 @@ pub fn run_clustering_consolidate(
     let start_time = Instant::now();
     let num_vectors = vectors.len() / vector_dims as usize;
 
-    // cuvs setup
     let res = Resources::new().expect("GPU Resource creation failed");
 
-    let vectors_array =
-        Array2::from_shape_vec((num_vectors, vector_dims as usize), vectors).expect("shaping vectors failed");
+    let vectors_array = Array2::from_shape_vec((num_vectors, vector_dims as usize), vectors)
+        .expect("shaping vectors failed");
 
-    let weights_array =
-        Array1::from_shape_vec(num_vectors, weights).expect("shaping vectors failed");
+    let weights_array = Array1::from_shape_vec(num_vectors, weights)
+        .expect("shaping vectors failed");
 
     let weights = ManagedTensor::from(&weights_array)
         .to_device(&res)
@@ -221,9 +179,6 @@ pub fn run_clustering_consolidate(
         .to_device(&res)
         .expect("centroids(empty)->GPU transfer failed");
 
-    // Note: We use non-hierarchical kmeans here because only that supports
-    // passing in weights (critical for accuracy when consolidating batches),
-    // and non-hierarchical only works with L2Expanded distance.
     let kmeans_params = kmeans::Params::new()
         .expect("kmeans params create failed")
         .set_n_clusters(num_clusters as i32)
@@ -232,10 +187,7 @@ pub fn run_clustering_consolidate(
         .set_metric(DistanceType::L2Expanded)
         .set_hierarchical(false);
 
-    debug1!(
-        "⏱️ preparing/transferring data done at: {:.2?}",
-        start_time.elapsed()
-    );
+    debug1!("⏱️ preparing/transferring data done at: {:.2?}", start_time.elapsed());
 
     debug1!("running kmeans");
     let (inertia, n_iter) = kmeans::fit(
@@ -247,20 +199,14 @@ pub fn run_clustering_consolidate(
     )
     .expect("kmeans training failed");
     debug1!("kmeans done with inertia: {inertia}, n_iter: {n_iter}");
-    debug1!(
-        "⏱️ kmeans training data done at: {:.2?}",
-        start_time.elapsed()
-    );
+    debug1!("⏱️ kmeans training data done at: {:.2?}", start_time.elapsed());
 
     debug1!("retrieve results from GPU");
 
     centroids_gpu
         .to_host(&res, &mut centroids_host)
         .expect("centroids->host transfer failed");
-    debug1!(
-        "⏱️ retrieved data from GPU at: {:.2?}",
-        start_time.elapsed()
-    );
+    debug1!("⏱️ retrieved data from GPU at: {:.2?}", start_time.elapsed());
 
     if spherical_centroids {
         debug1!("normalizing centroids");
@@ -270,61 +216,245 @@ pub fn run_clustering_consolidate(
 
     let centroids_owned: Vec<f32> = centroids_host.into_raw_vec().into();
 
-    debug1!(
-        "\tClustering (k-means) done in: {:.2?}",
-        start_time.elapsed()
-    );
+    debug1!("\tClustering (k-means) done in: {:.2?}", start_time.elapsed());
     centroids_owned
 }
 
 // ============================================================================================
-// SECTION 2: HIERARCHICAL CLUSTERING APPROACHES
+// SECTION 2: TOP-DOWN HIERARCHICAL CLUSTERING
+// ============================================================================================
+// Strategy:
+// 1. Train root centroids from a sample of vectors
+// 2. Assign ALL vectors to their nearest root
+// 3. For each root bucket, train leaf centroids
+//
+// This approach makes many small k-means calls instead of one huge call,
+// which is more memory efficient and often faster.
 // ============================================================================================
 
-// --------------------------------------------------------------------------------------------
-// BOTTOM-UP CLUSTERING (Recommended - matches VectorChord's approach but on GPU)
-// --------------------------------------------------------------------------------------------
-// Strategy: Train ALL leaf centroids in ONE GPU call, then cluster leaves into roots.
-// This is fundamentally different from top-down which makes N separate GPU calls.
-//
-// VectorChord CPU approach:
-//   - lloyd_k_means on CPU with rayon parallelism
-//   - ~160k clusters from ~6.4M samples
-//
-// Our GPU approach (should be faster):
-//   - ONE cuVS hierarchical k-means call: samples → leaves
-//   - ONE cuVS k-means call: leaves → roots
-//   - Reuse GPU context across all operations
-// --------------------------------------------------------------------------------------------
+/// Train root centroids from a sample of vectors.
+/// Uses stride-based sampling if dataset is too large.
+pub fn train_roots_gpu(
+    full_vectors: &Vec<f32>,
+    vector_dims: u32,
+    num_roots: u32,
+    iterations: u32,
+    spherical_centroids: bool,
+) -> Vec<f32> {
+    let total_vectors = full_vectors.len() / vector_dims as usize;
+    let train_limit = 2_000_000; // Sample up to 2M vectors for root training
+
+    let num_train = std::cmp::min(total_vectors, train_limit);
+    let stride = if total_vectors > train_limit {
+        total_vectors / train_limit
+    } else {
+        1
+    };
+
+    info!("🚀 [PHASE 1] Training {} roots from {} vectors (stride={})",
+          num_roots, num_train, stride);
+    log_gpu_memory();
+
+    let start = Instant::now();
+    let res = Resources::new().expect("GPU Resource failed");
+
+    // Create training buffer with strided sampling
+    let mut train_data: Vec<f32> = Vec::with_capacity(num_train * vector_dims as usize);
+    for i in 0..num_train {
+        let src_idx = (i * stride) * vector_dims as usize;
+        if src_idx + vector_dims as usize > full_vectors.len() {
+            break;
+        }
+        train_data.extend_from_slice(&full_vectors[src_idx..src_idx + vector_dims as usize]);
+    }
+
+    let actual_train_count = train_data.len() / vector_dims as usize;
+
+    let train_array = Array2::from_shape_vec(
+        (actual_train_count, vector_dims as usize),
+        train_data
+    ).expect("reshape failed");
+
+    let dataset = ManagedTensor::from(&train_array)
+        .to_device(&res)
+        .expect("transfer failed");
+
+    let mut centroids_host = Array2::<f32>::zeros((num_roots as usize, vector_dims as usize));
+    let mut centroids_gpu = ManagedTensor::from(&centroids_host)
+        .to_device(&res)
+        .expect("alloc failed");
+
+    // Use non-hierarchical k-means for small cluster counts (roots are typically ~400)
+    let params = kmeans::Params::new()
+        .expect("params failed")
+        .set_n_clusters(num_roots as i32)
+        .set_max_iter(iterations as i32)
+        .set_metric(DistanceType::L2Expanded)
+        .set_n_init(1);
+
+    let (inertia, n_iter) = kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
+        .expect("k-means fit failed");
+
+    centroids_gpu
+        .to_host(&res, &mut centroids_host)
+        .expect("retrieval failed");
+
+    if spherical_centroids {
+        normalize_vectors(&mut centroids_host);
+    }
+
+    info!("✅ [PHASE 1] Roots trained in {:.2?} (inertia={:.2e}, iters={})",
+          start.elapsed(), inertia, n_iter);
+
+    centroids_host.into_raw_vec()
+}
+
+/// Assign all vectors to their nearest root centroid.
+/// Returns a vector of labels (root indices) for each input vector.
+pub fn assign_to_roots_gpu(
+    all_vectors: &Vec<f32>,
+    root_centroids: &Vec<f32>,
+    vector_dims: u32,
+    num_roots: u32,
+) -> Vec<i32> {
+    let total_vectors = all_vectors.len() / vector_dims as usize;
+    info!("🚀 [PHASE 2] Assigning {} vectors to {} roots...", total_vectors, num_roots);
+
+    let start = Instant::now();
+    let res = Resources::new().expect("GPU Resource failed");
+
+    let roots_array = Array2::from_shape_vec(
+        (num_roots as usize, vector_dims as usize),
+        root_centroids.clone()
+    ).expect("shape failed");
+
+    let roots_gpu = ManagedTensor::from(&roots_array)
+        .to_device(&res)
+        .expect("transfer failed");
+
+    let mut final_labels = Vec::with_capacity(total_vectors);
+    let batch_size = 5_000_000; // Process 5M vectors at a time
+    let mut processed = 0;
+
+    let params = kmeans::Params::new()
+        .expect("params failed")
+        .set_n_clusters(num_roots as i32)
+        .set_metric(DistanceType::L2Expanded);
+
+    while processed < total_vectors {
+        let end = std::cmp::min(processed + batch_size, total_vectors);
+        let current_batch_len = end - processed;
+
+        let slice_start = processed * vector_dims as usize;
+        let slice_end = end * vector_dims as usize;
+        let batch_slice = &all_vectors[slice_start..slice_end];
+
+        let batch_array = Array2::from_shape_vec(
+            (current_batch_len, vector_dims as usize),
+            batch_slice.to_vec()
+        ).expect("reshape failed");
+
+        let batch_gpu = ManagedTensor::from(&batch_array)
+            .to_device(&res)
+            .expect("transfer failed");
+
+        let mut labels_host = Array1::<i32>::zeros(current_batch_len);
+        let mut labels_gpu = ManagedTensor::from(&labels_host)
+            .to_device(&res)
+            .expect("alloc failed");
+
+        kmeans::predict(&res, &params, &batch_gpu, &None, &roots_gpu, &mut labels_gpu, false)
+            .expect("predict failed");
+
+        labels_gpu
+            .to_host(&res, &mut labels_host)
+            .expect("retrieval failed");
+
+        final_labels.extend(labels_host.into_iter());
+        processed += current_batch_len;
+
+        if processed % 20_000_000 == 0 && processed < total_vectors {
+            info!("   ... assigned {}/{} ({:.1}%)",
+                  processed, total_vectors, 100.0 * processed as f64 / total_vectors as f64);
+        }
+    }
+
+    info!("✅ [PHASE 2] Assignment complete in {:.2?}", start.elapsed());
+    final_labels
+}
+
+/// Train leaf centroids for a single bucket of vectors.
+pub fn train_leaves_for_bucket_gpu(
+    bucket_vectors: &Vec<f32>,
+    vector_dims: u32,
+    num_leaves: u32,
+    iterations: u32,
+    spherical_centroids: bool,
+) -> Vec<f32> {
+    let num_vecs = bucket_vectors.len() / vector_dims as usize;
+
+    if num_vecs < num_leaves as usize {
+        warning!("⚠️ Bucket too small ({} vectors < {} leaves)", num_vecs, num_leaves);
+        return bucket_vectors.clone();
+    }
+
+    if num_vecs == 0 {
+        return Vec::new();
+    }
+
+    let res = Resources::new().expect("GPU Resource failed");
+
+    let dataset_array = Array2::from_shape_vec(
+        (num_vecs, vector_dims as usize),
+        bucket_vectors.clone()
+    ).expect("reshape failed");
+
+    let dataset = ManagedTensor::from(&dataset_array)
+        .to_device(&res)
+        .expect("transfer failed");
+
+    let mut centroids_host = Array2::<f32>::zeros((num_leaves as usize, vector_dims as usize));
+    let mut centroids_gpu = ManagedTensor::from(&centroids_host)
+        .to_device(&res)
+        .expect("alloc failed");
+
+    // Use hierarchical k-means for larger cluster counts
+    let use_hierarchical = num_leaves > 256;
+    let params = kmeans::Params::new()
+        .expect("params failed")
+        .set_n_clusters(num_leaves as i32)
+        .set_max_iter(iterations as i32)
+        .set_metric(DistanceType::L2Expanded)
+        .set_hierarchical(use_hierarchical)
+        .set_hierarchical_n_iters(iterations as i32);
+
+    kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
+        .expect("k-means fit failed");
+
+    centroids_gpu
+        .to_host(&res, &mut centroids_host)
+        .expect("retrieval failed");
+
+    if spherical_centroids {
+        normalize_vectors(&mut centroids_host);
+    }
+
+    centroids_host.into_raw_vec()
+}
+
+// ============================================================================================
+// SECTION 3: BOTTOM-UP HIERARCHICAL CLUSTERING (Alternative approach)
+// ============================================================================================
 
 /// Bottom-up hierarchical clustering result
 pub struct BottomUpResult {
-    /// Root/parent centroids (num_roots x dims)
     pub root_centroids: Vec<f32>,
-    /// Leaf centroids (num_leaves x dims)
     pub leaf_centroids: Vec<f32>,
-    /// Parent assignment for each leaf (which root each leaf belongs to)
     pub leaf_to_root: Vec<i32>,
 }
 
-/// Performs bottom-up hierarchical clustering on GPU.
-///
-/// This matches VectorChord's clustering strategy but leverages GPU acceleration.
-/// If the dataset exceeds GPU memory, it processes in batches internally.
-///
-/// Strategy:
-/// 1. If data fits GPU: Train ALL leaf centroids in one GPU call
-/// 2. If data exceeds GPU: Batch process → intermediate centroids → consolidate
-/// 3. Train root centroids from leaf centroids
-/// 4. Assign leaves to roots
-///
-/// # Arguments
-/// * `vectors` - Flat vector of all training data (num_vectors * dims)
-/// * `vector_dims` - Dimensionality of each vector
-/// * `num_leaves` - Number of leaf centroids to create (e.g., 160,000)
-/// * `num_roots` - Number of root/parent centroids (e.g., 400). Pass 0 for flat index.
-/// * `kmeans_iterations` - Max iterations for k-means
-/// * `spherical_centroids` - Whether to L2-normalize centroids (for cosine similarity)
+/// Bottom-up clustering: train all leaves first, then cluster leaves into roots.
+/// This is an alternative to top-down, useful when data fits in GPU memory.
 pub fn bottom_up(
     vectors: Vec<f32>,
     vector_dims: u32,
@@ -339,45 +469,61 @@ pub fn bottom_up(
     info!("🚀 [BOTTOM-UP] Starting GPU hierarchical clustering");
     info!("   Input vectors: {}, Dims: {}", total_vectors, vector_dims);
     info!("   Target: {} leaves, {} roots", num_leaves, if is_hierarchical { num_roots } else { 0 });
-
-    // Query actual GPU memory and calculate capacity
-    let gpu_memory_budget = get_gpu_memory_budget();
-    let bytes_per_vector = vector_dims as usize * 4;
-    let max_vectors_for_gpu = gpu_memory_budget / bytes_per_vector;
-    info!("   Max vectors for GPU: {} ({:.1}GB budget)",
-          max_vectors_for_gpu, gpu_memory_budget as f64 / 1e9);
+    log_gpu_memory();
 
     let overall_start = Instant::now();
 
     // =========================================================================
-    // Decide strategy: direct fit vs batched consolidation
+    // PHASE 1: Train ALL leaf centroids
     // =========================================================================
-    let leaf_centroids_flat: Vec<f32> = if total_vectors <= max_vectors_for_gpu {
-        // Dataset fits in GPU memory - train directly
-        info!("📍 [PHASE 1] Direct GPU training ({} vectors fit in memory)", total_vectors);
-        train_leaves_direct(
-            vectors,
-            vector_dims,
-            num_leaves,
-            kmeans_iterations,
-            spherical_centroids,
-        )
-    } else {
-        // Dataset exceeds GPU memory - batch process with consolidation
-        let num_batches = (total_vectors + max_vectors_for_gpu - 1) / max_vectors_for_gpu;
-        info!("📍 [PHASE 1] Batched GPU training ({} vectors in {} batches)",
-              total_vectors, num_batches);
-        train_leaves_batched(
-            vectors,
-            vector_dims,
-            num_leaves,
-            max_vectors_for_gpu,
-            kmeans_iterations,
-            spherical_centroids,
-        )
-    };
+    info!("📍 [PHASE 1] Training {} leaf centroids from {} vectors...", num_leaves, total_vectors);
+    let phase1_start = Instant::now();
 
-    info!("✅ [PHASE 1] Leaf training complete in {:.2?}", overall_start.elapsed());
+    let res = Resources::new().expect("GPU Resource creation failed");
+
+    let vectors_array = Array2::from_shape_vec(
+        (total_vectors, vector_dims as usize),
+        vectors
+    ).expect("Failed to reshape vectors");
+
+    let dataset_gpu = ManagedTensor::from(&vectors_array)
+        .to_device(&res)
+        .expect("Failed to transfer vectors to GPU");
+
+    let mut leaf_centroids_host = Array2::<f32>::zeros((num_leaves as usize, vector_dims as usize));
+    let mut leaf_centroids_gpu = ManagedTensor::from(&leaf_centroids_host)
+        .to_device(&res)
+        .expect("Failed to allocate leaf centroids on GPU");
+
+    // Use hierarchical k-means for large cluster counts
+    let leaf_params = kmeans::Params::new()
+        .expect("Failed to create k-means params")
+        .set_n_clusters(num_leaves as i32)
+        .set_max_iter(kmeans_iterations as i32)
+        .set_metric(DistanceType::L2Expanded)
+        .set_hierarchical(true)
+        .set_hierarchical_n_iters(kmeans_iterations as i32);
+
+    let (inertia, n_iter) = kmeans::fit(
+        &res,
+        &leaf_params,
+        &dataset_gpu,
+        &None,
+        &mut leaf_centroids_gpu
+    ).expect("Leaf k-means training failed");
+
+    info!("   K-means converged: inertia={:.2e}, iters={}", inertia, n_iter);
+
+    leaf_centroids_gpu
+        .to_host(&res, &mut leaf_centroids_host)
+        .expect("Leaf centroids transfer failed");
+
+    if spherical_centroids {
+        normalize_vectors(&mut leaf_centroids_host);
+    }
+
+    let leaf_centroids_flat = leaf_centroids_host.into_raw_vec();
+    info!("✅ [PHASE 1] Leaf training complete in {:.2?}", phase1_start.elapsed());
 
     // =========================================================================
     // PHASE 2: Train root centroids from leaves (if hierarchical)
@@ -394,11 +540,9 @@ pub fn bottom_up(
     info!("📍 [PHASE 2] Training {} roots from {} leaves...", num_roots, num_leaves);
     let phase2_start = Instant::now();
 
-    let res = Resources::new().expect("GPU Resource creation failed");
-
     let leaf_array = Array2::from_shape_vec(
         (num_leaves as usize, vector_dims as usize),
-        leaf_centroids_flat.clone(),
+        leaf_centroids_flat.clone()
     ).expect("Failed to reshape leaf centroids");
 
     let leaf_dataset_gpu = ManagedTensor::from(&leaf_array)
@@ -471,276 +615,3 @@ pub fn bottom_up(
         leaf_to_root: leaf_to_root_host.into_raw_vec(),
     }
 }
-
-/// Train leaf centroids directly when data fits in GPU memory
-fn train_leaves_direct(
-    vectors: Vec<f32>,
-    vector_dims: u32,
-    num_leaves: u32,
-    kmeans_iterations: u32,
-    spherical_centroids: bool,
-) -> Vec<f32> {
-    let num_vectors = vectors.len() / vector_dims as usize;
-    let start = Instant::now();
-
-    let res = Resources::new().expect("GPU Resource creation failed");
-
-    let vectors_array = Array2::from_shape_vec(
-        (num_vectors, vector_dims as usize),
-        vectors,
-    ).expect("Failed to reshape vectors");
-
-    let dataset_gpu = ManagedTensor::from(&vectors_array)
-        .to_device(&res)
-        .expect("Failed to transfer vectors to GPU");
-
-    debug1!("   GPU transfer complete: {:.2?}", start.elapsed());
-
-    let mut leaf_centroids_host = Array2::<f32>::zeros((num_leaves as usize, vector_dims as usize));
-    let mut leaf_centroids_gpu = ManagedTensor::from(&leaf_centroids_host)
-        .to_device(&res)
-        .expect("Failed to allocate leaf centroids on GPU");
-
-    // Use hierarchical k-means for large cluster counts (more efficient)
-    let use_hierarchical = num_leaves > 256;
-    let leaf_params = kmeans::Params::new()
-        .expect("Failed to create k-means params")
-        .set_n_clusters(num_leaves as i32)
-        .set_max_iter(kmeans_iterations as i32)
-        .set_metric(DistanceType::L2Expanded)
-        .set_hierarchical(use_hierarchical)
-        .set_hierarchical_n_iters(kmeans_iterations as i32);
-
-    let (inertia, n_iter) = kmeans::fit(
-        &res,
-        &leaf_params,
-        &dataset_gpu,
-        &None,
-        &mut leaf_centroids_gpu,
-    ).expect("Leaf k-means training failed");
-
-    info!("   K-means converged: inertia={:.2e}, iters={}", inertia, n_iter);
-
-    leaf_centroids_gpu
-        .to_host(&res, &mut leaf_centroids_host)
-        .expect("Leaf centroids transfer failed");
-
-    if spherical_centroids {
-        normalize_vectors(&mut leaf_centroids_host);
-    }
-
-    leaf_centroids_host.into_raw_vec()
-}
-
-/// Train leaf centroids via batched processing when data exceeds GPU memory
-fn train_leaves_batched(
-    vectors: Vec<f32>,
-    vector_dims: u32,
-    num_leaves: u32,
-    batch_size_vectors: usize,
-    kmeans_iterations: u32,
-    spherical_centroids: bool,
-) -> Vec<f32> {
-    let total_vectors = vectors.len() / vector_dims as usize;
-    let num_batches = (total_vectors + batch_size_vectors - 1) / batch_size_vectors;
-
-    // Target: 4x leaves as intermediate centroids for quality, spread across batches
-    // Cap at 100k per batch - non-hierarchical k-means gets slow beyond this
-    const MAX_INTERMEDIATES_PER_BATCH: usize = 100_000;
-    let total_intermediates = (num_leaves as usize).saturating_mul(4);
-    let intermediates_per_batch = std::cmp::min(
-        std::cmp::max(total_intermediates / num_batches, 64),
-        MAX_INTERMEDIATES_PER_BATCH,
-    );
-
-    info!("   Batching: {} batches, {} intermediates/batch", num_batches, intermediates_per_batch);
-
-    let mut all_intermediates: Vec<f32> = Vec::new();
-    let mut all_weights: Vec<f32> = Vec::new();
-
-    // Process each batch
-    for batch_idx in 0..num_batches {
-        let start_vec = batch_idx * batch_size_vectors;
-        let end_vec = std::cmp::min(start_vec + batch_size_vectors, total_vectors);
-        let batch_count = end_vec - start_vec;
-
-        let start_idx = start_vec * vector_dims as usize;
-        let end_idx = end_vec * vector_dims as usize;
-        let batch_vectors: Vec<f32> = vectors[start_idx..end_idx].to_vec();
-
-        info!("   Batch {}/{}: {} vectors -> {} intermediates",
-              batch_idx + 1, num_batches, batch_count, intermediates_per_batch);
-
-        let (centroids, weights) = cluster_batch_to_intermediates(
-            batch_vectors,
-            vector_dims,
-            intermediates_per_batch as u32,
-            kmeans_iterations,
-            spherical_centroids,
-        );
-
-        all_intermediates.extend(centroids);
-        all_weights.extend(weights);
-    }
-
-    // Consolidate all intermediate centroids into final leaves
-    let total_intermediate_count = all_intermediates.len() / vector_dims as usize;
-    info!("   Consolidating {} intermediates -> {} leaves", total_intermediate_count, num_leaves);
-
-    consolidate_to_leaves(
-        all_intermediates,
-        all_weights,
-        vector_dims,
-        num_leaves,
-        kmeans_iterations,
-        spherical_centroids,
-    )
-}
-
-/// Cluster a batch of vectors to intermediate centroids
-fn cluster_batch_to_intermediates(
-    vectors: Vec<f32>,
-    vector_dims: u32,
-    num_clusters: u32,
-    kmeans_iterations: u32,
-    spherical_centroids: bool,
-) -> (Vec<f32>, Vec<f32>) {
-    let num_vectors = vectors.len() / vector_dims as usize;
-
-    let res = Resources::new().expect("GPU Resource creation failed");
-
-    let vectors_array = Array2::from_shape_vec(
-        (num_vectors, vector_dims as usize),
-        vectors,
-    ).expect("Failed to reshape vectors");
-
-    let dataset_gpu = ManagedTensor::from(&vectors_array)
-        .to_device(&res)
-        .expect("Failed to transfer vectors to GPU");
-
-    let mut centroids_host = Array2::<f32>::zeros((num_clusters as usize, vector_dims as usize));
-    let mut centroids_gpu = ManagedTensor::from(&centroids_host)
-        .to_device(&res)
-        .expect("Failed to allocate centroids on GPU");
-
-    let mut labels_host = Array1::<i32>::zeros(num_vectors);
-    let mut labels_gpu = ManagedTensor::from(&labels_host)
-        .to_device(&res)
-        .expect("Failed to allocate labels on GPU");
-
-    // Use non-hierarchical k-means for batches to avoid cuVS multi-device issues
-    // The hierarchical algorithm seems to trigger cudaErrorInvalidDevice on some systems
-    let params = kmeans::Params::new()
-        .expect("Failed to create k-means params")
-        .set_n_clusters(num_clusters as i32)
-        .set_max_iter(kmeans_iterations as i32)
-        .set_metric(DistanceType::L2Expanded)
-        .set_hierarchical(false);
-
-    let (_inertia, _n_iter) = kmeans::fit(
-        &res,
-        &params,
-        &dataset_gpu,
-        &None,
-        &mut centroids_gpu,
-    ).expect("Batch k-means training failed");
-
-    // Get labels to compute weights
-    kmeans::predict(
-        &res,
-        &params,
-        &dataset_gpu,
-        &None,
-        &centroids_gpu,
-        &mut labels_gpu,
-        false,
-    ).expect("Batch k-means predict failed");
-
-    centroids_gpu
-        .to_host(&res, &mut centroids_host)
-        .expect("Centroids transfer failed");
-
-    labels_gpu
-        .to_host(&res, &mut labels_host)
-        .expect("Labels transfer failed");
-
-    if spherical_centroids {
-        normalize_vectors(&mut centroids_host);
-    }
-
-    // Compute weights (cluster sizes)
-    let mut weights = vec![0.0f32; num_clusters as usize];
-    for &label in labels_host.iter() {
-        if label >= 0 && (label as usize) < weights.len() {
-            weights[label as usize] += 1.0;
-        }
-    }
-
-    (centroids_host.into_raw_vec(), weights)
-}
-
-/// Consolidate intermediate centroids into final leaf centroids using weighted k-means
-fn consolidate_to_leaves(
-    intermediates: Vec<f32>,
-    weights: Vec<f32>,
-    vector_dims: u32,
-    num_leaves: u32,
-    kmeans_iterations: u32,
-    spherical_centroids: bool,
-) -> Vec<f32> {
-    let num_intermediates = intermediates.len() / vector_dims as usize;
-    let start = Instant::now();
-
-    let res = Resources::new().expect("GPU Resource creation failed");
-
-    let intermediates_array = Array2::from_shape_vec(
-        (num_intermediates, vector_dims as usize),
-        intermediates,
-    ).expect("Failed to reshape intermediates");
-
-    let weights_array = Array1::from_shape_vec(num_intermediates, weights)
-        .expect("Failed to reshape weights");
-
-    let intermediates_gpu = ManagedTensor::from(&intermediates_array)
-        .to_device(&res)
-        .expect("Failed to transfer intermediates to GPU");
-
-    let weights_gpu = ManagedTensor::from(&weights_array)
-        .to_device(&res)
-        .expect("Failed to transfer weights to GPU");
-
-    let mut leaf_centroids_host = Array2::<f32>::zeros((num_leaves as usize, vector_dims as usize));
-    let mut leaf_centroids_gpu = ManagedTensor::from(&leaf_centroids_host)
-        .to_device(&res)
-        .expect("Failed to allocate leaf centroids on GPU");
-
-    // Non-hierarchical to support weights
-    let params = kmeans::Params::new()
-        .expect("Failed to create k-means params")
-        .set_n_clusters(num_leaves as i32)
-        .set_max_iter(kmeans_iterations as i32)
-        .set_metric(DistanceType::L2Expanded)
-        .set_hierarchical(false);
-
-    let (inertia, n_iter) = kmeans::fit(
-        &res,
-        &params,
-        &intermediates_gpu,
-        &Some(weights_gpu),
-        &mut leaf_centroids_gpu,
-    ).expect("Consolidation k-means failed");
-
-    info!("   Consolidation converged: inertia={:.2e}, iters={}", inertia, n_iter);
-
-    leaf_centroids_gpu
-        .to_host(&res, &mut leaf_centroids_host)
-        .expect("Leaf centroids transfer failed");
-
-    if spherical_centroids {
-        normalize_vectors(&mut leaf_centroids_host);
-    }
-
-    debug1!("   Consolidation complete: {:.2?}", start.elapsed());
-    leaf_centroids_host.into_raw_vec()
-}
-
