@@ -349,9 +349,7 @@ pub fn assign_to_roots_gpu(
     let params = kmeans::Params::new()
         .expect("params failed")
         .set_n_clusters(num_roots as i32)
-        .set_metric(DistanceType::L2Expanded)
-        .set_batch_samples(0)
-        .set_batch_centroids(0);
+        .set_metric(DistanceType::L2Expanded);
 
     while processed < total_vectors {
         let end = std::cmp::min(processed + batch_size, total_vectors);
