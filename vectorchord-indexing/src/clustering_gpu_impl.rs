@@ -343,13 +343,15 @@ pub fn assign_to_roots_gpu(
         .expect("transfer failed");
 
     let mut final_labels = Vec::with_capacity(total_vectors);
-    let batch_size = 10_000_000; // Larger batches for better GPU utilization
+    let batch_size = 5_000_000; // Balanced batch size for GPU utilization
     let mut processed = 0;
 
     let params = kmeans::Params::new()
         .expect("params failed")
         .set_n_clusters(num_roots as i32)
-        .set_metric(DistanceType::L2Expanded);
+        .set_metric(DistanceType::L2Expanded)
+        .set_batch_samples(0)
+        .set_batch_centroids(0);
 
     while processed < total_vectors {
         let end = std::cmp::min(processed + batch_size, total_vectors);

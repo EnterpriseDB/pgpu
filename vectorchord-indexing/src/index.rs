@@ -8,6 +8,7 @@ use crate::vectorchord_index;
 use crate::{centroids_table, util};
 use pgrx::spi::quote_qualified_identifier;
 use pgrx::{info, warning};
+use std::io::{self, Write};
 use std::time::Instant;
 
 #[allow(clippy::too_many_arguments)]
@@ -155,15 +156,18 @@ pub fn index(
                     format!("{}K", num_samples_target / 1000)
                 };
 
-                info!(
-                    "[{}] {:.1}% ({}/{}) | {} vec/s | ETA: {}",
+                // Use \r to overwrite line in place (no newline)
+                eprint!(
+                    "\r[{}] {:.1}% ({}/{}) | {} vec/s | ETA: {}   ",
                     bar, percent, loaded_str, target_str, rate_str, eta_str
                 );
+                let _ = io::stderr().flush();
 
                 last_log_time = Instant::now();
                 last_log_count = loaded_count;
             }
         }
+        eprintln!(); // Move to next line after progress completes
         batcher.end_scan();
         let d_load = t_load_start.elapsed();
         info!("✅ Loaded {} vectors in {:.2?}", loaded_count, d_load);
