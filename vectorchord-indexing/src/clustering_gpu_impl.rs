@@ -339,7 +339,7 @@ pub fn train_roots_and_assign_gpu(
     let assign_start = Instant::now();
 
     let mut final_labels = Vec::with_capacity(total_vectors);
-    let batch_size = 5_000_000;
+    let batch_size = 2_000_000; // 5M causes CUDA errors
     let mut processed = 0;
 
     while processed < total_vectors {
