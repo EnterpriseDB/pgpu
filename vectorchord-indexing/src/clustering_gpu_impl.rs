@@ -11,10 +11,11 @@ use std::time::Instant;
 // GPU MEMORY UTILITIES
 // ============================================================================================
 
-/// Query available GPU memory using nvidia-smi for GPU 0.
-fn query_gpu_memory() -> Option<(usize, usize)> {
+/// Query available GPU memory and info using nvidia-smi.
+/// Returns (free_bytes, total_bytes, gpu_index, gpu_name)
+fn query_gpu_info() -> Option<(usize, usize, String, String)> {
     let output = Command::new("nvidia-smi")
-        .args(["--id=0", "--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"])
+        .args(["--query-gpu=index,name,memory.free,memory.total", "--format=csv,noheader,nounits"])
         .output()
         .ok()?;
 
@@ -26,10 +27,12 @@ fn query_gpu_memory() -> Option<(usize, usize)> {
     let line = stdout.lines().next()?;
     let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
 
-    if parts.len() >= 2 {
-        let free_mb: usize = parts[0].parse().ok()?;
-        let total_mb: usize = parts[1].parse().ok()?;
-        Some((free_mb * 1024 * 1024, total_mb * 1024 * 1024))
+    if parts.len() >= 4 {
+        let gpu_index = parts[0].to_string();
+        let gpu_name = parts[1].to_string();
+        let free_mb: usize = parts[2].parse().ok()?;
+        let total_mb: usize = parts[3].parse().ok()?;
+        Some((free_mb * 1024 * 1024, total_mb * 1024 * 1024, gpu_index, gpu_name))
     } else {
         None
     }
@@ -37,9 +40,9 @@ fn query_gpu_memory() -> Option<(usize, usize)> {
 
 /// Get GPU memory info for logging
 fn log_gpu_memory() {
-    if let Some((free, total)) = query_gpu_memory() {
-        info!("   GPU memory: {:.1}GB free / {:.1}GB total",
-              free as f64 / 1e9, total as f64 / 1e9);
+    if let Some((free, total, idx, name)) = query_gpu_info() {
+        info!("   GPU[{}] {}: {:.1}GB free / {:.1}GB total",
+              idx, name, free as f64 / 1e9, total as f64 / 1e9);
     }
 }
 
