@@ -381,7 +381,7 @@ pub fn index(
     // PATH B: FLAT BUILD (single level, no hierarchy)
     // ========================================================================================
     } else {
-        info!("🏗️ [FLAT DETECTED] Running Bottom-Up Batch Clustering");
+        info!("🏗️ [FLAT BUILD] Running Bottom-Up Batch Clustering");
 
         // --- SAMPLER INITIALIZATION ---
         // New call format

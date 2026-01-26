@@ -5,7 +5,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ptr::NonNull;
 
-// Configuration
+// Number of vectors to accumulate before returning a batch to the caller.
+// Smaller values = more function call overhead, larger values = more memory pressure.
 const VECTORS_PER_BATCH: u64 = 50000;
 
 // =============================================================================
@@ -172,7 +173,7 @@ impl VectorReadBatcher {
             let vector_data_gb = (target_samples * detected_dims as u64 * 4) as f64 / 1_073_741_824.0;
 
             info!(
-                "[SAMPLER] Sampling {:.1}M vectors ({} dims) | ~{:.1}GB to read",
+                "🎲 [SAMPLER] Sampling {:.1}M vectors ({} dims) | ~{:.1}GB to read",
                 target_samples as f64 / 1_000_000.0,
                 detected_dims,
                 vector_data_gb
@@ -512,6 +513,8 @@ impl FeistelBlockIterator {
             .unwrap_or_default()
             .as_nanos() as u64;
 
+        // Derive two independent keys from the seed for the Feistel network.
+        // XOR with a constant ensures key_1 differs from key_0 even with the same hasher state.
         let mut hasher = DefaultHasher::new();
         seed.hash(&mut hasher);
         let key_0 = hasher.finish();

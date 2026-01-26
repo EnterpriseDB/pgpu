@@ -3,7 +3,7 @@ use cuvs::cluster::kmeans;
 use cuvs::distance_type::DistanceType;
 use cuvs::{ManagedTensor, Resources};
 use ndarray::{Array1, Array2, ArrayBase, ArrayView2, Ix1, OwnedRepr};
-use pgrx::{debug1, info, warning};
+use pgrx::{debug1, info};
 use std::process::Command;
 use std::time::Instant;
 
@@ -262,7 +262,7 @@ pub fn train_roots_and_assign_gpu(
         1
     };
 
-    info!("🚀 [PHASE 1] Training {} roots from {} vectors (stride={})",
+    info!("🚀 [PHASE 1] Training {} roots from {} vectors (stride={} )",
           num_roots, num_train, stride);
     log_gpu_memory();
 
@@ -295,7 +295,6 @@ pub fn train_roots_and_assign_gpu(
         .to_device(&res)
         .expect("alloc failed");
 
-    // Match main branch configuration
     let params = kmeans::Params::new()
         .expect("params failed")
         .set_n_clusters(num_roots as i32)
@@ -339,7 +338,7 @@ pub fn train_roots_and_assign_gpu(
     let assign_start = Instant::now();
 
     let mut final_labels = Vec::with_capacity(total_vectors);
-    let batch_size = 2_000_000; // 5M causes CUDA errors
+    let batch_size = 2_000_000; // Limited by cuVS internal memory allocation
     let mut processed = 0;
 
     while processed < total_vectors {
@@ -445,7 +444,6 @@ pub fn train_leaves_for_bucket_gpu(
         .to_device(res)
         .expect("alloc failed");
 
-    // Match main branch configuration
     let params = kmeans::Params::new()
         .expect("params failed")
         .set_n_clusters(num_leaves as i32)
