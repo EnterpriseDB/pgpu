@@ -257,12 +257,12 @@ pub fn index(
             .collect();
 
         // Parallel leaf training with multiple GPU streams
-        let num_workers = 4; // 4 concurrent GPU streams
+        let num_workers = 16; // 16 concurrent GPU streams
         let work_counter = std::sync::atomic::AtomicUsize::new(0);
         let completed_counter = std::sync::atomic::AtomicUsize::new(0);
         let total_work = work_items.len();
 
-        info!("   Using {} parallel GPU workers", num_workers);
+        info!("   Using {} parallel GPU workers for {} buckets", num_workers, total_work);
 
         let all_leaf_results: Vec<(usize, Vec<f32>)> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..num_workers)
@@ -294,8 +294,12 @@ pub fn index(
 
                             results.push((bucket_idx, leaf_centroids));
 
-                            // Just increment counter (no logging from threads - pgrx isn't thread-safe)
-                            completed_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            // Progress logging (eprintln is thread-safe, pgrx macros are not)
+                            let done = completed_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            if done % 50 == 0 || done == total_work {
+                                eprintln!("   ... trained {}/{} buckets ({:.0}%)",
+                                    done, total_work, 100.0 * done as f64 / total_work as f64);
+                            }
                         }
 
                         results
