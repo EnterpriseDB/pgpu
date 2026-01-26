@@ -294,11 +294,8 @@ pub fn index(
 
                             results.push((bucket_idx, leaf_centroids));
 
-                            // Progress logging
-                            let done = completed_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                            if done % 50 == 0 {
-                                info!("   ... trained {}/{} buckets", done, total_work);
-                            }
+                            // Just increment counter (no logging from threads - pgrx isn't thread-safe)
+                            completed_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         }
 
                         results
@@ -307,10 +304,17 @@ pub fn index(
                 .collect();
 
             // Collect results from all workers
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().unwrap())
-                .collect()
+            let mut all_results = Vec::new();
+            for (worker_id, h) in handles.into_iter().enumerate() {
+                match h.join() {
+                    Ok(results) => all_results.extend(results),
+                    Err(e) => {
+                        // Worker panicked - log error after threads complete
+                        eprintln!("Worker {} panicked: {:?}", worker_id, e);
+                    }
+                }
+            }
+            all_results
         });
 
         // Sort by bucket_idx and add to final results

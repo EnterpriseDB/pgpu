@@ -408,14 +408,13 @@ pub fn train_leaves_for_bucket_gpu(
     let num_vecs = bucket_indices.len();
 
     if num_vecs < num_leaves as usize {
-        // Return the actual vectors for small buckets
+        // Return the actual vectors for small buckets (no k-means needed)
         let mut result = Vec::with_capacity(num_vecs * vector_dims as usize);
         for &idx in bucket_indices {
             let start = idx * vector_dims as usize;
             let end = start + vector_dims as usize;
             result.extend_from_slice(&all_vectors[start..end]);
         }
-        warning!("⚠️ Bucket too small ({} vectors < {} leaves)", num_vecs, num_leaves);
         return result;
     }
 
