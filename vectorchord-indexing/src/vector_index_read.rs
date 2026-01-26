@@ -169,20 +169,13 @@ impl VectorReadBatcher {
             // Get total number of blocks
             let total_blocks = pg_sys::RelationGetNumberOfBlocksInFork(heap_relation, 0);
 
-            // Calculate density for logging
-            let vec_byte_size = detected_dims as u64 * 4;
-            let is_toasted = vec_byte_size > 2000 || vec_byte_size == 0;
-            let density = if is_toasted { 177 } else { (8192 - 24) / (24 + vec_byte_size + 4) };
-            let estimated_rows = total_blocks as u64 * density;
+            let vector_data_gb = (target_samples * detected_dims as u64 * 4) as f64 / 1_073_741_824.0;
 
-            let num_chunks = (total_blocks + CHUNK_SIZE_BLOCKS - 1) / CHUNK_SIZE_BLOCKS;
             info!(
-                "[SAMPLER] Table: {} blocks (~{} rows). Target: {} samples. Dims: {}",
-                total_blocks, estimated_rows, target_samples, detected_dims
-            );
-            info!(
-                "[SAMPLER] Using chunked I/O: {} chunks of {} blocks ({}MB sequential reads)",
-                num_chunks, CHUNK_SIZE_BLOCKS, (CHUNK_SIZE_BLOCKS * 8) / 1024
+                "[SAMPLER] Sampling {:.1}M vectors ({} dims) | ~{:.1}GB to read",
+                target_samples as f64 / 1_000_000.0,
+                detected_dims,
+                vector_data_gb
             );
 
             // Get snapshot
