@@ -241,42 +241,89 @@ pub fn index(
             final_results.push((root_vec.to_vec(), -1));
         }
 
-        // Create GPU resources once for all bucket training (avoids 400x initialization overhead)
-        let gpu_res = create_gpu_resources();
+        // Prepare work items for parallel processing
+        let work_items: Vec<(usize, u32)> = bucket_indices
+            .iter()
+            .enumerate()
+            .filter_map(|(bucket_idx, indices)| {
+                let n_vecs = indices.len();
+                if n_vecs == 0 {
+                    return None;
+                }
+                let raw_target = n_vecs as f64 * leaves_per_vector_ratio;
+                let target_leaves = (raw_target.round() as u32).clamp(1, n_vecs as u32);
+                Some((bucket_idx, target_leaves))
+            })
+            .collect();
 
-        // Train leaves for each bucket
+        // Parallel leaf training with multiple GPU streams
+        let num_workers = 4; // 4 concurrent GPU streams
+        let work_counter = std::sync::atomic::AtomicUsize::new(0);
+        let completed_counter = std::sync::atomic::AtomicUsize::new(0);
+        let total_work = work_items.len();
+
+        info!("   Using {} parallel GPU workers", num_workers);
+
+        let all_leaf_results: Vec<(usize, Vec<f32>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..num_workers)
+                .map(|_worker_id| {
+                    s.spawn(|| {
+                        // Each worker gets its own GPU Resources (own CUDA stream)
+                        let gpu_res = create_gpu_resources();
+                        let mut results: Vec<(usize, Vec<f32>)> = Vec::new();
+
+                        loop {
+                            // Atomically grab next work item
+                            let idx = work_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if idx >= total_work {
+                                break;
+                            }
+
+                            let (bucket_idx, target_leaves) = work_items[idx];
+                            let indices = &bucket_indices[bucket_idx];
+
+                            let leaf_centroids = train_leaves_for_bucket_gpu(
+                                &gpu_res,
+                                &training_dataset,
+                                indices,
+                                vector_dims,
+                                target_leaves,
+                                kmeans_iterations / 2,
+                                spherical_centroids,
+                            );
+
+                            results.push((bucket_idx, leaf_centroids));
+
+                            // Progress logging
+                            let done = completed_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            if done % 50 == 0 {
+                                info!("   ... trained {}/{} buckets", done, total_work);
+                            }
+                        }
+
+                        results
+                    })
+                })
+                .collect();
+
+            // Collect results from all workers
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        // Sort by bucket_idx and add to final results
+        let mut sorted_results = all_leaf_results;
+        sorted_results.sort_by_key(|(idx, _)| *idx);
+
         let mut total_leaves_trained = 0;
-        for (bucket_idx, indices) in bucket_indices.iter().enumerate() {
-            let n_vecs = indices.len();
+        for (bucket_idx, leaf_centroids) in sorted_results {
             let parent_id = bucket_idx as i32;
-
-            if n_vecs == 0 {
-                continue;
-            }
-
-            // Calculate target leaves proportionally
-            let raw_target = n_vecs as f64 * leaves_per_vector_ratio;
-            let target_leaves = (raw_target.round() as u32).clamp(1, n_vecs as u32);
-
-            let leaf_centroids = train_leaves_for_bucket_gpu(
-                &gpu_res,
-                &training_dataset,
-                indices,
-                vector_dims,
-                target_leaves,
-                kmeans_iterations / 2, // Fewer iterations for leaves (speed)
-                spherical_centroids,
-            );
-
             for leaf_vec in leaf_centroids.chunks(vector_dims as usize) {
                 final_results.push((leaf_vec.to_vec(), parent_id));
             }
             total_leaves_trained += leaf_centroids.len() / vector_dims as usize;
-
-            if (bucket_idx + 1) % 50 == 0 {
-                info!("   ... trained {}/{} buckets ({} leaves so far)",
-                      bucket_idx + 1, num_roots, total_leaves_trained);
-            }
         }
         let d_leaves = t_leaves_start.elapsed();
 
