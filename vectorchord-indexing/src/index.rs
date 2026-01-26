@@ -257,7 +257,7 @@ pub fn index(
             .collect();
 
         // Parallel leaf training with multiple GPU streams
-        let num_workers = 8; // 8 concurrent GPU streams
+        let num_workers = 6; // 6 concurrent GPU streams
         let work_counter = std::sync::atomic::AtomicUsize::new(0);
         let completed_counter = std::sync::atomic::AtomicUsize::new(0);
         let total_work = work_items.len();
