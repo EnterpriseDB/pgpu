@@ -193,16 +193,13 @@ pub fn index(
         // ================================================================================
         // STEP 3+4: Train root centroids AND assign vectors (combined for GPU stability)
         // ================================================================================
-        let t_roots_start = Instant::now();
-        let (root_centroids, assignments) = train_roots_and_assign_gpu(
+        let (root_centroids, assignments, d_roots, d_assign) = train_roots_and_assign_gpu(
             &training_dataset,
             vector_dims,
             num_roots,
             kmeans_iterations,
             spherical_centroids,
         );
-        let d_roots = t_roots_start.elapsed();
-        let d_assign = std::time::Duration::ZERO; // Included in d_roots now
 
         // Analyze bucket distribution
         let mut bucket_counts = vec![0usize; num_roots as usize];

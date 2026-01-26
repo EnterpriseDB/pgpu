@@ -241,7 +241,7 @@ pub fn run_clustering_consolidate(
 // ============================================================================================
 
 /// Train root centroids and assign all vectors to them.
-/// Returns (root_centroids, assignments).
+/// Returns (root_centroids, assignments, root_training_duration, assignment_duration).
 ///
 /// This combined function keeps centroids on GPU between fit() and predict(),
 /// which is required for cuVS kmeans::predict to work correctly.
@@ -251,7 +251,7 @@ pub fn train_roots_and_assign_gpu(
     num_roots: u32,
     iterations: u32,
     spherical_centroids: bool,
-) -> (Vec<f32>, Vec<i32>) {
+) -> (Vec<f32>, Vec<i32>, std::time::Duration, std::time::Duration) {
     let total_vectors = full_vectors.len() / vector_dims as usize;
     let train_limit = 2_000_000; // Sample up to 2M vectors for root training
 
@@ -308,12 +308,32 @@ pub fn train_roots_and_assign_gpu(
     let (inertia, n_iter) = kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
         .expect("k-means fit failed");
 
+    let d_roots = start.elapsed();
     info!("✅ [PHASE 1] Roots trained in {:.2?} (inertia={:.2e}, iters={})",
-          start.elapsed(), inertia, n_iter);
+          d_roots, inertia, n_iter);
 
     // ========================================================================
-    // PHASE 2: Assign all vectors using the SAME centroids_gpu tensor
-    // This is critical - predict must use centroids from fit, not re-uploaded
+    // Normalize centroids BEFORE assignment (if spherical)
+    // This ensures assignment uses the same centroids that will be stored/queried
+    // ========================================================================
+    let centroids_for_predict = if spherical_centroids {
+        // Transfer to host, normalize, create new tensor
+        centroids_gpu
+            .to_host(&res, &mut centroids_host)
+            .expect("retrieval failed");
+        normalize_vectors(&mut centroids_host);
+
+        // Create new tensor with normalized centroids
+        ManagedTensor::from(&centroids_host)
+            .to_device(&res)
+            .expect("normalized centroids transfer failed")
+    } else {
+        // Use original tensor as-is (move ownership)
+        centroids_gpu
+    };
+
+    // ========================================================================
+    // PHASE 2: Assign all vectors to normalized centroids
     // ========================================================================
     info!("🚀 [PHASE 2] Assigning {} vectors to {} roots...", total_vectors, num_roots);
     let assign_start = Instant::now();
@@ -349,7 +369,7 @@ pub fn train_roots_and_assign_gpu(
             .to_device(&res)
             .expect("alloc failed");
 
-        kmeans::predict(&res, &params, &batch_gpu, &None, &centroids_gpu, &mut labels_gpu, false)
+        kmeans::predict(&res, &params, &batch_gpu, &None, &centroids_for_predict, &mut labels_gpu, false)
             .expect("predict failed");
 
         labels_gpu
@@ -360,18 +380,18 @@ pub fn train_roots_and_assign_gpu(
         processed += current_batch_len;
     }
 
-    info!("✅ [PHASE 2] Assignment complete in {:.2?}", assign_start.elapsed());
+    let d_assign = assign_start.elapsed();
+    info!("✅ [PHASE 2] Assignment complete in {:.2?}", d_assign);
 
-    // Now retrieve centroids to host (after all predict calls are done)
-    centroids_gpu
-        .to_host(&res, &mut centroids_host)
-        .expect("retrieval failed");
-
-    if spherical_centroids {
-        normalize_vectors(&mut centroids_host);
+    // If spherical_centroids, centroids_host is already normalized from before predict
+    // If not, retrieve from GPU now
+    if !spherical_centroids {
+        centroids_for_predict
+            .to_host(&res, &mut centroids_host)
+            .expect("retrieval failed");
     }
 
-    (centroids_host.into_raw_vec(), final_labels)
+    (centroids_host.into_raw_vec(), final_labels, d_roots, d_assign)
 }
 
 /// Train leaf centroids for a single bucket using pre-created Resources.
