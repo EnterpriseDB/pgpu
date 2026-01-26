@@ -2,7 +2,7 @@ use crate::util::{distance_type_from_str, normalize_vectors};
 use cuvs::cluster::kmeans;
 use cuvs::distance_type::DistanceType;
 use cuvs::{ManagedTensor, Resources};
-use ndarray::{Array1, Array2, ArrayBase, Ix1, OwnedRepr};
+use ndarray::{Array1, Array2, ArrayBase, ArrayView2, Ix1, OwnedRepr};
 use pgrx::{debug1, info, warning};
 use std::process::Command;
 use std::time::Instant;
@@ -339,7 +339,7 @@ pub fn train_roots_and_assign_gpu(
     let assign_start = Instant::now();
 
     let mut final_labels = Vec::with_capacity(total_vectors);
-    let batch_size = 2_000_000;
+    let batch_size = 5_000_000;
     let mut processed = 0;
 
     while processed < total_vectors {
@@ -355,12 +355,13 @@ pub fn train_roots_and_assign_gpu(
         let slice_end = end * vector_dims as usize;
         let batch_slice = &full_vectors[slice_start..slice_end];
 
-        let batch_array = Array2::from_shape_vec(
+        // Use ArrayView to avoid copying - just borrow the slice
+        let batch_view = ArrayView2::from_shape(
             (current_batch_len, vector_dims as usize),
-            batch_slice.to_vec()
+            batch_slice
         ).expect("reshape failed");
 
-        let batch_gpu = ManagedTensor::from(&batch_array)
+        let batch_gpu = ManagedTensor::from(&batch_view)
             .to_device(&res)
             .expect("transfer failed");
 
