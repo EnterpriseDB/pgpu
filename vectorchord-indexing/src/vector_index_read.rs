@@ -175,9 +175,14 @@ impl VectorReadBatcher {
             let density = if is_toasted { 177 } else { (8192 - 24) / (24 + vec_byte_size + 4) };
             let estimated_rows = total_blocks as u64 * density;
 
+            let num_chunks = (total_blocks + CHUNK_SIZE_BLOCKS - 1) / CHUNK_SIZE_BLOCKS;
             info!(
                 "[SAMPLER] Table: {} blocks (~{} rows). Target: {} samples. Dims: {}",
                 total_blocks, estimated_rows, target_samples, detected_dims
+            );
+            info!(
+                "[SAMPLER] Using chunked I/O: {} chunks of {} blocks ({}KB sequential reads)",
+                num_chunks, CHUNK_SIZE_BLOCKS, CHUNK_SIZE_BLOCKS * 8
             );
 
             // Get snapshot
@@ -329,9 +334,12 @@ impl HeapSampler {
 
     fn sample(&self) -> HeapSample {
         unsafe {
-            // Create sampler state with Feistel permutation
+            // Create sampler state with chunked block iteration for sequential I/O
             let state = NonNull::new_unchecked(Box::into_raw(Box::new(SamplerState {
-                blocks_iter: Some(Box::new(FeistelBlockIterator::new(self.total_blocks))),
+                blocks_iter: Some(Box::new(ChunkedBlockIterator::new(
+                    self.total_blocks,
+                    CHUNK_SIZE_BLOCKS,
+                ))),
                 tuples_iter: None,
             })));
 
@@ -476,11 +484,15 @@ impl Drop for HeapSample {
 }
 
 // =============================================================================
-// Sampler State and Feistel Iterator
+// Sampler State and Block Iterators
 // =============================================================================
 
+// Number of consecutive blocks to read per random seek
+// 128 blocks = 1MB sequential read per seek (optimized for NVMe SSDs)
+const CHUNK_SIZE_BLOCKS: u32 = 128;
+
 struct SamplerState {
-    blocks_iter: Option<Box<FeistelBlockIterator>>,
+    blocks_iter: Option<Box<ChunkedBlockIterator>>,
     tuples_iter: Option<std::ops::RangeInclusive<u16>>,
 }
 
@@ -565,6 +577,72 @@ impl Iterator for FeistelBlockIterator {
         }
 
         None
+    }
+}
+
+/// Chunked block iterator for sequential I/O optimization.
+/// Divides the table into chunks of consecutive blocks, then visits chunks
+/// in random order (using Feistel permutation). Within each chunk, blocks
+/// are read sequentially, maximizing I/O throughput on SSDs.
+struct ChunkedBlockIterator {
+    total_blocks: u32,
+    chunk_size: u32,
+    /// Feistel iterator over chunk indices (not block indices)
+    chunk_feistel: FeistelBlockIterator,
+    /// Current chunk's starting block
+    current_chunk_start: Option<u32>,
+    /// Current offset within the current chunk
+    current_offset: u32,
+}
+
+impl ChunkedBlockIterator {
+    fn new(total_blocks: u32, chunk_size: u32) -> Self {
+        // Number of chunks (rounded up)
+        let num_chunks = (total_blocks + chunk_size - 1) / chunk_size;
+
+        // Use Feistel to randomize chunk order
+        let chunk_feistel = FeistelBlockIterator::new(num_chunks);
+
+        ChunkedBlockIterator {
+            total_blocks,
+            chunk_size,
+            chunk_feistel,
+            current_chunk_start: None,
+            current_offset: 0,
+        }
+    }
+}
+
+impl Iterator for ChunkedBlockIterator {
+    type Item = BlockNumber;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // If we have a current chunk, try to emit the next block from it
+            if let Some(chunk_start) = self.current_chunk_start {
+                let block = chunk_start + self.current_offset;
+
+                // Check if we're still within the chunk AND within total blocks
+                if self.current_offset < self.chunk_size && block < self.total_blocks {
+                    self.current_offset += 1;
+                    return Some(block);
+                }
+
+                // Chunk exhausted, need to get next chunk
+                self.current_chunk_start = None;
+            }
+
+            // Get next chunk from Feistel
+            match self.chunk_feistel.next() {
+                Some(chunk_idx) => {
+                    let chunk_start = chunk_idx * self.chunk_size;
+                    self.current_chunk_start = Some(chunk_start);
+                    self.current_offset = 0;
+                    // Continue loop to emit first block of new chunk
+                }
+                None => return None,
+            }
+        }
     }
 }
 
