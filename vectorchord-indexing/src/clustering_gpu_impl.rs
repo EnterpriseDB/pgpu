@@ -11,11 +11,16 @@ use std::time::Instant;
 // GPU MEMORY UTILITIES
 // ============================================================================================
 
-/// Query available GPU memory using nvidia-smi.
+/// Query available GPU memory using nvidia-smi for GPU 0 (primary GPU).
 /// Returns (free_bytes, total_bytes) or None if query fails.
 fn query_gpu_memory() -> Option<(usize, usize)> {
+    // Query specifically GPU 0 to avoid multi-GPU confusion
     let output = Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.free,memory.total", "--format=csv,noheader,nounits"])
+        .args([
+            "--id=0",
+            "--query-gpu=memory.free,memory.total",
+            "--format=csv,noheader,nounits"
+        ])
         .output()
         .ok()?;
 
@@ -37,15 +42,18 @@ fn query_gpu_memory() -> Option<(usize, usize)> {
 }
 
 /// Get usable GPU memory for vector data.
-/// Uses 80% of free memory to leave room for centroids, labels, and cuVS workspace.
+/// Uses 50% of free memory to leave room for:
+/// - Centroids (can be large with 160k+ clusters)
+/// - Labels array
+/// - cuVS hierarchical k-means workspace (significant for large cluster counts)
 fn get_gpu_memory_budget() -> usize {
     const DEFAULT_BUDGET: usize = 10_000_000_000; // 10GB fallback
-    const MEMORY_USAGE_RATIO: f64 = 0.80; // Use 80% of free memory
+    const MEMORY_USAGE_RATIO: f64 = 0.50; // Conservative: use 50% for vectors
 
     match query_gpu_memory() {
         Some((free_bytes, total_bytes)) => {
             let usable = (free_bytes as f64 * MEMORY_USAGE_RATIO) as usize;
-            info!("   GPU memory: {:.1}GB free / {:.1}GB total -> using {:.1}GB for vectors",
+            info!("   GPU 0 memory: {:.1}GB free / {:.1}GB total -> using {:.1}GB for vectors (50%)",
                   free_bytes as f64 / 1e9,
                   total_bytes as f64 / 1e9,
                   usable as f64 / 1e9);
@@ -536,8 +544,13 @@ fn train_leaves_batched(
     let num_batches = (total_vectors + batch_size_vectors - 1) / batch_size_vectors;
 
     // Target: 4x leaves as intermediate centroids for quality, spread across batches
+    // Cap at 50k per batch to avoid excessive GPU workspace for hierarchical k-means
+    const MAX_INTERMEDIATES_PER_BATCH: usize = 50_000;
     let total_intermediates = (num_leaves as usize).saturating_mul(4);
-    let intermediates_per_batch = std::cmp::max(total_intermediates / num_batches, 64);
+    let intermediates_per_batch = std::cmp::min(
+        std::cmp::max(total_intermediates / num_batches, 64),
+        MAX_INTERMEDIATES_PER_BATCH,
+    );
 
     info!("   Batching: {} batches, {} intermediates/batch", num_batches, intermediates_per_batch);
 
