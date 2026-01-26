@@ -240,15 +240,18 @@ pub fn run_clustering_consolidate(
 // which is more memory efficient and often faster.
 // ============================================================================================
 
-/// Train root centroids from a sample of vectors.
-/// Uses stride-based sampling if dataset is too large.
-pub fn train_roots_gpu(
-    full_vectors: &Vec<f32>,
+/// Train root centroids and assign all vectors to them.
+/// Returns (root_centroids, assignments).
+///
+/// This combined function keeps centroids on GPU between fit() and predict(),
+/// which is required for cuVS kmeans::predict to work correctly.
+pub fn train_roots_and_assign_gpu(
+    full_vectors: &[f32],
     vector_dims: u32,
     num_roots: u32,
     iterations: u32,
     spherical_centroids: bool,
-) -> Vec<f32> {
+) -> (Vec<f32>, Vec<i32>) {
     let total_vectors = full_vectors.len() / vector_dims as usize;
     let train_limit = 2_000_000; // Sample up to 2M vectors for root training
 
@@ -305,51 +308,19 @@ pub fn train_roots_gpu(
     let (inertia, n_iter) = kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
         .expect("k-means fit failed");
 
-    centroids_gpu
-        .to_host(&res, &mut centroids_host)
-        .expect("retrieval failed");
-
-    if spherical_centroids {
-        normalize_vectors(&mut centroids_host);
-    }
-
     info!("✅ [PHASE 1] Roots trained in {:.2?} (inertia={:.2e}, iters={})",
           start.elapsed(), inertia, n_iter);
 
-    centroids_host.into_raw_vec()
-}
-
-/// Assign all vectors to their nearest root centroid.
-/// Returns a vector of labels (root indices) for each input vector.
-pub fn assign_to_roots_gpu(
-    all_vectors: &Vec<f32>,
-    root_centroids: &Vec<f32>,
-    vector_dims: u32,
-    num_roots: u32,
-) -> Vec<i32> {
-    let total_vectors = all_vectors.len() / vector_dims as usize;
+    // ========================================================================
+    // PHASE 2: Assign all vectors using the SAME centroids_gpu tensor
+    // This is critical - predict must use centroids from fit, not re-uploaded
+    // ========================================================================
     info!("🚀 [PHASE 2] Assigning {} vectors to {} roots...", total_vectors, num_roots);
-
-    let start = Instant::now();
-    let res = Resources::new().expect("GPU Resource failed");
-
-    let roots_array = Array2::from_shape_vec(
-        (num_roots as usize, vector_dims as usize),
-        root_centroids.clone()
-    ).expect("shape failed");
-
-    let roots_gpu = ManagedTensor::from(&roots_array)
-        .to_device(&res)
-        .expect("transfer failed");
+    let assign_start = Instant::now();
 
     let mut final_labels = Vec::with_capacity(total_vectors);
-    let batch_size = 5_000_000; // Balanced batch size for GPU utilization
+    let batch_size = 2_000_000;
     let mut processed = 0;
-
-    let params = kmeans::Params::new()
-        .expect("params failed")
-        .set_n_clusters(num_roots as i32)
-        .set_metric(DistanceType::L2Expanded);
 
     while processed < total_vectors {
         let end = std::cmp::min(processed + batch_size, total_vectors);
@@ -362,7 +333,7 @@ pub fn assign_to_roots_gpu(
 
         let slice_start = processed * vector_dims as usize;
         let slice_end = end * vector_dims as usize;
-        let batch_slice = &all_vectors[slice_start..slice_end];
+        let batch_slice = &full_vectors[slice_start..slice_end];
 
         let batch_array = Array2::from_shape_vec(
             (current_batch_len, vector_dims as usize),
@@ -378,7 +349,7 @@ pub fn assign_to_roots_gpu(
             .to_device(&res)
             .expect("alloc failed");
 
-        kmeans::predict(&res, &params, &batch_gpu, &None, &roots_gpu, &mut labels_gpu, false)
+        kmeans::predict(&res, &params, &batch_gpu, &None, &centroids_gpu, &mut labels_gpu, false)
             .expect("predict failed");
 
         labels_gpu
@@ -389,8 +360,18 @@ pub fn assign_to_roots_gpu(
         processed += current_batch_len;
     }
 
-    info!("✅ [PHASE 2] Assignment complete in {:.2?}", start.elapsed());
-    final_labels
+    info!("✅ [PHASE 2] Assignment complete in {:.2?}", assign_start.elapsed());
+
+    // Now retrieve centroids to host (after all predict calls are done)
+    centroids_gpu
+        .to_host(&res, &mut centroids_host)
+        .expect("retrieval failed");
+
+    if spherical_centroids {
+        normalize_vectors(&mut centroids_host);
+    }
+
+    (centroids_host.into_raw_vec(), final_labels)
 }
 
 /// Train leaf centroids for a single bucket using pre-created Resources.

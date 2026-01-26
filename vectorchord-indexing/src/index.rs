@@ -1,6 +1,6 @@
 use crate::clustering_gpu_impl::{
-    assign_to_roots_gpu, create_gpu_resources, run_clustering_batch, run_clustering_consolidate,
-    train_leaves_for_bucket_gpu, train_roots_gpu,
+    create_gpu_resources, run_clustering_batch, run_clustering_consolidate,
+    train_leaves_for_bucket_gpu, train_roots_and_assign_gpu,
 };
 use crate::guc::use_gpu_acceleration;
 use crate::vector_index_read::VectorReadBatcher;
@@ -114,9 +114,9 @@ pub fn index(
             loaded_count += vecs.len() / dims as usize;
             training_dataset.extend(vecs);
 
-            // Progress logging every 5 seconds
+            // Progress logging every 20 seconds
             let elapsed_since_log = last_log_time.elapsed().as_secs_f64();
-            if elapsed_since_log >= 5.0 {
+            if elapsed_since_log >= 20.0 {
                 let vectors_since_log = loaded_count - last_log_count;
                 let rate = vectors_since_log as f64 / elapsed_since_log;
                 let percent = (loaded_count as f64 / num_samples_target as f64) * 100.0;
@@ -191,10 +191,10 @@ pub fn index(
         let d_norm = t_norm_start.elapsed();
 
         // ================================================================================
-        // STEP 3: Train root centroids
+        // STEP 3+4: Train root centroids AND assign vectors (combined for GPU stability)
         // ================================================================================
         let t_roots_start = Instant::now();
-        let root_centroids = train_roots_gpu(
+        let (root_centroids, assignments) = train_roots_and_assign_gpu(
             &training_dataset,
             vector_dims,
             num_roots,
@@ -202,18 +202,7 @@ pub fn index(
             spherical_centroids,
         );
         let d_roots = t_roots_start.elapsed();
-
-        // ================================================================================
-        // STEP 4: Assign all vectors to roots
-        // ================================================================================
-        let t_assign_start = Instant::now();
-        let assignments = assign_to_roots_gpu(
-            &training_dataset,
-            &root_centroids,
-            vector_dims,
-            num_roots,
-        );
-        let d_assign = t_assign_start.elapsed();
+        let d_assign = std::time::Duration::ZERO; // Included in d_roots now
 
         // Analyze bucket distribution
         let mut bucket_counts = vec![0usize; num_roots as usize];
