@@ -287,16 +287,15 @@ pub fn train_roots_gpu(
         .to_device(&res)
         .expect("alloc failed");
 
-    // Use non-hierarchical k-means for small cluster counts (roots are typically ~400)
-    // IMPORTANT: Explicitly disable hierarchical to avoid multi-GPU bugs
-    // NOTE: cuVS k-means only supports L2Expanded/L2SqrtExpanded - normalize vectors beforehand
+    // Match main branch configuration
     let params = kmeans::Params::new()
         .expect("params failed")
         .set_n_clusters(num_roots as i32)
         .set_max_iter(iterations as i32)
         .set_metric(DistanceType::L2Expanded)
-        .set_hierarchical(false)
-        .set_n_init(1);
+        .set_n_init(1)
+        .set_batch_samples(0)
+        .set_batch_centroids(0);
 
     let (inertia, n_iter) = kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
         .expect("k-means fit failed");
@@ -304,11 +303,6 @@ pub fn train_roots_gpu(
     centroids_gpu
         .to_host(&res, &mut centroids_host)
         .expect("retrieval failed");
-
-    // Explicit drop to ensure GPU cleanup before next phase
-    drop(centroids_gpu);
-    drop(dataset);
-    drop(res);
 
     if spherical_centroids {
         normalize_vectors(&mut centroids_host);
@@ -344,10 +338,9 @@ pub fn assign_to_roots_gpu(
         .expect("transfer failed");
 
     let mut final_labels = Vec::with_capacity(total_vectors);
-    let batch_size = 5_000_000; // Process 5M vectors at a time
+    let batch_size = 2_000_000; // Match main branch
     let mut processed = 0;
 
-    // NOTE: cuVS k-means only supports L2Expanded/L2SqrtExpanded
     let params = kmeans::Params::new()
         .expect("params failed")
         .set_n_clusters(num_roots as i32)
@@ -356,6 +349,11 @@ pub fn assign_to_roots_gpu(
     while processed < total_vectors {
         let end = std::cmp::min(processed + batch_size, total_vectors);
         let current_batch_len = end - processed;
+
+        if processed > 0 && processed % 10_000_000 == 0 {
+            info!("   ... assigned {}/{} ({:.1}%)",
+                  processed, total_vectors, 100.0 * processed as f64 / total_vectors as f64);
+        }
 
         let slice_start = processed * vector_dims as usize;
         let slice_end = end * vector_dims as usize;
@@ -382,22 +380,9 @@ pub fn assign_to_roots_gpu(
             .to_host(&res, &mut labels_host)
             .expect("retrieval failed");
 
-        // Explicit cleanup of batch GPU resources
-        drop(labels_gpu);
-        drop(batch_gpu);
-
         final_labels.extend(labels_host.into_iter());
         processed += current_batch_len;
-
-        if processed % 20_000_000 == 0 && processed < total_vectors {
-            info!("   ... assigned {}/{} ({:.1}%)",
-                  processed, total_vectors, 100.0 * processed as f64 / total_vectors as f64);
-        }
     }
-
-    // Explicit cleanup before returning
-    drop(roots_gpu);
-    drop(res);
 
     info!("✅ [PHASE 2] Assignment complete in {:.2?}", start.elapsed());
     final_labels
@@ -438,15 +423,14 @@ pub fn train_leaves_for_bucket_gpu(
         .to_device(&res)
         .expect("alloc failed");
 
-    // IMPORTANT: Disable hierarchical k-means to avoid multi-GPU bugs
-    // Non-hierarchical is slower but more reliable
-    // NOTE: cuVS k-means only supports L2Expanded/L2SqrtExpanded - normalize vectors beforehand
+    // Match main branch configuration
     let params = kmeans::Params::new()
         .expect("params failed")
         .set_n_clusters(num_leaves as i32)
         .set_max_iter(iterations as i32)
         .set_metric(DistanceType::L2Expanded)
-        .set_hierarchical(false);
+        .set_batch_samples(0)
+        .set_batch_centroids(0);
 
     kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
         .expect("k-means fit failed");
@@ -454,11 +438,6 @@ pub fn train_leaves_for_bucket_gpu(
     centroids_gpu
         .to_host(&res, &mut centroids_host)
         .expect("retrieval failed");
-
-    // Explicit cleanup
-    drop(centroids_gpu);
-    drop(dataset);
-    drop(res);
 
     if spherical_centroids {
         normalize_vectors(&mut centroids_host);
