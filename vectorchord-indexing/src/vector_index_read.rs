@@ -181,8 +181,8 @@ impl VectorReadBatcher {
                 total_blocks, estimated_rows, target_samples, detected_dims
             );
             info!(
-                "[SAMPLER] Using chunked I/O: {} chunks of {} blocks ({}KB sequential reads)",
-                num_chunks, CHUNK_SIZE_BLOCKS, CHUNK_SIZE_BLOCKS * 8
+                "[SAMPLER] Using chunked I/O: {} chunks of {} blocks ({}MB sequential reads)",
+                num_chunks, CHUNK_SIZE_BLOCKS, (CHUNK_SIZE_BLOCKS * 8) / 1024
             );
 
             // Get snapshot
@@ -488,8 +488,8 @@ impl Drop for HeapSample {
 // =============================================================================
 
 // Number of consecutive blocks to read per random seek
-// 128 blocks = 1MB sequential read per seek (optimized for NVMe SSDs)
-const CHUNK_SIZE_BLOCKS: u32 = 128;
+// 25600 blocks = 200MB sequential read per seek (optimized for NVMe SSDs)
+const CHUNK_SIZE_BLOCKS: u32 = 25600;
 
 struct SamplerState {
     blocks_iter: Option<Box<ChunkedBlockIterator>>,

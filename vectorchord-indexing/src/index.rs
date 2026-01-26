@@ -123,9 +123,41 @@ pub fn index(
                 let remaining = num_samples_target as usize - loaded_count;
                 let eta_secs = if rate > 0.0 { remaining as f64 / rate } else { 0.0 };
 
+                // Build progress bar (30 chars wide)
+                let bar_width = 30;
+                let filled = ((percent / 100.0) * bar_width as f64) as usize;
+                let empty = bar_width - filled;
+                let bar: String = "█".repeat(filled) + &"░".repeat(empty);
+
+                // Format rate (K or M)
+                let rate_str = if rate >= 1_000_000.0 {
+                    format!("{:.1}M", rate / 1_000_000.0)
+                } else {
+                    format!("{:.0}K", rate / 1_000.0)
+                };
+
+                // Format ETA (m:ss or just seconds)
+                let eta_str = if eta_secs >= 60.0 {
+                    format!("{}m {:02.0}s", (eta_secs / 60.0) as u32, eta_secs % 60.0)
+                } else {
+                    format!("{:.0}s", eta_secs)
+                };
+
+                // Format counts (M suffix for millions)
+                let loaded_str = if loaded_count >= 1_000_000 {
+                    format!("{:.1}M", loaded_count as f64 / 1_000_000.0)
+                } else {
+                    format!("{}K", loaded_count / 1000)
+                };
+                let target_str = if num_samples_target >= 1_000_000 {
+                    format!("{:.1}M", num_samples_target as f64 / 1_000_000.0)
+                } else {
+                    format!("{}K", num_samples_target / 1000)
+                };
+
                 info!(
-                    "⏳ Loaded {}/{} ({:.1}%) | {:.0} vec/s | ETA: {:.0}s",
-                    loaded_count, num_samples_target, percent, rate, eta_secs
+                    "[{}] {:.1}% ({}/{}) | {} vec/s | ETA: {}",
+                    bar, percent, loaded_str, target_str, rate_str, eta_str
                 );
 
                 last_log_time = Instant::now();
