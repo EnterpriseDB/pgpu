@@ -141,25 +141,9 @@ pub fn index(
         }
 
         // ================================================================================
-        // STEP 2: Normalize training data (if spherical)
+        // STEP 2: Train root centroids
         // ================================================================================
-        let t_norm_start = Instant::now();
-        if spherical_centroids {
-            info!("📐 Normalizing {} training vectors...", loaded_count);
-            for chunk in training_dataset.chunks_mut(vector_dims as usize) {
-                let mut norm_sq = 0.0f32;
-                for x in chunk.iter() { norm_sq += x * x; }
-                let norm = norm_sq.sqrt();
-                if norm > 1e-6 {
-                    for x in chunk.iter_mut() { *x /= norm; }
-                }
-            }
-        }
-        let d_norm = t_norm_start.elapsed();
-
-        // ================================================================================
-        // STEP 3: Train root centroids
-        // ================================================================================
+        // NOTE: Normalization is handled by GPU k-means using CosineExpanded metric
         let t_roots_start = Instant::now();
         let root_centroids = train_roots_gpu(
             &training_dataset,
@@ -171,7 +155,7 @@ pub fn index(
         let d_roots = t_roots_start.elapsed();
 
         // ================================================================================
-        // STEP 4: Assign all vectors to roots
+        // STEP 3: Assign all vectors to roots
         // ================================================================================
         let t_assign_start = Instant::now();
         let assignments = assign_to_roots_gpu(
@@ -179,6 +163,7 @@ pub fn index(
             &root_centroids,
             vector_dims,
             num_roots,
+            spherical_centroids,
         );
         let d_assign = t_assign_start.elapsed();
 
@@ -195,7 +180,7 @@ pub fn index(
               min_bucket, max_bucket, max_bucket as f64 / (min_bucket.max(1) as f64));
 
         // ================================================================================
-        // STEP 5: Build buckets and train leaves
+        // STEP 4: Build buckets and train leaves
         // ================================================================================
         let t_leaves_start = Instant::now();
         info!("🚀 [PHASE 3] Training leaves for {} buckets...", num_roots);
@@ -259,7 +244,7 @@ pub fn index(
         let d_leaves = t_leaves_start.elapsed();
 
         // ================================================================================
-        // STEP 6: Store centroids
+        // STEP 5: Store centroids
         // ================================================================================
         let t_store_start = Instant::now();
         info!("💾 Storing {} centroids ({} roots + {} leaves)...",
@@ -274,7 +259,6 @@ pub fn index(
         info!(
             "\n⏱️  [TIMING SUMMARY - TOP-DOWN]\n\
             \t• 📥 Data Loading:     {:.2?}\n\
-            \t• 📐 Normalization:    {:.2?}\n\
             \t• 🌳 Root Training:    {:.2?}\n\
             \t• 📍 Assignment:       {:.2?}\n\
             \t• 🌿 Leaf Training:    {:.2?}\n\
@@ -288,7 +272,6 @@ pub fn index(
             \t-----------------------------\n\
             \t👉 TOTAL TIME:         {:.2?}",
             d_load,
-            d_norm,
             d_roots,
             d_assign,
             d_leaves,

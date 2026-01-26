@@ -289,11 +289,17 @@ pub fn train_roots_gpu(
 
     // Use non-hierarchical k-means for small cluster counts (roots are typically ~400)
     // IMPORTANT: Explicitly disable hierarchical to avoid multi-GPU bugs
+    // Use CosineExpanded for spherical centroids - handles normalization internally
+    let metric = if spherical_centroids {
+        DistanceType::CosineExpanded
+    } else {
+        DistanceType::L2Expanded
+    };
     let params = kmeans::Params::new()
         .expect("params failed")
         .set_n_clusters(num_roots as i32)
         .set_max_iter(iterations as i32)
-        .set_metric(DistanceType::L2Expanded)
+        .set_metric(metric)
         .set_hierarchical(false)
         .set_n_init(1);
 
@@ -326,6 +332,7 @@ pub fn assign_to_roots_gpu(
     root_centroids: &Vec<f32>,
     vector_dims: u32,
     num_roots: u32,
+    spherical_centroids: bool,
 ) -> Vec<i32> {
     let total_vectors = all_vectors.len() / vector_dims as usize;
     info!("🚀 [PHASE 2] Assigning {} vectors to {} roots...", total_vectors, num_roots);
@@ -346,10 +353,16 @@ pub fn assign_to_roots_gpu(
     let batch_size = 5_000_000; // Process 5M vectors at a time
     let mut processed = 0;
 
+    // Use same metric as training
+    let metric = if spherical_centroids {
+        DistanceType::CosineExpanded
+    } else {
+        DistanceType::L2Expanded
+    };
     let params = kmeans::Params::new()
         .expect("params failed")
         .set_n_clusters(num_roots as i32)
-        .set_metric(DistanceType::L2Expanded);
+        .set_metric(metric);
 
     while processed < total_vectors {
         let end = std::cmp::min(processed + batch_size, total_vectors);
@@ -379,6 +392,10 @@ pub fn assign_to_roots_gpu(
         labels_gpu
             .to_host(&res, &mut labels_host)
             .expect("retrieval failed");
+
+        // Explicit cleanup of batch GPU resources
+        drop(labels_gpu);
+        drop(batch_gpu);
 
         final_labels.extend(labels_host.into_iter());
         processed += current_batch_len;
@@ -434,11 +451,17 @@ pub fn train_leaves_for_bucket_gpu(
 
     // IMPORTANT: Disable hierarchical k-means to avoid multi-GPU bugs
     // Non-hierarchical is slower but more reliable
+    // Use CosineExpanded for spherical centroids - handles normalization internally
+    let metric = if spherical_centroids {
+        DistanceType::CosineExpanded
+    } else {
+        DistanceType::L2Expanded
+    };
     let params = kmeans::Params::new()
         .expect("params failed")
         .set_n_clusters(num_leaves as i32)
         .set_max_iter(iterations as i32)
-        .set_metric(DistanceType::L2Expanded)
+        .set_metric(metric)
         .set_hierarchical(false);
 
     kmeans::fit(&res, &params, &dataset, &None, &mut centroids_gpu)
